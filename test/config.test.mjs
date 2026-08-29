@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { loadEnvFile } from '../dist/config.js';
+import { loadEnvFile, loadConfig } from '../dist/config.js';
 
 async function withEnvFile(contents, fn) {
   const dir = await mkdtemp(join(tmpdir(), 'pikvm-env-'));
@@ -39,15 +39,28 @@ test('NO_DOTENV=1: .env does NOT override an explicitly set env var', async () =
   });
 });
 
-test('without NO_DOTENV: .env override behavior is unchanged (still wins)', async () => {
+test('without NO_DOTENV: explicitly-set process env wins over .env (override:false)', async () => {
   await withEnvFile('PIKVM_MCP_TEST_B=fromdotenv\n', async (file) => {
     process.env.PIKVM_MCP_TEST_B = 'fromprocess';
     try {
       loadEnvFile(file);
-      assert.equal(process.env.PIKVM_MCP_TEST_B, 'fromdotenv',
-        'default path must keep the pre-existing override:true behavior');
+      assert.equal(process.env.PIKVM_MCP_TEST_B, 'fromprocess',
+        'explicit process env must always win over .env values');
     } finally {
       delete process.env.PIKVM_MCP_TEST_B;
+    }
+  });
+});
+
+test('without NO_DOTENV: .env still fills variables absent from process env', async () => {
+  await withEnvFile('PIKVM_MCP_TEST_D=fromdotenv\n', async (file) => {
+    delete process.env.PIKVM_MCP_TEST_D;
+    try {
+      loadEnvFile(file);
+      assert.equal(process.env.PIKVM_MCP_TEST_D, 'fromdotenv',
+        '.env must remain the source for vars the caller did not set');
+    } finally {
+      delete process.env.PIKVM_MCP_TEST_D;
     }
   });
 });
@@ -64,4 +77,28 @@ test('NO_DOTENV=1: .env-only variables are not introduced at all', async () => {
       delete process.env.PIKVM_MCP_NO_DOTENV;
     }
   });
+});
+
+test('HTTP config: bind host defaults to 127.0.0.1, PIKVM_MCP_HOST overrides', () => {
+  const saved = {
+    PIKVM_HOST: process.env.PIKVM_HOST,
+    PIKVM_PASSWORD: process.env.PIKVM_PASSWORD,
+    PIKVM_MCP_PORT: process.env.PIKVM_MCP_PORT,
+    PIKVM_MCP_HOST: process.env.PIKVM_MCP_HOST,
+  };
+  // Explicit sets must win over the repo's real .env (override:false).
+  process.env.PIKVM_HOST = 'http://mock.test';
+  process.env.PIKVM_PASSWORD = 'testpw';
+  process.env.PIKVM_MCP_PORT = '8675';
+  delete process.env.PIKVM_MCP_HOST;
+  try {
+    assert.equal(loadConfig().http.host, '127.0.0.1', 'bind must default to loopback');
+    process.env.PIKVM_MCP_HOST = '10.66.0.7';
+    assert.equal(loadConfig().http.host, '10.66.0.7', 'bridge gateway IP must be settable');
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
 });

@@ -8,7 +8,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { PiKVMClient } from '../dist/pikvm/client.js';
 import { BusyLock } from '../dist/pikvm/lock.js';
-import { createMcpServer } from '../dist/server.js';
+import { createMcpServer, ARM_GATED_TOOLS } from '../dist/server.js';
 import { startHttpServer } from '../dist/http.js';
 import { startKvmdMock } from './kvmd-mock.mjs';
 
@@ -145,6 +145,61 @@ test('HTTP: unknown session id -> 404', async () => {
   }
 });
 
+test('HTTP: GET without token -> 401; DELETE without token -> 401', async () => {
+  const mock = await startKvmdMock();
+  const srv = await startServer(mock, true);
+  try {
+    const get = await fetch(`${srv.base}/mcp`, {
+      headers: { Accept: 'text/event-stream' },
+    });
+    assert.equal(get.status, 401, 'GET (SSE stream) must be bearer-guarded too');
+    assert.match(get.headers.get('www-authenticate') ?? '', /bearer/i);
+
+    const del = await fetch(`${srv.base}/mcp`, { method: 'DELETE' });
+    assert.equal(del.status, 401, 'DELETE (session termination) must be bearer-guarded too');
+    assert.match(del.headers.get('www-authenticate') ?? '', /bearer/i);
+  } finally {
+    await srv.close();
+    await mock.close();
+  }
+});
+
+test('HTTP: GET with token -> 405 (no SSE streams; JSON responses only)', async () => {
+  const mock = await startKvmdMock();
+  const srv = await startServer(mock, true);
+  try {
+    // Reviewer amendment: Cloudflare kills long-lived SSE, so the standalone
+    // GET stream is refused with the spec-allowed 405.
+    const res = await fetch(`${srv.base}/mcp`, {
+      headers: { Accept: 'text/event-stream', Authorization: `Bearer ${TOKEN}` },
+    });
+    assert.equal(res.status, 405);
+    assert.match(res.headers.get('allow') ?? '', /POST/);
+  } finally {
+    await srv.close();
+    await mock.close();
+  }
+});
+
+test('HTTP: POST responses are JSON, not SSE', async () => {
+  const mock = await startKvmdMock();
+  const srv = await startServer(mock, true);
+  try {
+    const res = await rpc(srv.base, {
+      method: 'initialize',
+      params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'wp1-test', version: '1.0' } },
+    });
+    assert.equal(res.status, 200);
+    const ct = res.headers.get('content-type') ?? '';
+    assert.match(ct, /application\/json/);
+    assert.ok(!ct.includes('text/event-stream'), 'POST must never open an SSE stream');
+    await res.json(); // must parse as a single JSON body
+  } finally {
+    await srv.close();
+    await mock.close();
+  }
+});
+
 test('HTTP: DELETE terminates the session', async () => {
   const mock = await startKvmdMock();
   const srv = await startServer(mock, true);
@@ -171,10 +226,39 @@ const GATED_TOOLS = [
   ['pikvm_type', { text: 'hello' }],
   ['pikvm_key', { key: 'KeyA' }],
   ['pikvm_shortcut', { keys: ['ControlLeft', 'AltLeft', 'Delete'] }],
+  ['pikvm_mouse_move', { x: 100, y: 50 }],
   ['pikvm_mouse_click', { button: 'left' }],
+  ['pikvm_mouse_scroll', { deltaY: 3 }],
   ['pikvm_calibrate', {}],
   ['pikvm_auto_calibrate', {}],
 ];
+
+const UNGATED_TOOLS = [
+  'pikvm_screenshot',
+  'pikvm_get_resolution',
+  'pikvm_set_calibration',
+  'pikvm_get_calibration',
+  'pikvm_clear_calibration',
+];
+
+test('ARM_GATED_TOOLS choke point covers every HID-mutating tool', () => {
+  assert.deepEqual(
+    [...ARM_GATED_TOOLS].sort(),
+    [
+      'pikvm_auto_calibrate',
+      'pikvm_calibrate',
+      'pikvm_key',
+      'pikvm_mouse_click',
+      'pikvm_mouse_move',
+      'pikvm_mouse_scroll',
+      'pikvm_shortcut',
+      'pikvm_type',
+    ]
+  );
+  for (const tool of UNGATED_TOOLS) {
+    assert.ok(!ARM_GATED_TOOLS.has(tool), `${tool} must stay ungated (read-only/local-state)`);
+  }
+});
 
 test('HTTP: disarmed (ARM unset) -> all HID tools return typed error, mock untouched', async () => {
   const mock = await startKvmdMock();

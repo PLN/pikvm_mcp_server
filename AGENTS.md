@@ -61,6 +61,11 @@ The server is configured via environment variables or a config file:
 - `PIKVM_PASSWORD` - Auth password
 - `PIKVM_VERIFY_SSL` - Whether to verify SSL certs (default: `false` for self-signed)
 - `PIKVM_DEFAULT_KEYMAP` - Default keyboard layout (default: `en-us`)
+- `PIKVM_MCP_PORT` - set to serve MCP over Streamable HTTP instead of stdio
+- `PIKVM_MCP_HOST` - HTTP bind address (default: `127.0.0.1`)
+- `PIKVM_MCP_BEARER` - required bearer token in HTTP mode (refuses to start without it)
+- `PIKVM_MCP_ARM_HID` - `1` arms HID tools in HTTP mode (default disarmed; stdio never gated)
+- `PIKVM_MCP_NO_DOTENV` - `1` skips `.env` loading (explicit process env always wins anyway)
 
 ## MCP Tools Provided
 

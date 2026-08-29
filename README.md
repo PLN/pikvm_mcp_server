@@ -85,6 +85,7 @@ mode used when a gateway exposes the device to off-box agents:
 
 ```bash
 PIKVM_MCP_PORT=8675
+PIKVM_MCP_HOST=127.0.0.1
 PIKVM_MCP_BEARER=<openssl rand -hex 32>
 PIKVM_MCP_ARM_HID=0
 PIKVM_MCP_NO_DOTENV=0
@@ -94,13 +95,18 @@ PIKVM_MCP_NO_DOTENV=0
   Streamable HTTP; initialize first, then send `mcp-session-id` on every
   request, `DELETE /mcp` to end the session). `GET /healthz` returns `200 ok`
   unauthenticated for supervision scripts.
+- **`PIKVM_MCP_HOST`** — bind address, default `127.0.0.1`. Set it to the
+  bridge gateway IP (or `0.0.0.0`) if a containerized reverse proxy (e.g.
+  Caddy in Docker) needs to reach the instance from outside host loopback.
 - **`PIKVM_MCP_BEARER`** — required token for every `/mcp` request
-  (`Authorization: Bearer <token>`). HTTP mode **refuses to start** without
-  it; missing/incorrect tokens get `401` + `WWW-Authenticate: Bearer`.
-  Comparison is constant-time.
+  (`Authorization: Bearer <token>`), on POST, GET, and DELETE alike. HTTP
+  mode **refuses to start** without it; missing/incorrect tokens get `401` +
+  `WWW-Authenticate: Bearer`. Comparison is constant-time (sha256 digests +
+  `crypto.timingSafeEqual`), and the token is never written to logs.
 - **`PIKVM_MCP_ARM_HID`** — the HID arm-gate. HTTP mode defaults to
-  **disarmed**: `pikvm_type`, `pikvm_key`, `pikvm_shortcut`,
-  `pikvm_mouse_click`, `pikvm_calibrate`, and `pikvm_auto_calibrate` return a
+  **disarmed**: every HID-mutating tool (`pikvm_type`, `pikvm_key`,
+  `pikvm_shortcut`, `pikvm_mouse_move`, `pikvm_mouse_click`,
+  `pikvm_mouse_scroll`, `pikvm_calibrate`, `pikvm_auto_calibrate`) returns a
   typed error naming this variable and no HID events reach the device.
   Read-only tools (`pikvm_screenshot`, `pikvm_get_resolution`,
   `pikvm_get/set/clear_calibration`) stay available. Set `1` to arm. stdio
@@ -108,7 +114,9 @@ PIKVM_MCP_NO_DOTENV=0
 - **`PIKVM_MCP_NO_DOTENV`** — set `1` to skip `.env` loading entirely (for
   systemd/gateway units that export env directly; a stray `.env` on disk must
   not win). Only read from the real process environment, so a `.env` cannot
-  enable it for itself.
+  enable it for itself. Even without it, explicitly-set process env always
+  beats `.env` values — dotenv uses `override: false`, so `.env` only fills
+  variables the caller did not set.
 
 Quick smoke test:
 
@@ -134,8 +142,13 @@ curl -i -X POST http://localhost:8675/mcp \
   transport is not a substitute for network isolation.
 - Run with `PIKVM_MCP_ARM_HID=0` unless the deployment is explicitly supposed
   to drive HID; arming is a per-deployment, explicit decision.
-- The bind address is all interfaces; front with a reverse proxy if you need
-  TLS termination or origin/host filtering.
+- Bind defaults to `127.0.0.1`; widen it only when a local proxy/gateway
+  actually needs the network, and front with a reverse proxy for TLS
+  termination or origin/host filtering.
+- No SSE streams: POSTs always return a single JSON body and the standalone
+  GET SSE stream answers 405. Long-lived SSE connections are killed by
+  Cloudflare's edge (and similar proxies), so keeping every MCP exchange a
+  plain HTTP round-trip is the CF-safe configuration.
 
 ## Usage with Claude Code
 

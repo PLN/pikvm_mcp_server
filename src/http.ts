@@ -10,8 +10,12 @@
  * - POST/GET/DELETE with mcp-session-id -> routed to that session's transport.
  * - DELETE terminates the session; the transport's onclose removes it here.
  *
- * POST responses are JSON (enableJsonResponse) so simple clients and curl
- * work without an SSE parser; GET opens the standalone SSE stream per spec.
+ * POST responses are always JSON (enableJsonResponse) — no SSE streams.
+ * Cloudflare's edge kills long-lived SSE connections, which would break
+ * remote MCP through a CF-fronted gateway; JSON responses keep every request
+ * a plain HTTP round-trip. The standalone GET SSE stream (server-initiated
+ * notifications) is refused with 405, which is spec-allowed and handled
+ * gracefully by MCP clients. DELETE still terminates sessions.
  */
 
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
@@ -181,7 +185,19 @@ export function startHttpServer(options: HttpTransportOptions): Promise<HttpServ
         return;
       }
 
-      if (req.method === 'GET' || req.method === 'DELETE') {
+      if (req.method === 'GET') {
+        // No server-initiated SSE stream (CF edge kills long-lived
+        // connections). 405 is the spec-allowed answer; clients treat it as
+        // "no server-initiated notifications" and keep using POST.
+        res.writeHead(405, {
+          'Content-Type': 'application/json',
+          Allow: 'POST, DELETE',
+        });
+        res.end(JSON.stringify({ error: 'Method not allowed: GET SSE streams are disabled; use POST JSON-RPC' }));
+        return;
+      }
+
+      if (req.method === 'DELETE') {
         const sessionId = req.headers['mcp-session-id'];
         const transport = typeof sessionId === 'string' ? sessions.get(sessionId) : undefined;
         if (!transport) {
@@ -194,11 +210,14 @@ export function startHttpServer(options: HttpTransportOptions): Promise<HttpServ
 
       res.writeHead(405, {
         'Content-Type': 'application/json',
-        Allow: 'GET, POST, DELETE',
+        Allow: 'POST, DELETE',
       });
       res.end(JSON.stringify({ error: 'Method not allowed' }));
     } catch (err) {
-      console.error('HTTP transport error:', err);
+      // Token never logged: scrub the bearer token out of whatever the error
+      // machinery produced before it reaches stderr.
+      const raw = err instanceof Error ? (err.stack ?? err.message) : String(err);
+      console.error('HTTP transport error:', raw.split(bearerToken).join('[REDACTED]'));
       if (!res.headersSent) {
         jsonError(res, 500, -32603, 'Internal server error');
       } else {

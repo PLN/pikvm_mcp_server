@@ -18,22 +18,28 @@ const envPath = resolve(__dirname, '..', '.env');
 /**
  * Load a .env file unless PIKVM_MCP_NO_DOTENV=1.
  *
- * The skip is checked BEFORE dotenv runs, and only against the real process
- * environment — so a .env file cannot enable the skip for itself. Gateway /
- * systemd deployments export env directly and set PIKVM_MCP_NO_DOTENV=1 so a
- * stray .env on disk cannot override their explicitly-set values.
+ * Two independent belts:
+ * 1. override is FALSE (dotenv default): explicitly-set process env always
+ *    wins over .env values — a stray .env can only fill gaps.
+ * 2. PIKVM_MCP_NO_DOTENV=1 skips .env loading entirely. The skip is checked
+ *    BEFORE dotenv runs and only against the real process environment, so a
+ *    .env file cannot enable the skip for itself. Gateway / systemd
+ *    deployments export env directly and set this so no on-disk .env wins.
  */
 export function loadEnvFile(path: string): void {
   if (process.env.PIKVM_MCP_NO_DOTENV === '1') {
     return;
   }
-  loadEnv({ path, quiet: true, override: true });
+  // override: false — process env already set by the caller wins over .env.
+  loadEnv({ path, quiet: true, override: false });
 }
 
 loadEnvFile(envPath);
 
 export interface HttpConfig {
   port: number;
+  /** Bind address. Default 127.0.0.1; the gateway may set a bridge IP. */
+  host: string;
   /** Bearer token required on every HTTP request (mandatory in HTTP mode). */
   bearerToken?: string;
   /** 1 = HID tools armed in HTTP mode; otherwise arm-gate blocks them. */
@@ -72,6 +78,7 @@ export function loadConfig(): Config {
   const http: HttpConfig | undefined = Number.isFinite(port) && port > 0
     ? {
         port,
+        host: process.env.PIKVM_MCP_HOST || '127.0.0.1',
         bearerToken: process.env.PIKVM_MCP_BEARER,
         armHid: process.env.PIKVM_MCP_ARM_HID === '1',
       }

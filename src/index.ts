@@ -31,7 +31,7 @@ async function main() {
   }
 
   if (config.http) {
-    const { port, bearerToken, armHid } = config.http;
+    const { port, host, bearerToken, armHid } = config.http;
     // Fail closed: an unauthenticated network listener on a HID server would
     // let anyone type on the remote machine.
     if (!bearerToken) {
@@ -41,10 +41,11 @@ async function main() {
     const armGateEnforced = !armHid;
     await startHttpServer({
       port,
+      host,
       bearerToken,
       createServer: () => createMcpServer({ pikvm, lock, calibrationConfig, armGateEnforced }),
     });
-    console.error(`PiKVM MCP Server running (HTTP on port ${port}, HID ${armHid ? 'ARMED' : 'DISARMED'})`);
+    console.error(`PiKVM MCP Server running (HTTP on ${host}:${port}, HID ${armHid ? 'ARMED' : 'DISARMED'})`);
     return;
   }
 

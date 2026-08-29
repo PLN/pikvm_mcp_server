@@ -130,15 +130,20 @@ const VALID_KEY_STATES = ['press', 'release', 'click'] as const;
 // ============================================================================
 
 /**
- * Tools that physically drive the remote machine's keyboard/mouse. In HTTP
- * mode these are disarmed unless PIKVM_MCP_ARM_HID=1 so a remote session
- * can't type/click on real hardware without an explicit arming step.
+ * Every tool that mutates HID state on the remote machine (keyboard, mouse,
+ * or calibration flows that move the cursor). In HTTP mode these are
+ * disarmed unless PIKVM_MCP_ARM_HID=1 so a remote session can't drive real
+ * hardware without an explicit arming step. Read-only tools (screenshot,
+ * resolution, calibration get/set/clear — local state only) stay ungated,
+ * as do the skill_* guidance tools.
  */
 export const ARM_GATED_TOOLS = new Set([
   'pikvm_type',
   'pikvm_key',
   'pikvm_shortcut',
+  'pikvm_mouse_move',
   'pikvm_mouse_click',
+  'pikvm_mouse_scroll',
   'pikvm_calibrate',
   'pikvm_auto_calibrate',
 ]);
