@@ -151,6 +151,11 @@ curl -i -X POST http://localhost:8675/mcp \
   GET SSE stream answers 405. Long-lived SSE connections are killed by
   Cloudflare's edge (and similar proxies), so keeping every MCP exchange a
   plain HTTP round-trip is the CF-safe configuration.
+- `/healthz` is intentionally unauthenticated and will be reachable through
+  any proxy in front of the server. It returns only the constant body `ok`
+  on GET — no state, version, or device information — so public exposure is
+  limited to a liveness oracle. Gate it at the proxy if you don't want even
+  that.
 
 ## Usage with Claude Code
 
