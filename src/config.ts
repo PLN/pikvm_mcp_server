@@ -2,7 +2,7 @@
  * Configuration management for PiKVM MCP Server
  *
  * Reads configuration from environment variables.
- * Supports .env file via dotenv.
+ * Supports .env file via dotenv (unless disabled).
  */
 
 import { config as loadEnv } from 'dotenv';
@@ -14,7 +14,31 @@ import { fileURLToPath } from 'url';
 // - override: true ensures .env values take precedence over any existing env vars
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const envPath = resolve(__dirname, '..', '.env');
-loadEnv({ path: envPath, quiet: true, override: true });
+
+/**
+ * Load a .env file unless PIKVM_MCP_NO_DOTENV=1.
+ *
+ * The skip is checked BEFORE dotenv runs, and only against the real process
+ * environment — so a .env file cannot enable the skip for itself. Gateway /
+ * systemd deployments export env directly and set PIKVM_MCP_NO_DOTENV=1 so a
+ * stray .env on disk cannot override their explicitly-set values.
+ */
+export function loadEnvFile(path: string): void {
+  if (process.env.PIKVM_MCP_NO_DOTENV === '1') {
+    return;
+  }
+  loadEnv({ path, quiet: true, override: true });
+}
+
+loadEnvFile(envPath);
+
+export interface HttpConfig {
+  port: number;
+  /** Bearer token required on every HTTP request (mandatory in HTTP mode). */
+  bearerToken?: string;
+  /** 1 = HID tools armed in HTTP mode; otherwise arm-gate blocks them. */
+  armHid: boolean;
+}
 
 export interface Config {
   pikvm: {
@@ -29,6 +53,8 @@ export interface Config {
     verifyRounds: number;
     moveDelayMs: number;
   };
+  /** Present only when PIKVM_MCP_PORT is set (HTTP mode). */
+  http?: HttpConfig;
 }
 
 export function loadConfig(): Config {
@@ -41,6 +67,15 @@ export function loadConfig(): Config {
   if (!password) {
     throw new Error('PIKVM_PASSWORD environment variable is required');
   }
+
+  const port = parseInt(process.env.PIKVM_MCP_PORT || '', 10);
+  const http: HttpConfig | undefined = Number.isFinite(port) && port > 0
+    ? {
+        port,
+        bearerToken: process.env.PIKVM_MCP_BEARER,
+        armHid: process.env.PIKVM_MCP_ARM_HID === '1',
+      }
+    : undefined;
 
   return {
     pikvm: {
@@ -55,5 +90,6 @@ export function loadConfig(): Config {
       verifyRounds: parseInt(process.env.PIKVM_CALIBRATION_VERIFY_ROUNDS || '5', 10),
       moveDelayMs: parseInt(process.env.PIKVM_CALIBRATION_MOVE_DELAY || '300', 10),
     },
+    http,
   };
 }

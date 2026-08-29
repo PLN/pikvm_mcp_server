@@ -16,8 +16,10 @@ pikvm_mcp_server/
 ├── CONTEXT.md          # Background research and design notes
 ├── API_REFERENCE.md    # PiKVM API documentation
 ├── src/                # Source code
-│   ├── index.ts        # Main MCP server entry point (tool + prompt handlers)
-│   ├── config.ts       # Configuration handling
+│   ├── index.ts        # Entry point: stdio (default) vs HTTP transport switch
+│   ├── config.ts       # Configuration handling (env + .env, PIKVM_MCP_* vars)
+│   ├── server.ts       # MCP server factory (tool + prompt handlers, HID arm-gate)
+│   ├── http.ts         # Streamable HTTP transport + bearer auth (node:http)
 │   ├── pikvm/          # PiKVM API client
 │   │   └── client.ts
 │   └── prompts/        # MCP prompt definitions
@@ -45,6 +47,9 @@ npm run dev
 
 # Type checking
 npm run typecheck
+
+# Tests (node:test, mock KVMD only — never touches real hardware)
+npm test
 ```
 
 ## Configuration

@@ -76,6 +76,67 @@ PIKVM_VERIFY_SSL=false
 PIKVM_DEFAULT_KEYMAP=en-us
 ```
 
+## HTTP Mode (remote / gateway deployments)
+
+By default the server speaks stdio (spawned directly by an MCP client on the
+same machine). Set `PIKVM_MCP_PORT` to serve MCP over the
+[Streamable HTTP transport](https://modelcontextprotocol.io) instead — the
+mode used when a gateway exposes the device to off-box agents:
+
+```bash
+PIKVM_MCP_PORT=8675
+PIKVM_MCP_BEARER=<openssl rand -hex 32>
+PIKVM_MCP_ARM_HID=0
+PIKVM_MCP_NO_DOTENV=0
+```
+
+- **`PIKVM_MCP_PORT`** — enables HTTP mode. The endpoint is `/mcp` (MCP
+  Streamable HTTP; initialize first, then send `mcp-session-id` on every
+  request, `DELETE /mcp` to end the session). `GET /healthz` returns `200 ok`
+  unauthenticated for supervision scripts.
+- **`PIKVM_MCP_BEARER`** — required token for every `/mcp` request
+  (`Authorization: Bearer <token>`). HTTP mode **refuses to start** without
+  it; missing/incorrect tokens get `401` + `WWW-Authenticate: Bearer`.
+  Comparison is constant-time.
+- **`PIKVM_MCP_ARM_HID`** — the HID arm-gate. HTTP mode defaults to
+  **disarmed**: `pikvm_type`, `pikvm_key`, `pikvm_shortcut`,
+  `pikvm_mouse_click`, `pikvm_calibrate`, and `pikvm_auto_calibrate` return a
+  typed error naming this variable and no HID events reach the device.
+  Read-only tools (`pikvm_screenshot`, `pikvm_get_resolution`,
+  `pikvm_get/set/clear_calibration`) stay available. Set `1` to arm. stdio
+  mode is never gated — local callers gate on their own side.
+- **`PIKVM_MCP_NO_DOTENV`** — set `1` to skip `.env` loading entirely (for
+  systemd/gateway units that export env directly; a stray `.env` on disk must
+  not win). Only read from the real process environment, so a `.env` cannot
+  enable it for itself.
+
+Quick smoke test:
+
+```bash
+# 401 without a token
+curl -i -X POST http://localhost:8675/mcp -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+
+# 200 initialize with the token
+curl -i -X POST http://localhost:8675/mcp \
+  -H 'Authorization: Bearer <token>' -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"1.0"}}}'
+```
+
+### Security notes
+
+- Bearer auth is mandatory in HTTP mode by design: the server can move real
+  hardware, and an unauthenticated network listener would let anyone type on
+  the machine it is connected to.
+- Keep the HTTP server behind a trusted network (WireGuard/VPN); bearer-only
+  transport is not a substitute for network isolation.
+- Run with `PIKVM_MCP_ARM_HID=0` unless the deployment is explicitly supposed
+  to drive HID; arming is a per-deployment, explicit decision.
+- The bind address is all interfaces; front with a reverse proxy if you need
+  TLS termination or origin/host filtering.
+
 ## Usage with Claude Code
 
 > **Requires Node.js 18+.** This server uses ES modules. If `node --version` shows an older version, replace `"command": "node"` with the full path to a compatible binary (e.g. `"/usr/local/bin/node"` or your nvm path like `"~/.nvm/versions/node/v22.x.x/bin/node"`). This is common when nvm's default alias points to an older version.
