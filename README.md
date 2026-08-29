@@ -95,9 +95,11 @@ PIKVM_MCP_NO_DOTENV=0
   Streamable HTTP; initialize first, then send `mcp-session-id` on every
   request, `DELETE /mcp` to end the session). `GET /healthz` returns `200 ok`
   unauthenticated for supervision scripts.
-- **`PIKVM_MCP_HOST`** — bind address, default `127.0.0.1`. Set it to the
-  bridge gateway IP (or `0.0.0.0`) if a containerized reverse proxy (e.g.
-  Caddy in Docker) needs to reach the instance from outside host loopback.
+- **`PIKVM_MCP_HOST`** — bind address, default `127.0.0.1`. Set it to a
+  specific interface address (e.g. the docker bridge gateway IP `172.17.0.1`)
+  if a containerized reverse proxy needs to reach the instance from outside
+  host loopback. Avoid wildcard binds (`0.0.0.0`) — bind only the interface
+  the proxy actually uses.
 - **`PIKVM_MCP_BEARER`** — required token for every `/mcp` request
   (`Authorization: Bearer <token>`), on POST, GET, and DELETE alike. HTTP
   mode **refuses to start** without it; missing/incorrect tokens get `401` +
