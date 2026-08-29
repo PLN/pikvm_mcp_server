@@ -218,6 +218,34 @@ test('HTTP: DELETE terminates the session', async () => {
   }
 });
 
+test('HTTP: idle sessions are reaped; server stays functional', { timeout: 10000 }, async () => {
+  const mock = await startKvmdMock();
+  const httpServer = await startHttpServer({
+    port: 0,
+    bearerToken: TOKEN,
+    createServer: depsFactory(mock, true),
+    maxSessionIdleMs: 150, // test-scale: idle threshold + sweep interval
+    sweepIntervalMs: 50,
+  });
+  const { port } = httpServer.address();
+  const base = `http://127.0.0.1:${port}`;
+  try {
+    const { sessionId } = await openSession(base);
+    // Wait past the idle threshold so at least one sweep runs.
+    await new Promise((r) => setTimeout(r, 400));
+    const after = await rpc(base, { sessionId, method: 'tools/list', params: {} });
+    assert.equal(after.status, 404, 'idle session must be reaped');
+
+    // The reaper must not poison the server: a fresh session works.
+    const fresh = await openSession(base);
+    const list = await rpc(base, { sessionId: fresh.sessionId, method: 'tools/list', params: {} });
+    assert.equal(list.status, 200);
+  } finally {
+    await new Promise((resolve) => httpServer.close(resolve));
+    await mock.close();
+  }
+});
+
 // ============================================================================
 // Arm-gate
 // ============================================================================

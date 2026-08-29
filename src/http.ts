@@ -33,8 +33,12 @@ export interface HttpTransportOptions {
   bearerToken: string;
   /** Builds a fresh MCP Server per session. */
   createServer: () => McpServer;
-  /** Bind address (default: all interfaces — auth is mandatory anyway). */
+  /** Bind address (caller-supplied; config defaults to 127.0.0.1). */
   host?: string;
+  /** Reap sessions idle longer than this (default 24h). */
+  maxSessionIdleMs?: number;
+  /** How often the idle-session sweep runs (default 1h). */
+  sweepIntervalMs?: number;
 }
 
 function sha256(value: string): Buffer {
@@ -108,9 +112,15 @@ function readJsonBody(req: IncomingMessage): Promise<unknown> {
  * Callers that embed this behind a reverse proxy must forward the
  * Authorization and mcp-session-id headers unchanged.
  */
+interface SessionEntry {
+  transport: StreamableHTTPServerTransport;
+  /** Date.now() of the last request routed through this session. */
+  lastActivity: number;
+}
+
 export function startHttpServer(options: HttpTransportOptions): Promise<HttpServer> {
   const { port, bearerToken, createServer, host } = options;
-  const sessions = new Map<string, StreamableHTTPServerTransport>();
+  const sessions = new Map<string, SessionEntry>();
 
   const server = createHttpServer(async (req: IncomingMessage, res: ServerResponse) => {
     try {
@@ -144,9 +154,10 @@ export function startHttpServer(options: HttpTransportOptions): Promise<HttpServ
         }
 
         const sessionId = req.headers['mcp-session-id'];
-        const existing = typeof sessionId === 'string' ? sessions.get(sessionId) : undefined;
-        if (existing) {
-          await existing.handleRequest(req, res, body);
+        const entry = typeof sessionId === 'string' ? sessions.get(sessionId) : undefined;
+        if (entry) {
+          entry.lastActivity = Date.now();
+          await entry.transport.handleRequest(req, res, body);
           return;
         }
 
@@ -154,7 +165,7 @@ export function startHttpServer(options: HttpTransportOptions): Promise<HttpServ
           const transport = new StreamableHTTPServerTransport({
             sessionIdGenerator: () => randomUUID(),
             onsessioninitialized: (sid) => {
-              sessions.set(sid, transport);
+              sessions.set(sid, { transport, lastActivity: Date.now() });
             },
             enableJsonResponse: true,
           });
@@ -199,12 +210,12 @@ export function startHttpServer(options: HttpTransportOptions): Promise<HttpServ
 
       if (req.method === 'DELETE') {
         const sessionId = req.headers['mcp-session-id'];
-        const transport = typeof sessionId === 'string' ? sessions.get(sessionId) : undefined;
-        if (!transport) {
+        const entry = typeof sessionId === 'string' ? sessions.get(sessionId) : undefined;
+        if (!entry) {
           jsonError(res, 404, -32001, 'Session not found');
           return;
         }
-        await transport.handleRequest(req, res);
+        await entry.transport.handleRequest(req, res);
         return;
       }
 
@@ -225,6 +236,24 @@ export function startHttpServer(options: HttpTransportOptions): Promise<HttpServ
       }
     }
   });
+
+  // Idle-session reaper: sessions hold memory only (no device state), but an
+  // abandoned session should not live forever. Swept transports are closed,
+  // which fires onclose and removes them from the map (delete here first is
+  // idempotent). unref'd so the timer never keeps the process alive.
+  const maxSessionIdleMs = options.maxSessionIdleMs ?? 24 * 60 * 60 * 1000;
+  const sweepIntervalMs = options.sweepIntervalMs ?? 60 * 60 * 1000;
+  const sweepTimer = setInterval(() => {
+    const now = Date.now();
+    for (const [sid, entry] of sessions) {
+      if (now - entry.lastActivity > maxSessionIdleMs) {
+        sessions.delete(sid);
+        entry.transport.close().catch(() => {});
+      }
+    }
+  }, sweepIntervalMs);
+  sweepTimer.unref();
+  server.on('close', () => clearInterval(sweepTimer));
 
   return new Promise((resolve, reject) => {
     server.once('error', reject);

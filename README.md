@@ -93,7 +93,8 @@ PIKVM_MCP_NO_DOTENV=0
 
 - **`PIKVM_MCP_PORT`** — enables HTTP mode. The endpoint is `/mcp` (MCP
   Streamable HTTP; initialize first, then send `mcp-session-id` on every
-  request, `DELETE /mcp` to end the session). `GET /healthz` returns `200 ok`
+  request, `DELETE /mcp` to end the session; idle sessions are reaped after
+  24h with an hourly sweep). `GET /healthz` returns `200 ok`
   unauthenticated for supervision scripts.
 - **`PIKVM_MCP_HOST`** — bind address, default `127.0.0.1`. Set it to a
   specific interface address (e.g. the docker bridge gateway IP `172.17.0.1`)
