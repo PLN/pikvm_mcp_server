@@ -3,6 +3,10 @@
 // adapted from dtrukr/pikvm_mcp_server src/pikvm/client.ts @ d120243 (GPL-3.0).
 // Snapshot HTTP 503 retry-once adapted from dvaerum/pikvm_mcp_server
 // fetchSnapshotWithRetry and PiKVMApiError @ b5fdc31 (GPL-3.0).
+//
+// HID ceilings: /hid/print is 5s + 1.5 × (4·min(len,1024) + 2) × perEventSec + 5s,
+// at least 10s, and is refused above 50s. Other HID POSTs use 30s. When a
+// ceiling expires the error is PIKVM_HID_STATE_UNKNOWN and the call is not retried.
 
 /**
  * PiKVM API Client
@@ -30,12 +34,6 @@ export interface PiKVMConfig {
   defaultKeymap?: string;
   /** Abort deadline for one ordinary kvmd call. Default 5000. */
   requestTimeoutMs?: number;
-  /**
-   * Multiplier for HID abort timers. Default 1.
-   * Tests pass a fraction so a 10s or 30s ceiling expires quickly.
-   * Refusal still uses the unscaled estimate.
-   */
-  deadlineScale?: number;
 }
 
 export interface TypeOptions {
@@ -190,12 +188,55 @@ function parseKvmdFailure(text: string): { error: string; error_msg: string } | 
   return null;
 }
 
+/** Nothing was written. Connection refused and DNS failures stay unreachable. */
+const PRE_SEND_CODES = new Set([
+  'ECONNREFUSED',
+  'ENOTFOUND',
+  'EAI_AGAIN',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+]);
+
+/**
+ * The request may already be at kvmd. A reset here must not be retried,
+ * and must not be reported as a clean "unreachable".
+ */
+const POST_SEND_SOCKET_CODES = new Set([
+  'ECONNRESET',
+  'EPIPE',
+  'ECONNABORTED',
+  'UND_ERR_SOCKET',
+  'UND_ERR_CLOSED',
+]);
+
+function errorCodes(err: unknown): string[] {
+  const codes: string[] = [];
+  const seen = new Set<unknown>();
+  let current: unknown = err;
+  while (current && typeof current === 'object' && !seen.has(current)) {
+    seen.add(current);
+    const code = (current as { code?: unknown }).code;
+    if (typeof code === 'string') codes.push(code);
+    current = (current as { cause?: unknown }).cause;
+  }
+  return codes;
+}
+
+function failedAfterSend(err: unknown): boolean {
+  const codes = errorCodes(err);
+  if (codes.some((code) => PRE_SEND_CODES.has(code))) return false;
+  return codes.some((code) => POST_SEND_SOCKET_CODES.has(code));
+}
+
 function transportError(err: unknown, endpoint: string, hid: boolean): KvmdError {
   if (isTimeoutError(err)) {
     if (hid) {
       return new KvmdError(0, 'PIKVM_HID_STATE_UNKNOWN', HID_STATE_UNKNOWN_MESSAGE, endpoint);
     }
     return new KvmdError(0, 'PIKVM_TIMEOUT', 'kvmd request timed out', endpoint);
+  }
+  if (hid && failedAfterSend(err)) {
+    return new KvmdError(0, 'PIKVM_HID_STATE_UNKNOWN', HID_STATE_UNKNOWN_MESSAGE, endpoint);
   }
   return new KvmdError(0, 'PIKVM_UNREACHABLE', 'kvmd network error', endpoint);
 }
@@ -204,11 +245,6 @@ function isRetryableGetError(err: KvmdError): boolean {
   if (err.type === 'PIKVM_HID_STATE_UNKNOWN') return false;
   if (err.type === 'PIKVM_UNREACHABLE' || err.type === 'PIKVM_TIMEOUT') return true;
   return err.status === 502 || err.status === 503;
-}
-
-function deadlineScaleOf(value: number | undefined): number {
-  if (value === undefined || !Number.isFinite(value) || value <= 0) return 1;
-  return value;
 }
 
 /** `delay` as it appears on the query string, or undefined when omitted. */
@@ -236,9 +272,28 @@ function jitterMs(): number {
   return Math.floor(Math.random() * GET_RETRY_JITTER_MS);
 }
 
+/**
+ * HID abort timers are multiplied by this in tests. Not a config field.
+ * Refusal still uses the unscaled estimate.
+ */
+const hidDeadlineScales = new WeakMap<PiKVMClient, number>();
+
+/** Configured password for tool-error redaction. Not a client method. */
+const redactionPasswords = new WeakMap<PiKVMClient, string>();
+
+/** Test-only. Shrinks HID abort timers without putting a scale on PiKVMConfig. */
+export function setHidDeadlineScaleForTests(client: PiKVMClient, scale: number): void {
+  if (!Number.isFinite(scale) || scale <= 0) return;
+  hidDeadlineScales.set(client, scale);
+}
+
+/** Package-internal. The tool error path redacts with this password. */
+export function redactionPassword(client: PiKVMClient): string {
+  return redactionPasswords.get(client) ?? '';
+}
+
 export class PiKVMClient {
-  private config: Required<Omit<PiKVMConfig, 'deadlineScale'>>;
-  private deadlineScale: number;
+  private config: Required<PiKVMConfig>;
   private dispatcher: Agent;
   private cachedResolution: ScreenResolution | null = null;
   private screenshotScale: {
@@ -248,15 +303,14 @@ export class PiKVMClient {
   private calibration: CalibrationState | null = null;
 
   constructor(config: PiKVMConfig) {
-    const { deadlineScale, ...rest } = config;
-    this.deadlineScale = deadlineScaleOf(deadlineScale);
     this.config = {
       verifySsl: false,
       defaultKeymap: 'en-us',
       requestTimeoutMs: 5000,
-      ...rest,
+      ...config,
     };
     this.config.requestTimeoutMs = clampRequestTimeoutMs(this.config.requestTimeoutMs);
+    redactionPasswords.set(this, this.config.password);
 
     // headersTimeout and bodyTimeout 0 turn off undici's 300s defaults.
     // Each call sets its own AbortSignal, including HID ceilings.
@@ -286,7 +340,9 @@ export class PiKVMClient {
    * That extra try does not consume one of the three attempts, so a
    * snapshot can make at most four calls. HID POSTs use a per-call
    * ceiling and are never retried. /hid/print above 50s is refused
-   * before the request is sent.
+   * before the request is sent. A socket reset after a HID POST was
+   * sent is PIKVM_HID_STATE_UNKNOWN. A connect refusal stays
+   * PIKVM_UNREACHABLE.
    */
   private async request<T = unknown>(
     method: string,
@@ -425,15 +481,10 @@ export class PiKVMClient {
     return redactSecrets(value, this.config.password);
   }
 
-  /** Configured kvmd password, for tool-error redaction in this process. */
-  redactionPassword(): string {
-    return this.config.password;
-  }
-
   /**
    * Abort timer for one HID POST. Print uses the length × delay ceiling
    * and is refused above 50s. Every other HID POST uses 30s.
-   * deadlineScale shrinks the timer in tests; the refusal check does not.
+   * The test hook shrinks the timer; the refusal check does not.
    */
   private hidTimeoutMs(path: string, body: string | object | undefined): number {
     const pathname = path.split('?')[0];
@@ -448,13 +499,15 @@ export class PiKVMClient {
         );
       }
     }
-    return Math.max(1, Math.round(ceilingMs * this.deadlineScale));
+    const scale = hidDeadlineScales.get(this) ?? 1;
+    return Math.max(1, Math.round(ceilingMs * scale));
   }
 
   /**
    * Body reads can fail after headers: the deadline aborts a slow body,
-   * or the socket resets. Those become the same KvmdError values as a
-   * failed fetch, and GET retry treats them the same way.
+   * or the socket resets. A HID reset is PIKVM_HID_STATE_UNKNOWN.
+   * Other resets match a failed fetch, and GET retry treats them the
+   * same way.
    */
   private async readBody<T>(read: () => Promise<T>, endpoint: string, hid: boolean): Promise<T> {
     try {

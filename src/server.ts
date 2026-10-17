@@ -17,7 +17,7 @@ import {
   GetPromptRequestSchema,
   Tool,
 } from '@modelcontextprotocol/sdk/types.js';
-import { type PiKVMClient, KvmdError } from './pikvm/client.js';
+import { type PiKVMClient, KvmdError, redactionPassword } from './pikvm/client.js';
 import { redactSecrets } from './redact.js';
 import type { BusyLock } from './pikvm/lock.js';
 import { autoCalibrateWithRetries } from './pikvm/auto-calibrate.js';
@@ -801,7 +801,7 @@ export function createMcpServer(deps: McpServerDeps): Server {
       }
     } catch (error) {
       return {
-        content: [{ type: 'text', text: formatToolError(error, deps.pikvm.redactionPassword()) }],
+        content: [{ type: 'text', text: formatToolError(error, redactionPassword(deps.pikvm)) }],
         isError: true,
       };
     }

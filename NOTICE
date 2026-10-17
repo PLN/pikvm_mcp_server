@@ -136,3 +136,10 @@ Modification log (GPLv3 §5a)
   that is 0, falls back to 5000. Values above 600000 still clamp.
   Literal password redaction applies only when the password is at
   least 4 characters, including on the tool error path.
+
+2026-10, by PLN:
+  A connection reset or socket error on a HID POST after the request
+  was sent is PIKVM_HID_STATE_UNKNOWN and is not retried. A failure
+  before the request is sent, such as connection refused, stays
+  PIKVM_UNREACHABLE. With slow and no delay, a print of 333 characters
+  or more is refused (332 still fits). kvmd itself allows 1024.

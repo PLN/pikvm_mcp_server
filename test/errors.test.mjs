@@ -7,7 +7,8 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { PiKVMClient } from '../dist/pikvm/client.js';
+import http from 'node:http';
+import { KvmdError, PiKVMClient, setHidDeadlineScaleForTests } from '../dist/pikvm/client.js';
 import { BusyLock } from '../dist/pikvm/lock.js';
 import { createMcpServer } from '../dist/server.js';
 import { startHttpServer } from '../dist/http.js';
@@ -27,8 +28,10 @@ function depsFactory(mock, armGateEnforced, options = {}) {
     password: options.password ?? 'testpw',
     verifySsl: false,
     requestTimeoutMs: options.requestTimeoutMs,
-    deadlineScale: options.deadlineScale,
   });
+  if (options.deadlineScale !== undefined) {
+    setHidDeadlineScaleForTests(pikvm, options.deadlineScale);
+  }
   return () => createMcpServer({
     pikvm,
     lock: new BusyLock(),
@@ -281,13 +284,14 @@ test('a dropped GET maps to PIKVM_UNREACHABLE and is attempted 3 times', async (
   });
 });
 
-test('a dropped POST maps to PIKVM_UNREACHABLE and is not retried', async () => {
+test('a dropped HID POST maps to PIKVM_HID_STATE_UNKNOWN and is not retried', async () => {
   await withSession({
     'POST /api/hid/events/send_key': { drop: true },
   }, false, async ({ mock, srv, sessionId }) => {
     const result = await callTool(srv.base, sessionId, 'pikvm_key', { key: 'KeyA' });
     const { details } = parseKvmdToolError(result);
-    assert.equal(details.type, 'PIKVM_UNREACHABLE');
+    assert.equal(details.type, 'PIKVM_HID_STATE_UNKNOWN');
+    assert.equal(details.message, 'input may still be applying; do not resend');
     assert.equal(details.status, 0);
     assert.equal(count(mock, 'POST', '/api/hid/events/send_key'), 1);
   });
@@ -425,15 +429,37 @@ test('a body reset on GET maps to PIKVM_UNREACHABLE and is attempted 3 times', a
   });
 });
 
-test('a body reset on POST maps to PIKVM_UNREACHABLE and is not retried', async () => {
+test('a body reset on a HID POST maps to PIKVM_HID_STATE_UNKNOWN and is not retried', async () => {
   await withSession({
     'POST /api/hid/events/send_key': { resetAfterHeaders: true },
   }, false, async ({ mock, srv, sessionId }) => {
     const result = await callTool(srv.base, sessionId, 'pikvm_key', { key: 'KeyA' });
     const { details } = parseKvmdToolError(result);
-    assert.equal(details.type, 'PIKVM_UNREACHABLE');
+    assert.equal(details.type, 'PIKVM_HID_STATE_UNKNOWN');
+    assert.equal(details.message, 'input may still be applying; do not resend');
     assert.equal(count(mock, 'POST', '/api/hid/events/send_key'), 1);
   });
+});
+
+test('a HID POST refused at connect stays PIKVM_UNREACHABLE and is not retried', async () => {
+  const probe = http.createServer();
+  await new Promise((resolve) => probe.listen(0, '127.0.0.1', resolve));
+  const { port } = probe.address();
+  await new Promise((resolve) => probe.close(resolve));
+  const pikvm = new PiKVMClient({
+    host: `http://127.0.0.1:${port}`,
+    username: 'admin',
+    password: 'testpw',
+    verifySsl: false,
+  });
+  const started = Date.now();
+  await assert.rejects(() => pikvm.sendKey('KeyA'), (err) => {
+    assert.ok(err instanceof KvmdError);
+    assert.equal(err.type, 'PIKVM_UNREACHABLE');
+    assert.equal(err.message, 'kvmd network error');
+    return true;
+  });
+  assert.ok(Date.now() - started < 250, 'connect refusal must not wait out a retry backoff');
 });
 
 test('a slow body on GET maps to PIKVM_TIMEOUT and is attempted 3 times', { timeout: 20000 }, async () => {
@@ -588,21 +614,21 @@ test('POST /hid/print ceiling expiry is PIKVM_HID_STATE_UNKNOWN and is sent once
   }, { deadlineScale: 0.01 });
 });
 
-test('other HID POSTs use a 30s ceiling, longer than the print minimum', async () => {
-  // 200ms is past the scaled 10s print ceiling (100ms) and inside the
-  // scaled 30s ceiling (300ms).
+test('other HID POSTs finish inside a scaled 30s ceiling', async () => {
+  // Scale 0.1 turns 30s into 3s. A 200ms response is 15× under that.
   await withSession({
     'POST /api/hid/events/send_key': { delayMs: 200, status: 204, body: '' },
   }, false, async ({ mock, srv, sessionId }) => {
     const result = await callTool(srv.base, sessionId, 'pikvm_key', { key: 'Enter' });
     assert.equal(result.isError, undefined);
     assert.equal(count(mock, 'POST', '/api/hid/events/send_key'), 1);
-  }, { deadlineScale: 0.01 });
+  }, { deadlineScale: 0.1 });
 });
 
 test('other HID POST ceiling expiry is PIKVM_HID_STATE_UNKNOWN and is sent once', async () => {
+  // Scale 0.01 turns 30s into 300ms. 1200ms is 4× over that.
   await withSession({
-    'POST /api/hid/events/send_key': { delayMs: 800, status: 204, body: '' },
+    'POST /api/hid/events/send_key': { delayMs: 1200, status: 204, body: '' },
   }, false, async ({ mock, srv, sessionId }) => {
     const result = await callTool(srv.base, sessionId, 'pikvm_key', { key: 'Enter' });
     const { details } = parseKvmdToolError(result);
@@ -613,12 +639,14 @@ test('other HID POST ceiling expiry is PIKVM_HID_STATE_UNKNOWN and is sent once'
 });
 
 test('a print whose ceiling is above 50s is refused with zero kvmd calls', async () => {
+  // delay 1 is one second per event, which kvmd accepts. Ten characters
+  // estimate 73s, above the 50s ceiling.
   await withSession({
     'POST /api/hid/print': { status: 204, body: '' },
   }, false, async ({ mock, srv, sessionId }) => {
     const result = await callTool(srv.base, sessionId, 'pikvm_type', {
-      text: 'hello',
-      delay: 200,
+      text: '0123456789',
+      delay: 1,
     });
     assert.equal(result.isError, true);
     const text = result.content[0].text;
