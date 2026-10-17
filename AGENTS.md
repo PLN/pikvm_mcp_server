@@ -1,3 +1,5 @@
+<!-- Modified 2026-10 by PLN: PIKVM_REQUEST_TIMEOUT_MS (GPL-3.0; see NOTICE) -->
+
 # AGENTS.md - PiKVM MCP Server
 
 ## Project Overview
@@ -61,6 +63,7 @@ The server is configured via environment variables or a config file:
 - `PIKVM_PASSWORD` - Auth password
 - `PIKVM_VERIFY_SSL` - Whether to verify SSL certs (default: `false` for self-signed)
 - `PIKVM_DEFAULT_KEYMAP` - Default keyboard layout (default: `en-us`)
+- `PIKVM_REQUEST_TIMEOUT_MS` - Abort deadline for one ordinary kvmd call, in milliseconds (default: `5000`)
 - `PIKVM_MCP_PORT` - set to serve MCP over Streamable HTTP instead of stdio
 - `PIKVM_MCP_HOST` - HTTP bind address (default: `127.0.0.1`)
 - `PIKVM_MCP_BEARER` - required bearer token in HTTP mode (refuses to start without it)

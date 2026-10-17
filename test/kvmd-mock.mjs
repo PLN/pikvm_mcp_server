@@ -1,7 +1,14 @@
+// Modified 2026-10 by PLN: configurable error, status, and delay routes (GPL-3.0; see NOTICE).
+
 /**
  * Minimal KVMD REST mock implementing exactly the routes src/pikvm/client.ts
  * calls. Never touches real hardware — every HID POST just returns 204 and
  * is recorded in `calls` for assertions.
+ *
+ * `options.routes` overrides a route for the first `failTimes` hits
+ * (every hit, when `failTimes` is omitted). Keys are `METHOD /api/...`.
+ * `delayMs` waits, and ends early if the client aborts. `drop` destroys
+ * the socket. After the override is exhausted the built-in route runs.
  */
 
 import http from 'node:http';
@@ -17,12 +24,52 @@ async function tinyJpeg() {
   return jpegCache;
 }
 
-export async function startKvmdMock() {
+function waitOrClose(req, ms) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(done, ms);
+    function done() {
+      req.off('close', done);
+      clearTimeout(timer);
+      resolve();
+    }
+    req.on('close', done);
+  });
+}
+
+export async function startKvmdMock(options = {}) {
   const calls = [];
+  const routes = options.routes ?? {};
+  const routeHits = {};
 
   const server = http.createServer(async (req, res) => {
     const u = new URL(req.url, 'http://localhost');
-    calls.push({ method: req.method, path: u.pathname, query: u.search });
+    calls.push({ method: req.method, path: u.pathname, query: u.search, at: Date.now() });
+
+    const routeKey = `${req.method} ${u.pathname}`;
+    const route = routes[routeKey];
+    if (route) {
+      const n = (routeHits[routeKey] = (routeHits[routeKey] ?? 0) + 1);
+      const override = route.failTimes === undefined || n <= route.failTimes;
+      if (override) {
+        if (route.delayMs) await waitOrClose(req, route.delayMs);
+        if (req.destroyed || res.writableEnded) return;
+        if (route.drop) {
+          req.socket.destroy();
+          return;
+        }
+        const status = route.status ?? 500;
+        const body = route.body === undefined
+          ? { ok: false, result: { error: 'MockError', error_msg: 'mock error' } }
+          : route.body;
+        const payload = typeof body === 'string' ? body : JSON.stringify(body);
+        res.writeHead(status, {
+          'Content-Type': route.contentType ?? 'application/json',
+          'Content-Length': Buffer.byteLength(payload),
+        });
+        res.end(payload);
+        return;
+      }
+    }
 
     if (req.method === 'GET' && u.pathname === '/api/auth/check') {
       res.writeHead(200, { 'Content-Type': 'application/json' });

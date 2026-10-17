@@ -1,4 +1,6 @@
 /**
+ * Modified 2026-10 by PLN: PIKVM_REQUEST_TIMEOUT_MS (GPL-3.0; see NOTICE).
+ *
  * loadEnvFile unit tests — verify PIKVM_MCP_NO_DOTENV=1 makes .env lose to
  * explicitly-set process env (the gateway systemd landmine fix).
  *
@@ -95,6 +97,31 @@ test('HTTP config: bind host defaults to 127.0.0.1, PIKVM_MCP_HOST overrides', (
     assert.equal(loadConfig().http.host, '127.0.0.1', 'bind must default to loopback');
     process.env.PIKVM_MCP_HOST = '10.66.0.7';
     assert.equal(loadConfig().http.host, '10.66.0.7', 'bridge gateway IP must be settable');
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+});
+
+test('PIKVM_REQUEST_TIMEOUT_MS defaults to 5000; non-positive values fall back', () => {
+  const saved = {
+    PIKVM_HOST: process.env.PIKVM_HOST,
+    PIKVM_PASSWORD: process.env.PIKVM_PASSWORD,
+    PIKVM_REQUEST_TIMEOUT_MS: process.env.PIKVM_REQUEST_TIMEOUT_MS,
+  };
+  process.env.PIKVM_HOST = 'http://mock.test';
+  process.env.PIKVM_PASSWORD = 'testpw';
+  try {
+    delete process.env.PIKVM_REQUEST_TIMEOUT_MS;
+    assert.equal(loadConfig().pikvm.requestTimeoutMs, 5000);
+    process.env.PIKVM_REQUEST_TIMEOUT_MS = '1500';
+    assert.equal(loadConfig().pikvm.requestTimeoutMs, 1500);
+    process.env.PIKVM_REQUEST_TIMEOUT_MS = '0';
+    assert.equal(loadConfig().pikvm.requestTimeoutMs, 5000);
+    process.env.PIKVM_REQUEST_TIMEOUT_MS = 'nope';
+    assert.equal(loadConfig().pikvm.requestTimeoutMs, 5000);
   } finally {
     for (const [k, v] of Object.entries(saved)) {
       if (v === undefined) delete process.env[k];

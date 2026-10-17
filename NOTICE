@@ -52,6 +52,26 @@ dvaerum/pikvm_mcp_server .github/workflows/ci.yml at
 00cbfc0207c1be2b28b25679019e7fe9bd9d9654 (GPL-3.0). This fork's workflow
 runs on Node 22: npm ci, npm run typecheck, then npm test.
 
+Kvmd errors, timeouts, and retry
+---------------------------------
+
+Typed HTTP failure (a status on the error) and one retry of
+GET /streamer/snapshot after HTTP 503 are adapted from
+dvaerum/pikvm_mcp_server src/pikvm/client.ts PiKVMApiError and
+fetchSnapshotWithRetry at b5fdc31e16525f196282436a0fa7ca797eea2e5e
+(GPL-3.0). The grace period is 1500 ms. This fork does not take the
+websocket keepalive from that commit.
+
+AbortSignal.timeout, PIKVM_REQUEST_TIMEOUT_MS (default 5000), and the
+no-retry codes PIKVM_UNREACHABLE and PIKVM_AUTH_FAILED are adapted from
+dtrukr/pikvm_mcp_server src/pikvm/client.ts and src/config.ts at
+d120243c4b81802ae725c18b39c4681ce89bfb7a (GPL-3.0). A timeout is reported
+as PIKVM_TIMEOUT. Idempotent GET retry is local to this fork: 3
+attempts, sleeping 250 ms then 500 ms plus jitter (the 250/500/1000 ms
+schedule; the 1000 ms step sits outside the three-attempt cap), on
+network errors, timeouts, HTTP 502, and HTTP 503. POST is not retried.
+HTTP 400, 401, 403, and 409 are not retried.
+
 Files that cannot carry a comment header
 ----------------------------------------
 
@@ -76,3 +96,15 @@ Modification log (GPLv3 §5a)
   cited above, then pinned its actions to the current v5 commits and
   set the runner to ubuntu-24.04. Noted the same Node.js facts and the
   GPL-3.0-only licence line in README.md.
+
+2026-10, by PLN:
+  Replaced the truncated kvmd error text in the client with KvmdError
+  (status, type, message, endpoint). kvmd
+  {ok:false,result:{error,error_msg}} is surfaced intact on tool
+  results, with the same secret redaction as before. Network failures
+  are PIKVM_UNREACHABLE, timeouts are PIKVM_TIMEOUT, and HTTP 401/403
+  are PIKVM_AUTH_FAILED. Ordinary kvmd calls abort at
+  PIKVM_REQUEST_TIMEOUT_MS (default 5000). Idempotent GETs retry up to
+  3 times on network errors, timeouts, HTTP 502, and HTTP 503. POST is
+  not retried. GET /streamer/snapshot retries HTTP 503 once after
+  1500 ms. Sources are the dvaerum and dtrukr commits cited above.

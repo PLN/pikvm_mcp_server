@@ -1,3 +1,5 @@
+// Modified 2026-10 by PLN: typed KvmdError, timeouts, GET retry (GPL-3.0; see NOTICE).
+
 /**
  * MCP server factory for PiKVM tools
  *
@@ -15,7 +17,7 @@ import {
   GetPromptRequestSchema,
   Tool,
 } from '@modelcontextprotocol/sdk/types.js';
-import type { PiKVMClient } from './pikvm/client.js';
+import { type PiKVMClient, KvmdError } from './pikvm/client.js';
 import type { BusyLock } from './pikvm/lock.js';
 import { autoCalibrateWithRetries } from './pikvm/auto-calibrate.js';
 import { allPrompts, getPromptByName } from './prompts/index.js';
@@ -147,6 +149,42 @@ export const ARM_GATED_TOOLS = new Set([
   'pikvm_calibrate',
   'pikvm_auto_calibrate',
 ]);
+
+/**
+ * Strip credentials that might have been echoed in an error string.
+ * Same replacements the tool-error path used before KvmdError.
+ */
+function redactSecrets(value: string): string {
+  return value
+    .replace(/X-KVMD-Passwd[^,\s]*/gi, 'X-KVMD-Passwd=[REDACTED]')
+    .replace(/password[=:][^\s,]*/gi, 'password=[REDACTED]');
+}
+
+/**
+ * Tool failure text. KvmdError keeps status, type, message, and endpoint.
+ * Other errors stay `Error: <message>`.
+ */
+function formatToolError(error: unknown): string {
+  if (error instanceof KvmdError) {
+    const message = redactSecrets(error.message);
+    const endpoint = redactSecrets(error.endpoint);
+    const type = redactSecrets(error.type);
+    const summary = `Error [${type}] ${endpoint} (HTTP ${error.status}): ${message}`;
+    const details = JSON.stringify({
+      status: error.status,
+      type,
+      message,
+      endpoint,
+    });
+    // Fields are already redacted. A second pass over the JSON would treat
+    // the closing quote as part of X-KVMD-Passwd=[REDACTED] and break the block.
+    return `${summary}\n${details}`;
+  }
+  if (error instanceof Error) {
+    return `Error: ${redactSecrets(error.message)}`;
+  }
+  return 'Error: An unexpected error occurred';
+}
 
 function disarmedResult(tool: string) {
   return {
@@ -770,18 +808,8 @@ export function createMcpServer(deps: McpServerDeps): Server {
           throw new Error(`Unknown tool: ${name}`);
       }
     } catch (error) {
-      // Sanitize error messages to avoid exposing sensitive information
-      let message: string;
-      if (error instanceof Error) {
-        // Strip any potential credential information from error messages
-        message = error.message
-          .replace(/X-KVMD-Passwd[^,\s]*/gi, 'X-KVMD-Passwd=[REDACTED]')
-          .replace(/password[=:][^\s,]*/gi, 'password=[REDACTED]');
-      } else {
-        message = 'An unexpected error occurred';
-      }
       return {
-        content: [{ type: 'text', text: `Error: ${message}` }],
+        content: [{ type: 'text', text: formatToolError(error) }],
         isError: true,
       };
     }

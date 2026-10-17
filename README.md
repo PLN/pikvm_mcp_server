@@ -1,4 +1,4 @@
-<!-- Modified 2026-10 by PLN: Node.js engines note and GPL-3.0-only licence line (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: Node.js engines note, GPL-3.0-only licence line, and PIKVM_REQUEST_TIMEOUT_MS (GPL-3.0; see NOTICE) -->
 
 # PiKVM MCP Server
 
@@ -76,7 +76,10 @@ PIKVM_USERNAME=admin
 PIKVM_PASSWORD=your_password
 PIKVM_VERIFY_SSL=false
 PIKVM_DEFAULT_KEYMAP=en-us
+PIKVM_REQUEST_TIMEOUT_MS=5000
 ```
+
+`PIKVM_REQUEST_TIMEOUT_MS` is the abort deadline, in milliseconds, for one ordinary kvmd call (default 5000). An idempotent GET that fails with a network error, a timeout, HTTP 502, or HTTP 503 is tried up to 3 times (backoff 250 ms, then 500 ms, plus a little jitter). POST is not retried. `GET /streamer/snapshot` retries HTTP 503 once after a 1500 ms grace period, for the ustreamer idle-stop race.
 
 ## HTTP Mode (remote / gateway deployments)
 

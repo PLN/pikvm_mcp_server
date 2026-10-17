@@ -1,3 +1,9 @@
+// Modified 2026-10 by PLN: typed KvmdError, timeouts, GET retry (GPL-3.0; see NOTICE).
+// AbortSignal.timeout and PIKVM_UNREACHABLE / PIKVM_AUTH_FAILED no-retry codes
+// adapted from dtrukr/pikvm_mcp_server src/pikvm/client.ts @ d120243 (GPL-3.0).
+// Snapshot HTTP 503 retry-once adapted from dvaerum/pikvm_mcp_server
+// fetchSnapshotWithRetry and PiKVMApiError @ b5fdc31 (GPL-3.0).
+
 /**
  * PiKVM API Client
  *
@@ -14,6 +20,8 @@ export interface PiKVMConfig {
   password: string;
   verifySsl?: boolean;
   defaultKeymap?: string;
+  /** Abort deadline for one ordinary kvmd call. Default 5000. */
+  requestTimeoutMs?: number;
 }
 
 export interface TypeOptions {
@@ -78,6 +86,109 @@ export interface CalibrationResult {
   message: string;
 }
 
+/**
+ * Failure from one kvmd call.
+ *
+ * `type` is kvmd's `result.error` when the body is
+ * `{ok:false,result:{error,error_msg}}`. Network, timeout, and auth
+ * failures use PIKVM_UNREACHABLE, PIKVM_TIMEOUT, and PIKVM_AUTH_FAILED.
+ * `message` is kvmd's `error_msg` after secret redaction. `endpoint` is
+ * the method and path with no query string.
+ */
+export class KvmdError extends Error {
+  readonly status: number;
+  readonly type: string;
+  readonly endpoint: string;
+
+  constructor(status: number, type: string, message: string, endpoint: string) {
+    super(message);
+    this.name = 'KvmdError';
+    this.status = status;
+    this.type = type;
+    this.endpoint = endpoint;
+  }
+}
+
+/** Idempotent GET attempts, including the first. */
+const MAX_GET_ATTEMPTS = 3;
+
+/**
+ * Backoff before retries, in ms. Three attempts sleep 250ms then 500ms.
+ * 1000ms is the next step of the same schedule and is not slept inside
+ * the three-attempt cap.
+ */
+const GET_RETRY_BACKOFF_MS = [250, 500, 1000] as const;
+
+/** Added to each GET retry backoff. Inclusive range 0..99. */
+const GET_RETRY_JITTER_MS = 100;
+
+/**
+ * Grace before the single snapshot 503 retry. ustreamer can answer 503
+ * while it is starting after an idle stop; a short backoff is not enough.
+ */
+const SNAPSHOT_503_GRACE_MS = 1500;
+
+function sanitizeKvmdMessage(text: string): string {
+  return text
+    .replace(/password[=:][^\s,"]*/gi, 'password=[REDACTED]')
+    .replace(/X-KVMD-Passwd[^,\s"]*/gi, 'X-KVMD-Passwd=[REDACTED]');
+}
+
+function isSnapshotPath(path: string): boolean {
+  return path.split('?')[0] === '/streamer/snapshot';
+}
+
+function isTimeoutError(err: unknown): boolean {
+  const seen = new Set<unknown>();
+  let current: unknown = err;
+  while (current && typeof current === 'object' && !seen.has(current)) {
+    seen.add(current);
+    const name = (current as { name?: unknown }).name;
+    const code = (current as { code?: unknown }).code;
+    if (name === 'TimeoutError') return true;
+    if (
+      code === 'UND_ERR_CONNECT_TIMEOUT' ||
+      code === 'UND_ERR_HEADERS_TIMEOUT' ||
+      code === 'UND_ERR_BODY_TIMEOUT'
+    ) {
+      return true;
+    }
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+function parseKvmdFailure(text: string): { error: string; error_msg: string } | null {
+  try {
+    const parsed = JSON.parse(text) as {
+      result?: { error?: unknown; error_msg?: unknown };
+    };
+    const error = parsed?.result?.error;
+    const errorMsg = parsed?.result?.error_msg;
+    if (typeof error === 'string' && typeof errorMsg === 'string') {
+      return { error, error_msg: errorMsg };
+    }
+  } catch {
+    // Not the kvmd JSON error shape.
+  }
+  return null;
+}
+
+function isRetryableGetError(err: KvmdError): boolean {
+  if (err.type === 'PIKVM_UNREACHABLE' || err.type === 'PIKVM_TIMEOUT') return true;
+  return err.status === 502 || err.status === 503;
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function jitterMs(): number {
+  return Math.floor(Math.random() * GET_RETRY_JITTER_MS);
+}
+
 export class PiKVMClient {
   private config: Required<PiKVMConfig>;
   private dispatcher: Agent;
@@ -92,8 +203,12 @@ export class PiKVMClient {
     this.config = {
       verifySsl: false,
       defaultKeymap: 'en-us',
+      requestTimeoutMs: 5000,
       ...config,
     };
+    if (!(this.config.requestTimeoutMs > 0)) {
+      this.config.requestTimeoutMs = 5000;
+    }
 
     // Create dispatcher with SSL configuration
     this.dispatcher = new Agent({
@@ -111,7 +226,13 @@ export class PiKVMClient {
   }
 
   /**
-   * Make an authenticated request to the PiKVM API
+   * Make an authenticated request to the PiKVM API.
+   *
+   * Idempotent GETs are tried up to three times on a network error, a
+   * timeout, HTTP 502, or HTTP 503. POST is never retried. HTTP 400, 401,
+   * 403, and 409 are never retried. GET /streamer/snapshot on HTTP 503
+   * waits out the ustreamer idle-stop grace and retries once, instead of
+   * using the short GET schedule.
    */
   private async request<T = unknown>(
     method: string,
@@ -119,7 +240,45 @@ export class PiKVMClient {
     body?: string | object,
     contentType?: string
   ): Promise<T> {
+    const idempotentGet = method.toUpperCase() === 'GET';
+    const snapshot = idempotentGet && isSnapshotPath(path);
+    let generalFailures = 0;
+    let snapshot503Retried = false;
+
+    for (;;) {
+      try {
+        return await this.requestOnce<T>(method, path, body, contentType);
+      } catch (err) {
+        if (!idempotentGet || !(err instanceof KvmdError) || !isRetryableGetError(err)) {
+          throw err;
+        }
+        if (snapshot && err.status === 503) {
+          if (snapshot503Retried) throw err;
+          snapshot503Retried = true;
+          await delay(SNAPSHOT_503_GRACE_MS);
+          continue;
+        }
+        generalFailures += 1;
+        if (generalFailures >= MAX_GET_ATTEMPTS) throw err;
+        const backoff = GET_RETRY_BACKOFF_MS[
+          Math.min(generalFailures - 1, GET_RETRY_BACKOFF_MS.length - 1)
+        ];
+        await delay(backoff + jitterMs());
+      }
+    }
+  }
+
+  /**
+   * One kvmd call. Throws KvmdError on HTTP, network, and timeout failures.
+   */
+  private async requestOnce<T = unknown>(
+    method: string,
+    path: string,
+    body?: string | object,
+    contentType?: string
+  ): Promise<T> {
     const url = new URL(`/api${path}`, this.config.host);
+    const endpoint = `${method.toUpperCase()} ${url.pathname}`;
 
     const headers: Record<string, string> = {
       'X-KVMD-User': this.config.username,
@@ -136,21 +295,48 @@ export class PiKVMClient {
       }
     }
 
-    const response = await fetch(url.toString(), {
-      method,
-      headers,
-      body: body ? (typeof body === 'object' ? JSON.stringify(body) : body) : undefined,
-      dispatcher: this.dispatcher,
-    });
+    let response;
+    try {
+      response = await fetch(url.toString(), {
+        method,
+        headers,
+        body: body ? (typeof body === 'object' ? JSON.stringify(body) : body) : undefined,
+        dispatcher: this.dispatcher,
+        signal: AbortSignal.timeout(this.config.requestTimeoutMs),
+      });
+    } catch (err) {
+      if (isTimeoutError(err)) {
+        throw new KvmdError(0, 'PIKVM_TIMEOUT', 'kvmd request timed out', endpoint);
+      }
+      throw new KvmdError(0, 'PIKVM_UNREACHABLE', 'kvmd network error', endpoint);
+    }
 
     if (!response.ok) {
       const errorText = await response.text();
-      // Sanitize error text to avoid exposing sensitive information
-      const sanitizedError = errorText
-        .replace(/password[=:][^\s,"]*/gi, 'password=[REDACTED]')
-        .replace(/X-KVMD-Passwd[^,\s"]*/gi, 'X-KVMD-Passwd=[REDACTED]')
-        .substring(0, 200); // Limit error message length
-      throw new Error(`PiKVM API error ${response.status}: ${sanitizedError}`);
+      const parsed = parseKvmdFailure(errorText);
+      if (response.status === 401 || response.status === 403) {
+        throw new KvmdError(
+          response.status,
+          'PIKVM_AUTH_FAILED',
+          sanitizeKvmdMessage(parsed?.error_msg ?? 'authentication failed'),
+          endpoint,
+        );
+      }
+      if (parsed) {
+        throw new KvmdError(
+          response.status,
+          parsed.error,
+          sanitizeKvmdMessage(parsed.error_msg),
+          endpoint,
+        );
+      }
+      const fallback = sanitizeKvmdMessage(errorText).substring(0, 200);
+      throw new KvmdError(
+        response.status,
+        'PIKVM_HTTP_ERROR',
+        fallback || `HTTP ${response.status}`,
+        endpoint,
+      );
     }
 
     // Check content type for response handling
