@@ -1,3 +1,5 @@
+<!-- Modified 2026-10 by PLN: Node.js 22 requirement and GPL-3.0-only licence line (GPL-3.0; see NOTICE) -->
+
 # PiKVM MCP Server
 
 
@@ -160,7 +162,7 @@ curl -i -X POST http://localhost:8675/mcp \
 
 ## Usage with Claude Code
 
-> **Requires Node.js 18+.** This server uses ES modules. If `node --version` shows an older version, replace `"command": "node"` with the full path to a compatible binary (e.g. `"/usr/local/bin/node"` or your nvm path like `"~/.nvm/versions/node/v22.x.x/bin/node"`). This is common when nvm's default alias points to an older version.
+> **Requires Node.js 22+.** This server uses ES modules. If `node --version` shows an older version, replace `"command": "node"` with the full path to a compatible binary (e.g. `"/usr/local/bin/node"` or your nvm path like `"~/.nvm/versions/node/v22.x.x/bin/node"`). This is common when nvm's default alias points to an older version.
 
 Add to your Claude Code MCP settings (`~/.config/claude-code/settings.json` or via the settings UI):
 
@@ -263,4 +265,4 @@ Common key codes for `pikvm_key` and `pikvm_shortcut`:
 
 ## License
 
-GPL-3.0 - See [LICENSE](LICENSE) for details.
+GPL-3.0-only. See [LICENSE](LICENSE) for the licence text and [NOTICE](NOTICE) for origins and the modification log. No later-version grant is stated.

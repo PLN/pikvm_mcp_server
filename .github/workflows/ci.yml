@@ -1,0 +1,27 @@
+# Modified 2026-10 by PLN: CI test job (GPL-3.0; see NOTICE).
+# Test-job idea adapted from dvaerum/pikvm_mcp_server
+# .github/workflows/ci.yml @ 00cbfc0207c1be2b28b25679019e7fe9bd9d9654
+# (GPL-3.0, test job only).
+
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test

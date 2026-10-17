@@ -22,7 +22,7 @@
     "hid"
   ],
   "author": "",
-  "license": "MIT",
+  "license": "GPL-3.0-only",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
     "dotenv": "^17.2.3",
@@ -35,6 +35,6 @@
     "typescript": "^5.0.0"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=22"
   }
 }
