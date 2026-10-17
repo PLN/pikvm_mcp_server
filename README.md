@@ -1,4 +1,4 @@
-<!-- Modified 2026-10 by PLN: Node.js 22 requirement and GPL-3.0-only licence line (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: Node.js engines note and GPL-3.0-only licence line (GPL-3.0; see NOTICE) -->
 
 # PiKVM MCP Server
 
@@ -162,7 +162,7 @@ curl -i -X POST http://localhost:8675/mcp \
 
 ## Usage with Claude Code
 
-> **Requires Node.js 22+.** This server uses ES modules. If `node --version` shows an older version, replace `"command": "node"` with the full path to a compatible binary (e.g. `"/usr/local/bin/node"` or your nvm path like `"~/.nvm/versions/node/v22.x.x/bin/node"`). This is common when nvm's default alias points to an older version.
+> **Node.js:** `engines` is `>=22` because Node.js 20 is end-of-life. The runtime dependency undici 7.24.1 needs Node.js >=20.18.1, and `npm test` quotes a glob that `node --test` expands only on Node.js 21 and later. This server uses ES modules. If `node --version` shows an older version, replace `"command": "node"` with the full path to a compatible binary (e.g. `"/usr/local/bin/node"` or your nvm path like `"~/.nvm/versions/node/v22.x.x/bin/node"`). This is common when nvm's default alias points to an older version.
 
 Add to your Claude Code MCP settings (`~/.config/claude-code/settings.json` or via the settings UI):
 

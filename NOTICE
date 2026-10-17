@@ -11,6 +11,8 @@ text is the file LICENSE, unchanged from upstream.
 
 This fork is GPL-3.0-only. The upstream statement is GPL-3.0 and does not
 grant the option of any later version, so this fork does not add one.
+Upstream package.json said "MIT" while LICENSE and README said GPL-3.0.
+This fork follows LICENSE.
 
 Origins
 -------
@@ -56,7 +58,10 @@ Files that cannot carry a comment header
 package.json and package-lock.json have no comment syntax. The 2026-10
 edits to those files are covered here: the root package "license" field
 is GPL-3.0-only, and engines.node is >=22. No dependency version was
-changed. The root package entry in package-lock.json matches.
+changed. The root package entry in package-lock.json matches. The
+runtime needs Node.js >=20.18.1 (undici 7.24.1). The quoted npm test
+glob needs Node.js >=21. engines.node is >=22 because Node.js 20 is
+end-of-life.
 
 Modification log (GPLv3 §5a)
 ----------------------------
@@ -64,9 +69,10 @@ Modification log (GPLv3 §5a)
 2026-10, by PLN:
   Added this NOTICE. Set the package licence to GPL-3.0-only and
   engines.node to >=22 in package.json and in the root package entry of
-  package-lock.json. Node.js 22 is required because undici 7.24.1 needs
-  Node.js >=20.18.1 and the quoted node --test glob in npm test is
-  expanded only on Node.js 21 and later; this fork standardises on
-  Node.js 22. Added .github/workflows/ci.yml, a test job adapted from
-  the dvaerum workflow cited above. Noted the Node.js 22 requirement and
-  the GPL-3.0-only licence line in README.md.
+  package-lock.json. The runtime needs Node.js >=20.18.1 (undici
+  7.24.1). The quoted npm test glob needs Node.js >=21. engines.node is
+  >=22 because Node.js 20 is end-of-life. Added
+  .github/workflows/ci.yml, a test job adapted from the dvaerum workflow
+  cited above, then pinned its actions to the current v5 commits and
+  set the runner to ubuntu-24.04. Noted the same Node.js facts and the
+  GPL-3.0-only licence line in README.md.
