@@ -63,7 +63,7 @@ The server is configured via environment variables or a config file:
 - `PIKVM_PASSWORD` - Auth password
 - `PIKVM_VERIFY_SSL` - Whether to verify SSL certs (default: `false` for self-signed)
 - `PIKVM_DEFAULT_KEYMAP` - Default keyboard layout (default: `en-us`)
-- `PIKVM_REQUEST_TIMEOUT_MS` - Abort deadline for one ordinary kvmd call, in milliseconds (integer 1..600000, default: `5000`). Does not apply to HID POSTs.
+- `PIKVM_REQUEST_TIMEOUT_MS` - Abort deadline for one ordinary kvmd call, in milliseconds (digits only, 1..600000, default: `5000`). A non-digit string or 0 uses 5000. Values above 600000 clamp. HID POSTs use a separate ceiling: `/hid/print` scales with length and delay (minimum 10s, refused above 50s) and other HID POSTs use 30s. Expiry is `PIKVM_HID_STATE_UNKNOWN` and is not retried.
 - `PIKVM_MCP_PORT` - set to serve MCP over Streamable HTTP instead of stdio
 - `PIKVM_MCP_HOST` - HTTP bind address (default: `127.0.0.1`)
 - `PIKVM_MCP_BEARER` - required bearer token in HTTP mode (refuses to start without it)

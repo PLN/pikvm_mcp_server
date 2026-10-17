@@ -14,7 +14,9 @@ export function redactSecrets(text: string, secret?: string): string {
     .replace(/password\s*[:=]\s*"[^"]*"/gi, 'password=[REDACTED]')
     .replace(/password\s*[:=]\s*[^\s,"]+/gi, 'password=[REDACTED]')
     .replace(/X-KVMD-Passwd(?:\s*[:=]\s*|\s+)?[^\s,"]*/gi, 'X-KVMD-Passwd=[REDACTED]');
-  if (secret) {
+  // A 1–3 character password is a substring of ordinary words ("cat"
+  // inside "category"). Only a longer secret is removed literally.
+  if (secret && secret.length >= 4) {
     out = out.split(secret).join('[REDACTED]');
   }
   return out;

@@ -1,0 +1,38 @@
+// Modified 2026-10 by PLN: HID print ceiling tests (GPL-3.0; see NOTICE).
+
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {
+  HID_OTHER_DEADLINE_MS,
+  HID_PRINT_MIN_MS,
+  hidPrintCeilingMs,
+} from '../dist/hid-deadline.js';
+
+test('print ceiling is at least 10s when there is no per-event delay', () => {
+  assert.equal(HID_PRINT_MIN_MS, 10_000);
+  assert.equal(hidPrintCeilingMs(0, undefined, false), 10_000);
+  assert.equal(hidPrintCeilingMs(1, undefined, false), 10_000);
+  assert.equal(hidPrintCeilingMs(5000, undefined, false), 10_000);
+  assert.equal(hidPrintCeilingMs(1, 0, true), 10_000);
+});
+
+test('slow uses 0.02s per event when delay is omitted', () => {
+  // 5 + 1.5 × (4·1 + 2) × 0.02 + 5 = 10.18s
+  assert.equal(hidPrintCeilingMs(1, undefined, true), 10_180);
+});
+
+test('delay is the per-event seconds actually sent to kvmd', () => {
+  // 5 + 1.5 × (4·10 + 2) × 0.05 + 5 = 13.15s
+  assert.equal(hidPrintCeilingMs(10, 0.05, false), 13_150);
+});
+
+test('print length is capped at 1024 for the ceiling', () => {
+  const atCap = hidPrintCeilingMs(1024, 0.01, false);
+  const pastCap = hidPrintCeilingMs(5000, 0.01, false);
+  assert.equal(atCap, pastCap);
+  assert.ok(atCap > hidPrintCeilingMs(1023, 0.01, false));
+});
+
+test('other HID routes use a fixed 30s deadline', () => {
+  assert.equal(HID_OTHER_DEADLINE_MS, 30_000);
+});

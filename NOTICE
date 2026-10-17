@@ -123,3 +123,16 @@ Modification log (GPLv3 §5a)
   password, password: value, and "password":"value". kvmd error type
   and error_msg are capped at 1024 characters. GET retry sleeps 250 ms
   then 500 ms. GET /streamer/snapshot makes at most 4 attempts.
+
+2026-10, by PLN:
+  HID POSTs now have a per-call ceiling. /hid/print uses
+  5s + 1.5 × (4·min(len,1024) + 2) × perEventSec + 5s, at least 10s.
+  perEventSec is the delay value sent to kvmd, otherwise 0.02 when
+  slow, otherwise 0. A print above 50s is refused before the call,
+  because nginx on PiKVM likely applies a 60s proxy_read_timeout on
+  /api/ (not confirmed on hardware). Other HID POSTs use 30s. Expiry
+  is PIKVM_HID_STATE_UNKNOWN and is not retried. A
+  PIKVM_REQUEST_TIMEOUT_MS value that is not a string of digits, or
+  that is 0, falls back to 5000. Values above 600000 still clamp.
+  Literal password redaction applies only when the password is at
+  least 4 characters, including on the tool error path.

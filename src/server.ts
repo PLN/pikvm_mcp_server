@@ -155,11 +155,12 @@ export const ARM_GATED_TOOLS = new Set([
  * Tool failure text. KvmdError keeps status, type, message, and endpoint.
  * Other errors stay `Error: <message>`.
  */
-function formatToolError(error: unknown): string {
+export function formatToolError(error: unknown, password = ''): string {
+  const redact = (value: string) => redactSecrets(value, password);
   if (error instanceof KvmdError) {
-    const message = redactSecrets(error.message);
-    const endpoint = redactSecrets(error.endpoint);
-    const type = redactSecrets(error.type);
+    const message = redact(error.message);
+    const endpoint = redact(error.endpoint);
+    const type = redact(error.type);
     const summary = `Error [${type}] ${endpoint} (HTTP ${error.status}): ${message}`;
     const details = JSON.stringify({
       status: error.status,
@@ -172,7 +173,7 @@ function formatToolError(error: unknown): string {
     return `${summary}\n${details}`;
   }
   if (error instanceof Error) {
-    return `Error: ${redactSecrets(error.message)}`;
+    return `Error: ${redact(error.message)}`;
   }
   return 'Error: An unexpected error occurred';
 }
@@ -800,7 +801,7 @@ export function createMcpServer(deps: McpServerDeps): Server {
       }
     } catch (error) {
       return {
-        content: [{ type: 'text', text: formatToolError(error) }],
+        content: [{ type: 'text', text: formatToolError(error, deps.pikvm.redactionPassword()) }],
         isError: true,
       };
     }

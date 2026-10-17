@@ -20,13 +20,14 @@ function kvmdBody(error, errorMsg) {
   return { ok: false, result: { error, error_msg: errorMsg } };
 }
 
-function depsFactory(mock, armGateEnforced, requestTimeoutMs) {
+function depsFactory(mock, armGateEnforced, options = {}) {
   const pikvm = new PiKVMClient({
     host: mock.url,
     username: 'admin',
-    password: 'testpw',
+    password: options.password ?? 'testpw',
     verifySsl: false,
-    requestTimeoutMs,
+    requestTimeoutMs: options.requestTimeoutMs,
+    deadlineScale: options.deadlineScale,
   });
   return () => createMcpServer({
     pikvm,
@@ -36,11 +37,11 @@ function depsFactory(mock, armGateEnforced, requestTimeoutMs) {
   });
 }
 
-async function startServer(mock, armGateEnforced, requestTimeoutMs) {
+async function startServer(mock, armGateEnforced, options) {
   const httpServer = await startHttpServer({
     port: 0,
     bearerToken: TOKEN,
-    createServer: depsFactory(mock, armGateEnforced, requestTimeoutMs),
+    createServer: depsFactory(mock, armGateEnforced, options),
   });
   const { port } = httpServer.address();
   return {
@@ -109,9 +110,14 @@ function count(mock, method, path) {
   return mock.calls.filter((c) => c.method === method && c.path === path).length;
 }
 
-async function withSession(routes, armGateEnforced, fn, requestTimeoutMs) {
+function clientOptions(value) {
+  if (typeof value === 'number') return { requestTimeoutMs: value };
+  return value ?? {};
+}
+
+async function withSession(routes, armGateEnforced, fn, options) {
   const mock = await startKvmdMock({ routes });
-  const srv = await startServer(mock, armGateEnforced, requestTimeoutMs);
+  const srv = await startServer(mock, armGateEnforced, clientOptions(options));
   try {
     const sessionId = await openSession(srv.base);
     await fn({ mock, srv, sessionId });
@@ -447,7 +453,7 @@ test('a slow body on GET maps to PIKVM_TIMEOUT and is attempted 3 times', { time
   }, 200);
 });
 
-test('requestTimeoutMs 0 is clamped below the default and times out a short GET', { timeout: 20000 }, async () => {
+test('requestTimeoutMs 0 falls back to 5000, so a short GET succeeds', async () => {
   await withSession({
     'GET /api/streamer': {
       delayMs: 200,
@@ -458,16 +464,10 @@ test('requestTimeoutMs 0 is clamped below the default and times out a short GET'
       },
     },
   }, true, async ({ mock, srv, sessionId }) => {
-    const started = Date.now();
     const result = await callTool(srv.base, sessionId, 'pikvm_get_resolution');
-    const elapsed = Date.now() - started;
-    const { details } = parseKvmdToolError(result);
-    // 0 is clamped to 1 ms, so a 200 ms response must time out. The default
-    // of 5000 ms would have let it succeed. Queued retries can abort before
-    // the mock accepts them, so the call count is not the assertion.
-    assert.equal(details.type, 'PIKVM_TIMEOUT');
-    assert.ok(elapsed < 2000, `clamped timeout waited too long: ${elapsed}ms`);
-    assert.ok(!result.content[0].text.includes('1920x1080'));
+    assert.equal(result.isError, undefined);
+    assert.match(result.content[0].text, /1920x1080/);
+    assert.equal(count(mock, 'GET', '/api/streamer'), 1);
   }, 0);
 });
 
@@ -554,5 +554,76 @@ test('tool results redact secrets and omit the query string', async () => {
     assert.match(text, /password=\[REDACTED\]/);
     assert.match(text, /X-KVMD-Passwd=\[REDACTED\]/);
     assert.equal(count(mock, 'GET', '/api/streamer/snapshot'), 1);
+  });
+});
+
+test('a password shorter than 4 characters does not mangle ordinary text', async () => {
+  await withSession({
+    'GET /api/streamer': {
+      status: 400,
+      body: kvmdBody('ValidatorError', 'the category field stayed intact'),
+    },
+  }, true, async ({ srv, sessionId }) => {
+    const result = await callTool(srv.base, sessionId, 'pikvm_get_resolution');
+    const { text, details } = parseKvmdToolError(result);
+    assert.equal(details.message, 'the category field stayed intact');
+    assert.match(text, /category/);
+    assert.doesNotMatch(text, /\[REDACTED\]/);
+  }, { password: 'cat' });
+});
+
+const HID_UNKNOWN = 'input may still be applying; do not resend';
+
+test('POST /hid/print ceiling expiry is PIKVM_HID_STATE_UNKNOWN and is sent once', async () => {
+  // Scale 0.01 turns the 10s minimum print ceiling into 100ms.
+  await withSession({
+    'POST /api/hid/print': { delayMs: 400, status: 204, body: '' },
+  }, false, async ({ mock, srv, sessionId }) => {
+    const result = await callTool(srv.base, sessionId, 'pikvm_type', { text: 'hi' });
+    const { details } = parseKvmdToolError(result);
+    assert.equal(details.type, 'PIKVM_HID_STATE_UNKNOWN');
+    assert.equal(details.message, HID_UNKNOWN);
+    assert.equal(details.status, 0);
+    assert.equal(count(mock, 'POST', '/api/hid/print'), 1);
+  }, { deadlineScale: 0.01 });
+});
+
+test('other HID POSTs use a 30s ceiling, longer than the print minimum', async () => {
+  // 200ms is past the scaled 10s print ceiling (100ms) and inside the
+  // scaled 30s ceiling (300ms).
+  await withSession({
+    'POST /api/hid/events/send_key': { delayMs: 200, status: 204, body: '' },
+  }, false, async ({ mock, srv, sessionId }) => {
+    const result = await callTool(srv.base, sessionId, 'pikvm_key', { key: 'Enter' });
+    assert.equal(result.isError, undefined);
+    assert.equal(count(mock, 'POST', '/api/hid/events/send_key'), 1);
+  }, { deadlineScale: 0.01 });
+});
+
+test('other HID POST ceiling expiry is PIKVM_HID_STATE_UNKNOWN and is sent once', async () => {
+  await withSession({
+    'POST /api/hid/events/send_key': { delayMs: 800, status: 204, body: '' },
+  }, false, async ({ mock, srv, sessionId }) => {
+    const result = await callTool(srv.base, sessionId, 'pikvm_key', { key: 'Enter' });
+    const { details } = parseKvmdToolError(result);
+    assert.equal(details.type, 'PIKVM_HID_STATE_UNKNOWN');
+    assert.equal(details.message, HID_UNKNOWN);
+    assert.equal(count(mock, 'POST', '/api/hid/events/send_key'), 1);
+  }, { deadlineScale: 0.01 });
+});
+
+test('a print whose ceiling is above 50s is refused with zero kvmd calls', async () => {
+  await withSession({
+    'POST /api/hid/print': { status: 204, body: '' },
+  }, false, async ({ mock, srv, sessionId }) => {
+    const result = await callTool(srv.base, sessionId, 'pikvm_type', {
+      text: 'hello',
+      delay: 200,
+    });
+    assert.equal(result.isError, true);
+    const text = result.content[0].text;
+    assert.match(text, /Shorten the text/);
+    assert.match(text, /lower the delay/);
+    assert.equal(mock.calls.length, 0);
   });
 });

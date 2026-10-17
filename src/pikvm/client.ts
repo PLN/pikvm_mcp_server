@@ -13,6 +13,12 @@
 
 import { Agent, fetch } from 'undici';
 import sharp from 'sharp';
+import {
+  HID_OTHER_DEADLINE_MS,
+  HID_PRINT_REFUSE_MS,
+  HID_STATE_UNKNOWN_MESSAGE,
+  hidPrintCeilingMs,
+} from '../hid-deadline.js';
 import { capKvmdField, redactSecrets } from '../redact.js';
 import { clampRequestTimeoutMs } from '../request-timeout.js';
 
@@ -24,6 +30,12 @@ export interface PiKVMConfig {
   defaultKeymap?: string;
   /** Abort deadline for one ordinary kvmd call. Default 5000. */
   requestTimeoutMs?: number;
+  /**
+   * Multiplier for HID abort timers. Default 1.
+   * Tests pass a fraction so a 10s or 30s ceiling expires quickly.
+   * Refusal still uses the unscaled estimate.
+   */
+  deadlineScale?: number;
 }
 
 export interface TypeOptions {
@@ -132,10 +144,9 @@ function isSnapshotPath(path: string): boolean {
 
 /**
  * POST /hid and /hid/* finish only when kvmd has applied the input.
- * /hid/print in particular replies after every keystroke, so a short
- * deadline aborts the client while the device is still typing. The
- * client abort does not cancel that work, and a retry would type it
- * again. These calls wait for kvmd instead of using the ordinary deadline.
+ * A client abort does not cancel that work, and a retry would send it
+ * again. These calls use a per-call ceiling instead of the ordinary
+ * deadline, and expiry is never retried.
  */
 function isHidPost(method: string, path: string): boolean {
   if (method.toUpperCase() !== 'POST') return false;
@@ -179,16 +190,40 @@ function parseKvmdFailure(text: string): { error: string; error_msg: string } | 
   return null;
 }
 
-function transportError(err: unknown, endpoint: string): KvmdError {
+function transportError(err: unknown, endpoint: string, hid: boolean): KvmdError {
   if (isTimeoutError(err)) {
+    if (hid) {
+      return new KvmdError(0, 'PIKVM_HID_STATE_UNKNOWN', HID_STATE_UNKNOWN_MESSAGE, endpoint);
+    }
     return new KvmdError(0, 'PIKVM_TIMEOUT', 'kvmd request timed out', endpoint);
   }
   return new KvmdError(0, 'PIKVM_UNREACHABLE', 'kvmd network error', endpoint);
 }
 
 function isRetryableGetError(err: KvmdError): boolean {
+  if (err.type === 'PIKVM_HID_STATE_UNKNOWN') return false;
   if (err.type === 'PIKVM_UNREACHABLE' || err.type === 'PIKVM_TIMEOUT') return true;
   return err.status === 502 || err.status === 503;
+}
+
+function deadlineScaleOf(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value) || value <= 0) return 1;
+  return value;
+}
+
+/** `delay` as it appears on the query string, or undefined when omitted. */
+function printDelaySent(path: string): number | undefined {
+  const query = path.includes('?') ? path.slice(path.indexOf('?') + 1) : '';
+  const raw = new URLSearchParams(query).get('delay');
+  if (raw === null || raw === '') return undefined;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+function printIsSlow(path: string): boolean {
+  const query = path.includes('?') ? path.slice(path.indexOf('?') + 1) : '';
+  const slow = new URLSearchParams(query).get('slow');
+  return slow === '1' || slow === 'true';
 }
 
 function delay(ms: number): Promise<void> {
@@ -202,7 +237,8 @@ function jitterMs(): number {
 }
 
 export class PiKVMClient {
-  private config: Required<PiKVMConfig>;
+  private config: Required<Omit<PiKVMConfig, 'deadlineScale'>>;
+  private deadlineScale: number;
   private dispatcher: Agent;
   private cachedResolution: ScreenResolution | null = null;
   private screenshotScale: {
@@ -212,17 +248,18 @@ export class PiKVMClient {
   private calibration: CalibrationState | null = null;
 
   constructor(config: PiKVMConfig) {
+    const { deadlineScale, ...rest } = config;
+    this.deadlineScale = deadlineScaleOf(deadlineScale);
     this.config = {
       verifySsl: false,
       defaultKeymap: 'en-us',
       requestTimeoutMs: 5000,
-      ...config,
+      ...rest,
     };
     this.config.requestTimeoutMs = clampRequestTimeoutMs(this.config.requestTimeoutMs);
 
     // headersTimeout and bodyTimeout 0 turn off undici's 300s defaults.
-    // Ordinary calls abort through AbortSignal. HID POSTs do not, so a
-    // long print is not cut off by that hidden deadline either.
+    // Each call sets its own AbortSignal, including HID ceilings.
     this.dispatcher = new Agent({
       connect: {
         rejectUnauthorized: this.config.verifySsl,
@@ -247,8 +284,9 @@ export class PiKVMClient {
    * 403, 409, 500, and 504 are never retried. GET /streamer/snapshot on
    * HTTP 503 waits out the ustreamer idle-stop grace and retries once.
    * That extra try does not consume one of the three attempts, so a
-   * snapshot can make at most four calls. HID POSTs are not aborted by
-   * the ordinary deadline.
+   * snapshot can make at most four calls. HID POSTs use a per-call
+   * ceiling and are never retried. /hid/print above 50s is refused
+   * before the request is sent.
    */
   private async request<T = unknown>(
     method: string,
@@ -310,6 +348,9 @@ export class PiKVMClient {
     }
 
     const hidPost = isHidPost(method, path);
+    const timeoutMs = hidPost
+      ? this.hidTimeoutMs(path, body)
+      : this.config.requestTimeoutMs;
     let response;
     try {
       response = await fetch(url.toString(), {
@@ -317,16 +358,14 @@ export class PiKVMClient {
         headers,
         body: body ? (typeof body === 'object' ? JSON.stringify(body) : body) : undefined,
         dispatcher: this.dispatcher,
-        // HID POSTs wait until kvmd finishes. A short abort would report
-        // failure while the device is still applying the input.
-        signal: hidPost ? undefined : AbortSignal.timeout(this.config.requestTimeoutMs),
+        signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (err) {
-      throw transportError(err, endpoint);
+      throw transportError(err, endpoint, hidPost);
     }
 
     if (!response.ok) {
-      const errorText = await this.readBody(() => response.text(), endpoint);
+      const errorText = await this.readBody(() => response.text(), endpoint, hidPost);
       const parsed = parseKvmdFailure(errorText);
       if (response.status === 401 || response.status === 403) {
         throw new KvmdError(
@@ -356,7 +395,7 @@ export class PiKVMClient {
     // Check content type for response handling
     const responseType = response.headers.get('content-type') || '';
     if (responseType.includes('image/')) {
-      return await this.readBody(() => response.arrayBuffer() as Promise<T>, endpoint);
+      return await this.readBody(() => response.arrayBuffer() as Promise<T>, endpoint, hidPost);
     }
 
     // Handle empty responses (204 No Content)
@@ -364,7 +403,7 @@ export class PiKVMClient {
       return {} as T;
     }
 
-    const text = await this.readBody(() => response.text(), endpoint);
+    const text = await this.readBody(() => response.text(), endpoint, hidPost);
     if (!text) {
       return {} as T;
     }
@@ -386,16 +425,42 @@ export class PiKVMClient {
     return redactSecrets(value, this.config.password);
   }
 
+  /** Configured kvmd password, for tool-error redaction in this process. */
+  redactionPassword(): string {
+    return this.config.password;
+  }
+
+  /**
+   * Abort timer for one HID POST. Print uses the length × delay ceiling
+   * and is refused above 50s. Every other HID POST uses 30s.
+   * deadlineScale shrinks the timer in tests; the refusal check does not.
+   */
+  private hidTimeoutMs(path: string, body: string | object | undefined): number {
+    const pathname = path.split('?')[0];
+    let ceilingMs = HID_OTHER_DEADLINE_MS;
+    if (pathname === '/hid/print') {
+      const text = typeof body === 'string' ? body : '';
+      ceilingMs = hidPrintCeilingMs(text.length, printDelaySent(path), printIsSlow(path));
+      if (ceilingMs > HID_PRINT_REFUSE_MS) {
+        const seconds = Math.ceil(ceilingMs / 1000);
+        throw new Error(
+          `Refusing /hid/print: estimated time is ${seconds}s, above the 50s ceiling. Shorten the text or lower the delay.`,
+        );
+      }
+    }
+    return Math.max(1, Math.round(ceilingMs * this.deadlineScale));
+  }
+
   /**
    * Body reads can fail after headers: the deadline aborts a slow body,
    * or the socket resets. Those become the same KvmdError values as a
    * failed fetch, and GET retry treats them the same way.
    */
-  private async readBody<T>(read: () => Promise<T>, endpoint: string): Promise<T> {
+  private async readBody<T>(read: () => Promise<T>, endpoint: string, hid: boolean): Promise<T> {
     try {
       return await read();
     } catch (err) {
-      throw transportError(err, endpoint);
+      throw transportError(err, endpoint, hid);
     }
   }
 
