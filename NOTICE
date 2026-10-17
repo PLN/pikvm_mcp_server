@@ -57,20 +57,24 @@ Kvmd errors, timeouts, and retry
 
 Typed HTTP failure (a status on the error) and one retry of
 GET /streamer/snapshot after HTTP 503 are adapted from
-dvaerum/pikvm_mcp_server src/pikvm/client.ts PiKVMApiError and
-fetchSnapshotWithRetry at b5fdc31e16525f196282436a0fa7ca797eea2e5e
-(GPL-3.0). The grace period is 1500 ms. This fork does not take the
-websocket keepalive from that commit.
+dvaerum/pikvm_mcp_server (https://github.com/dvaerum/pikvm_mcp_server)
+src/pikvm/client.ts PiKVMApiError and fetchSnapshotWithRetry at
+b5fdc31e16525f196282436a0fa7ca797eea2e5e (GPL-3.0). The grace period is
+1500 ms. Together with the 3-attempt GET schedule, a snapshot makes at
+most 4 calls. This fork does not take the websocket keepalive from that
+commit.
 
 AbortSignal.timeout, PIKVM_REQUEST_TIMEOUT_MS (default 5000), and the
 no-retry codes PIKVM_UNREACHABLE and PIKVM_AUTH_FAILED are adapted from
-dtrukr/pikvm_mcp_server src/pikvm/client.ts and src/config.ts at
+dtrukr/pikvm_mcp_server (https://github.com/dtrukr/pikvm_mcp_server)
+src/pikvm/client.ts and src/config.ts at
 d120243c4b81802ae725c18b39c4681ce89bfb7a (GPL-3.0). A timeout is reported
 as PIKVM_TIMEOUT. Idempotent GET retry is local to this fork: 3
-attempts, sleeping 250 ms then 500 ms plus jitter (the 250/500/1000 ms
-schedule; the 1000 ms step sits outside the three-attempt cap), on
-network errors, timeouts, HTTP 502, and HTTP 503. POST is not retried.
-HTTP 400, 401, 403, and 409 are not retried.
+attempts, sleeping 250 ms then 500 ms plus jitter, on network errors,
+timeouts, HTTP 502, and HTTP 503. POST is not retried. HTTP 400, 401,
+403, 409, 500, and 504 are not retried. The snapshot 503 grace retry
+is in addition to those 3 attempts, so GET /streamer/snapshot makes at
+most 4 calls. POST /hid/* is not aborted by the ordinary deadline.
 
 Files that cannot carry a comment header
 ----------------------------------------
@@ -108,3 +112,14 @@ Modification log (GPLv3 §5a)
   3 times on network errors, timeouts, HTTP 502, and HTTP 503. POST is
   not retried. GET /streamer/snapshot retries HTTP 503 once after
   1500 ms. Sources are the dvaerum and dtrukr commits cited above.
+
+2026-10, by PLN:
+  HID POSTs, including /hid/print, are not aborted by
+  PIKVM_REQUEST_TIMEOUT_MS. kvmd replies only after the input is
+  applied, and a client abort does not cancel that work.
+  PIKVM_REQUEST_TIMEOUT_MS is clamped to an integer from 1 to 600000.
+  Body-read aborts and connection resets become KvmdError and are
+  retried for GETs only. Error text also redacts the configured
+  password, password: value, and "password":"value". kvmd error type
+  and error_msg are capped at 1024 characters. GET retry sleeps 250 ms
+  then 500 ms. GET /streamer/snapshot makes at most 4 attempts.

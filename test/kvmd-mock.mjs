@@ -8,7 +8,10 @@
  * `options.routes` overrides a route for the first `failTimes` hits
  * (every hit, when `failTimes` is omitted). Keys are `METHOD /api/...`.
  * `delayMs` waits, and ends early if the client aborts. `drop` destroys
- * the socket. After the override is exhausted the built-in route runs.
+ * the socket. `resetAfterHeaders` writes a partial body and resets.
+ * `delayAfterHeaders` sends headers, then waits, then the body.
+ * `then` runs after `failTimes` is exhausted. Otherwise the built-in
+ * route runs.
  */
 
 import http from 'node:http';
@@ -36,6 +39,39 @@ function waitOrClose(req, ms) {
   });
 }
 
+const defaultBody = { ok: false, result: { error: 'MockError', error_msg: 'mock error' } };
+
+async function sendRoute(req, res, route) {
+  if (route.delayMs && !route.delayAfterHeaders) await waitOrClose(req, route.delayMs);
+  if (req.destroyed || res.writableEnded) return;
+  if (route.drop) {
+    req.socket.destroy();
+    return;
+  }
+  if (route.resetAfterHeaders) {
+    res.writeHead(route.status ?? 200, { 'Content-Type': route.contentType ?? 'application/json' });
+    res.write('{"ok":');
+    req.socket.destroy();
+    return;
+  }
+  const status = route.status ?? 500;
+  const body = route.body === undefined ? defaultBody : route.body;
+  const payload = typeof body === 'string' ? body : JSON.stringify(body);
+  const headers = {
+    'Content-Type': route.contentType ?? 'application/json',
+    'Content-Length': Buffer.byteLength(payload),
+  };
+  if (route.delayAfterHeaders) {
+    res.writeHead(status, headers);
+    await waitOrClose(req, route.delayMs ?? 0);
+    if (req.destroyed || res.writableEnded || res.destroyed) return;
+    res.end(payload);
+    return;
+  }
+  res.writeHead(status, headers);
+  res.end(payload);
+}
+
 export async function startKvmdMock(options = {}) {
   const calls = [];
   const routes = options.routes ?? {};
@@ -51,22 +87,11 @@ export async function startKvmdMock(options = {}) {
       const n = (routeHits[routeKey] = (routeHits[routeKey] ?? 0) + 1);
       const override = route.failTimes === undefined || n <= route.failTimes;
       if (override) {
-        if (route.delayMs) await waitOrClose(req, route.delayMs);
-        if (req.destroyed || res.writableEnded) return;
-        if (route.drop) {
-          req.socket.destroy();
-          return;
-        }
-        const status = route.status ?? 500;
-        const body = route.body === undefined
-          ? { ok: false, result: { error: 'MockError', error_msg: 'mock error' } }
-          : route.body;
-        const payload = typeof body === 'string' ? body : JSON.stringify(body);
-        res.writeHead(status, {
-          'Content-Type': route.contentType ?? 'application/json',
-          'Content-Length': Buffer.byteLength(payload),
-        });
-        res.end(payload);
+        await sendRoute(req, res, route);
+        return;
+      }
+      if (route.then) {
+        await sendRoute(req, res, route.then);
         return;
       }
     }

@@ -13,6 +13,8 @@
 
 import { Agent, fetch } from 'undici';
 import sharp from 'sharp';
+import { capKvmdField, redactSecrets } from '../redact.js';
+import { clampRequestTimeoutMs } from '../request-timeout.js';
 
 export interface PiKVMConfig {
   host: string;
@@ -112,12 +114,8 @@ export class KvmdError extends Error {
 /** Idempotent GET attempts, including the first. */
 const MAX_GET_ATTEMPTS = 3;
 
-/**
- * Backoff before retries, in ms. Three attempts sleep 250ms then 500ms.
- * 1000ms is the next step of the same schedule and is not slept inside
- * the three-attempt cap.
- */
-const GET_RETRY_BACKOFF_MS = [250, 500, 1000] as const;
+/** Backoff before the second and third GET attempt. */
+const GET_RETRY_BACKOFF_MS = [250, 500] as const;
 
 /** Added to each GET retry backoff. Inclusive range 0..99. */
 const GET_RETRY_JITTER_MS = 100;
@@ -128,14 +126,21 @@ const GET_RETRY_JITTER_MS = 100;
  */
 const SNAPSHOT_503_GRACE_MS = 1500;
 
-function sanitizeKvmdMessage(text: string): string {
-  return text
-    .replace(/password[=:][^\s,"]*/gi, 'password=[REDACTED]')
-    .replace(/X-KVMD-Passwd[^,\s"]*/gi, 'X-KVMD-Passwd=[REDACTED]');
-}
-
 function isSnapshotPath(path: string): boolean {
   return path.split('?')[0] === '/streamer/snapshot';
+}
+
+/**
+ * POST /hid and /hid/* finish only when kvmd has applied the input.
+ * /hid/print in particular replies after every keystroke, so a short
+ * deadline aborts the client while the device is still typing. The
+ * client abort does not cancel that work, and a retry would type it
+ * again. These calls wait for kvmd instead of using the ordinary deadline.
+ */
+function isHidPost(method: string, path: string): boolean {
+  if (method.toUpperCase() !== 'POST') return false;
+  const pathname = path.split('?')[0];
+  return pathname === '/hid' || pathname.startsWith('/hid/');
 }
 
 function isTimeoutError(err: unknown): boolean {
@@ -174,6 +179,13 @@ function parseKvmdFailure(text: string): { error: string; error_msg: string } | 
   return null;
 }
 
+function transportError(err: unknown, endpoint: string): KvmdError {
+  if (isTimeoutError(err)) {
+    return new KvmdError(0, 'PIKVM_TIMEOUT', 'kvmd request timed out', endpoint);
+  }
+  return new KvmdError(0, 'PIKVM_UNREACHABLE', 'kvmd network error', endpoint);
+}
+
 function isRetryableGetError(err: KvmdError): boolean {
   if (err.type === 'PIKVM_UNREACHABLE' || err.type === 'PIKVM_TIMEOUT') return true;
   return err.status === 502 || err.status === 503;
@@ -206,15 +218,17 @@ export class PiKVMClient {
       requestTimeoutMs: 5000,
       ...config,
     };
-    if (!(this.config.requestTimeoutMs > 0)) {
-      this.config.requestTimeoutMs = 5000;
-    }
+    this.config.requestTimeoutMs = clampRequestTimeoutMs(this.config.requestTimeoutMs);
 
-    // Create dispatcher with SSL configuration
+    // headersTimeout and bodyTimeout 0 turn off undici's 300s defaults.
+    // Ordinary calls abort through AbortSignal. HID POSTs do not, so a
+    // long print is not cut off by that hidden deadline either.
     this.dispatcher = new Agent({
       connect: {
         rejectUnauthorized: this.config.verifySsl,
       },
+      headersTimeout: 0,
+      bodyTimeout: 0,
     });
   }
 
@@ -230,9 +244,11 @@ export class PiKVMClient {
    *
    * Idempotent GETs are tried up to three times on a network error, a
    * timeout, HTTP 502, or HTTP 503. POST is never retried. HTTP 400, 401,
-   * 403, and 409 are never retried. GET /streamer/snapshot on HTTP 503
-   * waits out the ustreamer idle-stop grace and retries once, instead of
-   * using the short GET schedule.
+   * 403, 409, 500, and 504 are never retried. GET /streamer/snapshot on
+   * HTTP 503 waits out the ustreamer idle-stop grace and retries once.
+   * That extra try does not consume one of the three attempts, so a
+   * snapshot can make at most four calls. HID POSTs are not aborted by
+   * the ordinary deadline.
    */
   private async request<T = unknown>(
     method: string,
@@ -260,9 +276,7 @@ export class PiKVMClient {
         }
         generalFailures += 1;
         if (generalFailures >= MAX_GET_ATTEMPTS) throw err;
-        const backoff = GET_RETRY_BACKOFF_MS[
-          Math.min(generalFailures - 1, GET_RETRY_BACKOFF_MS.length - 1)
-        ];
+        const backoff = GET_RETRY_BACKOFF_MS[generalFailures - 1];
         await delay(backoff + jitterMs());
       }
     }
@@ -295,6 +309,7 @@ export class PiKVMClient {
       }
     }
 
+    const hidPost = isHidPost(method, path);
     let response;
     try {
       response = await fetch(url.toString(), {
@@ -302,35 +317,34 @@ export class PiKVMClient {
         headers,
         body: body ? (typeof body === 'object' ? JSON.stringify(body) : body) : undefined,
         dispatcher: this.dispatcher,
-        signal: AbortSignal.timeout(this.config.requestTimeoutMs),
+        // HID POSTs wait until kvmd finishes. A short abort would report
+        // failure while the device is still applying the input.
+        signal: hidPost ? undefined : AbortSignal.timeout(this.config.requestTimeoutMs),
       });
     } catch (err) {
-      if (isTimeoutError(err)) {
-        throw new KvmdError(0, 'PIKVM_TIMEOUT', 'kvmd request timed out', endpoint);
-      }
-      throw new KvmdError(0, 'PIKVM_UNREACHABLE', 'kvmd network error', endpoint);
+      throw transportError(err, endpoint);
     }
 
     if (!response.ok) {
-      const errorText = await response.text();
+      const errorText = await this.readBody(() => response.text(), endpoint);
       const parsed = parseKvmdFailure(errorText);
       if (response.status === 401 || response.status === 403) {
         throw new KvmdError(
           response.status,
           'PIKVM_AUTH_FAILED',
-          sanitizeKvmdMessage(parsed?.error_msg ?? 'authentication failed'),
+          this.kvmdField(parsed?.error_msg ?? 'authentication failed'),
           endpoint,
         );
       }
       if (parsed) {
         throw new KvmdError(
           response.status,
-          parsed.error,
-          sanitizeKvmdMessage(parsed.error_msg),
+          this.kvmdField(parsed.error),
+          this.kvmdField(parsed.error_msg),
           endpoint,
         );
       }
-      const fallback = sanitizeKvmdMessage(errorText).substring(0, 200);
+      const fallback = this.redact(errorText).substring(0, 200);
       throw new KvmdError(
         response.status,
         'PIKVM_HTTP_ERROR',
@@ -342,7 +356,7 @@ export class PiKVMClient {
     // Check content type for response handling
     const responseType = response.headers.get('content-type') || '';
     if (responseType.includes('image/')) {
-      return response.arrayBuffer() as Promise<T>;
+      return await this.readBody(() => response.arrayBuffer() as Promise<T>, endpoint);
     }
 
     // Handle empty responses (204 No Content)
@@ -350,7 +364,7 @@ export class PiKVMClient {
       return {} as T;
     }
 
-    const text = await response.text();
+    const text = await this.readBody(() => response.text(), endpoint);
     if (!text) {
       return {} as T;
     }
@@ -360,6 +374,28 @@ export class PiKVMClient {
     } catch {
       // If not JSON, return as-is wrapped in an object
       return { result: text } as T;
+    }
+  }
+
+  /** Redact secrets, then cap a kvmd error type or error_msg at about 1 KB. */
+  private kvmdField(value: string): string {
+    return capKvmdField(this.redact(value));
+  }
+
+  private redact(value: string): string {
+    return redactSecrets(value, this.config.password);
+  }
+
+  /**
+   * Body reads can fail after headers: the deadline aborts a slow body,
+   * or the socket resets. Those become the same KvmdError values as a
+   * failed fetch, and GET retry treats them the same way.
+   */
+  private async readBody<T>(read: () => Promise<T>, endpoint: string): Promise<T> {
+    try {
+      return await read();
+    } catch (err) {
+      throw transportError(err, endpoint);
     }
   }
 

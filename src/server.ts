@@ -18,6 +18,7 @@ import {
   Tool,
 } from '@modelcontextprotocol/sdk/types.js';
 import { type PiKVMClient, KvmdError } from './pikvm/client.js';
+import { redactSecrets } from './redact.js';
 import type { BusyLock } from './pikvm/lock.js';
 import { autoCalibrateWithRetries } from './pikvm/auto-calibrate.js';
 import { allPrompts, getPromptByName } from './prompts/index.js';
@@ -149,16 +150,6 @@ export const ARM_GATED_TOOLS = new Set([
   'pikvm_calibrate',
   'pikvm_auto_calibrate',
 ]);
-
-/**
- * Strip credentials that might have been echoed in an error string.
- * Same replacements the tool-error path used before KvmdError.
- */
-function redactSecrets(value: string): string {
-  return value
-    .replace(/X-KVMD-Passwd[^,\s]*/gi, 'X-KVMD-Passwd=[REDACTED]')
-    .replace(/password[=:][^\s,]*/gi, 'password=[REDACTED]');
-}
 
 /**
  * Tool failure text. KvmdError keeps status, type, message, and endpoint.

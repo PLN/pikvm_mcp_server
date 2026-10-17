@@ -11,6 +11,7 @@
 import { config as loadEnv } from 'dotenv';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { clampRequestTimeoutMs } from './request-timeout.js';
 
 // Load .env file from project root
 // - quiet: true prevents stdout output that would corrupt MCP protocol
@@ -79,10 +80,8 @@ export function loadConfig(): Config {
     throw new Error('PIKVM_PASSWORD environment variable is required');
   }
 
-  const parsedTimeout = parseInt(process.env.PIKVM_REQUEST_TIMEOUT_MS || '5000', 10);
-  const requestTimeoutMs = Number.isFinite(parsedTimeout) && parsedTimeout > 0
-    ? parsedTimeout
-    : 5000;
+  const parsedTimeout = parseInt(process.env.PIKVM_REQUEST_TIMEOUT_MS || '', 10);
+  const requestTimeoutMs = clampRequestTimeoutMs(parsedTimeout);
 
   const port = parseInt(process.env.PIKVM_MCP_PORT || '', 10);
   const http: HttpConfig | undefined = Number.isFinite(port) && port > 0

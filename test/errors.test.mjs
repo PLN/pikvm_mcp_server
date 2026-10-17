@@ -301,18 +301,6 @@ test('a slow GET maps to PIKVM_TIMEOUT and is attempted 3 times', { timeout: 200
   }, 200);
 });
 
-test('a slow POST maps to PIKVM_TIMEOUT and is not retried', { timeout: 20000 }, async () => {
-  await withSession({
-    'POST /api/hid/events/send_key': { delayMs: 30000, status: 204, body: '' },
-  }, false, async ({ mock, srv, sessionId }) => {
-    const result = await callTool(srv.base, sessionId, 'pikvm_key', { key: 'KeyA' });
-    const { details } = parseKvmdToolError(result);
-    assert.equal(details.type, 'PIKVM_TIMEOUT');
-    assert.equal(details.endpoint, 'POST /api/hid/events/send_key');
-    assert.equal(count(mock, 'POST', '/api/hid/events/send_key'), 1);
-  }, 200);
-});
-
 test('snapshot HTTP 503 is retried once after the grace period and can succeed', { timeout: 20000 }, async () => {
   await withSession({
     'GET /api/streamer/snapshot': {
@@ -347,6 +335,204 @@ test('persistent snapshot HTTP 503 stops after one grace retry', { timeout: 2000
     const gap = snaps[1].at - snaps[0].at;
     assert.ok(gap >= 1200, `snapshot grace too short: ${gap}ms`);
     assert.equal(count(mock, 'GET', '/api/streamer'), 0);
+  });
+});
+
+test('POST /hid/print slower than the request timeout succeeds once', { timeout: 20000 }, async () => {
+  await withSession({
+    'POST /api/hid/print': { delayMs: 400, status: 204, body: '' },
+  }, false, async ({ mock, srv, sessionId }) => {
+    const result = await callTool(srv.base, sessionId, 'pikvm_type', { text: 'hello', slow: true });
+    assert.equal(result.isError, undefined, JSON.stringify(result));
+    assert.match(result.content[0].text, /Typed 5 character/);
+    assert.equal(count(mock, 'POST', '/api/hid/print'), 1);
+  }, 100);
+});
+
+test('POST /hid/events/send_key slower than the request timeout succeeds once', { timeout: 20000 }, async () => {
+  await withSession({
+    'POST /api/hid/events/send_key': { delayMs: 400, status: 204, body: '' },
+  }, false, async ({ mock, srv, sessionId }) => {
+    const key = await callTool(srv.base, sessionId, 'pikvm_key', { key: 'KeyA' });
+    assert.equal(key.isError, undefined, JSON.stringify(key));
+    assert.equal(count(mock, 'POST', '/api/hid/events/send_key'), 1);
+  }, 100);
+});
+
+test('HTTP 500 is not retried', async () => {
+  await withSession({
+    'GET /api/streamer': {
+      status: 500,
+      body: kvmdBody('InternalError', 'kvmd failed'),
+    },
+  }, true, async ({ mock, srv, sessionId }) => {
+    const result = await callTool(srv.base, sessionId, 'pikvm_get_resolution');
+    const { details } = parseKvmdToolError(result);
+    assert.equal(details.status, 500);
+    assert.equal(details.type, 'InternalError');
+    assert.equal(details.message, 'kvmd failed');
+    assert.equal(count(mock, 'GET', '/api/streamer'), 1);
+  });
+});
+
+test('HTTP 504 is not retried', async () => {
+  await withSession({
+    'GET /api/streamer': {
+      status: 504,
+      body: kvmdBody('GatewayTimeout', 'upstream late'),
+    },
+  }, true, async ({ mock, srv, sessionId }) => {
+    const result = await callTool(srv.base, sessionId, 'pikvm_get_resolution');
+    const { details } = parseKvmdToolError(result);
+    assert.equal(details.status, 504);
+    assert.equal(details.type, 'GatewayTimeout');
+    assert.equal(count(mock, 'GET', '/api/streamer'), 1);
+  });
+});
+
+test('a non-JSON error body falls back to PIKVM_HTTP_ERROR', async () => {
+  await withSession({
+    'GET /api/streamer': {
+      status: 500,
+      body: '<html>plain failure</html>',
+      contentType: 'text/html',
+    },
+  }, true, async ({ mock, srv, sessionId }) => {
+    const result = await callTool(srv.base, sessionId, 'pikvm_get_resolution');
+    const { details } = parseKvmdToolError(result);
+    assert.equal(details.type, 'PIKVM_HTTP_ERROR');
+    assert.equal(details.status, 500);
+    assert.match(details.message, /plain failure/);
+    assert.equal(count(mock, 'GET', '/api/streamer'), 1);
+  });
+});
+
+test('a body reset on GET maps to PIKVM_UNREACHABLE and is attempted 3 times', async () => {
+  await withSession({
+    'GET /api/streamer': { resetAfterHeaders: true },
+  }, true, async ({ mock, srv, sessionId }) => {
+    const result = await callTool(srv.base, sessionId, 'pikvm_get_resolution');
+    const { details } = parseKvmdToolError(result);
+    assert.equal(details.type, 'PIKVM_UNREACHABLE');
+    assert.equal(details.status, 0);
+    assert.equal(count(mock, 'GET', '/api/streamer'), 3);
+  });
+});
+
+test('a body reset on POST maps to PIKVM_UNREACHABLE and is not retried', async () => {
+  await withSession({
+    'POST /api/hid/events/send_key': { resetAfterHeaders: true },
+  }, false, async ({ mock, srv, sessionId }) => {
+    const result = await callTool(srv.base, sessionId, 'pikvm_key', { key: 'KeyA' });
+    const { details } = parseKvmdToolError(result);
+    assert.equal(details.type, 'PIKVM_UNREACHABLE');
+    assert.equal(count(mock, 'POST', '/api/hid/events/send_key'), 1);
+  });
+});
+
+test('a slow body on GET maps to PIKVM_TIMEOUT and is attempted 3 times', { timeout: 20000 }, async () => {
+  await withSession({
+    'GET /api/streamer': {
+      delayAfterHeaders: true,
+      delayMs: 30000,
+      status: 200,
+      body: { ok: true, result: { streamer: { source: { resolution: { width: 1, height: 1 } } } } },
+    },
+  }, true, async ({ mock, srv, sessionId }) => {
+    const result = await callTool(srv.base, sessionId, 'pikvm_get_resolution');
+    const { details } = parseKvmdToolError(result);
+    assert.equal(details.type, 'PIKVM_TIMEOUT');
+    assert.equal(details.message, 'kvmd request timed out');
+    assert.equal(count(mock, 'GET', '/api/streamer'), 3);
+  }, 200);
+});
+
+test('requestTimeoutMs 0 is clamped below the default and times out a short GET', { timeout: 20000 }, async () => {
+  await withSession({
+    'GET /api/streamer': {
+      delayMs: 200,
+      status: 200,
+      body: {
+        ok: true,
+        result: { streamer: { source: { resolution: { width: 1920, height: 1080 } } } },
+      },
+    },
+  }, true, async ({ mock, srv, sessionId }) => {
+    const started = Date.now();
+    const result = await callTool(srv.base, sessionId, 'pikvm_get_resolution');
+    const elapsed = Date.now() - started;
+    const { details } = parseKvmdToolError(result);
+    // 0 is clamped to 1 ms, so a 200 ms response must time out. The default
+    // of 5000 ms would have let it succeed. Queued retries can abort before
+    // the mock accepts them, so the call count is not the assertion.
+    assert.equal(details.type, 'PIKVM_TIMEOUT');
+    assert.ok(elapsed < 2000, `clamped timeout waited too long: ${elapsed}ms`);
+    assert.ok(!result.content[0].text.includes('1920x1080'));
+  }, 0);
+});
+
+test('snapshot timeouts use the 3-attempt schedule', { timeout: 20000 }, async () => {
+  await withSession({
+    'GET /api/streamer/snapshot': { delayMs: 30000, status: 503, body: kvmdBody('UnavailableError', 'late') },
+  }, true, async ({ mock, srv, sessionId }) => {
+    const result = await callTool(srv.base, sessionId, 'pikvm_screenshot');
+    const { details } = parseKvmdToolError(result);
+    assert.equal(details.type, 'PIKVM_TIMEOUT');
+    assert.equal(count(mock, 'GET', '/api/streamer/snapshot'), 3);
+  }, 150);
+});
+
+test('snapshot 503 plus later timeouts stops at 4 attempts', { timeout: 20000 }, async () => {
+  await withSession({
+    'GET /api/streamer/snapshot': {
+      status: 503,
+      body: kvmdBody('UnavailableError', 'streamer starting'),
+      failTimes: 1,
+      then: { delayMs: 30000, status: 200, body: '' },
+    },
+  }, true, async ({ mock, srv, sessionId }) => {
+    const result = await callTool(srv.base, sessionId, 'pikvm_screenshot');
+    const { details } = parseKvmdToolError(result);
+    assert.equal(details.type, 'PIKVM_TIMEOUT');
+    const snaps = mock.calls.filter((c) => c.path === '/api/streamer/snapshot');
+    assert.equal(snaps.length, 4);
+    assert.ok(snaps[1].at - snaps[0].at >= 1200, `grace gap ${snaps[1].at - snaps[0].at}ms`);
+  }, 150);
+});
+
+test('tool results redact the configured password and password forms', async () => {
+  await withSession({
+    'GET /api/streamer': {
+      status: 400,
+      body: kvmdBody(
+        'ValidatorError',
+        'saw testpw then password: testpw and {"password":"testpw"}',
+      ),
+    },
+  }, true, async ({ mock, srv, sessionId }) => {
+    const result = await callTool(srv.base, sessionId, 'pikvm_get_resolution');
+    const { text, details } = parseKvmdToolError(result);
+    assert.doesNotMatch(text, /testpw/);
+    assert.match(details.message, /\[REDACTED\]/);
+    assert.match(details.message, /"password":"\[REDACTED\]"/);
+    assert.equal(count(mock, 'GET', '/api/streamer'), 1);
+  });
+});
+
+test('kvmd error type and error_msg are capped at 1024 characters', async () => {
+  const big = 'A'.repeat(1500);
+  await withSession({
+    'GET /api/streamer': {
+      status: 400,
+      body: kvmdBody(big, big),
+    },
+  }, true, async ({ srv, sessionId }) => {
+    const result = await callTool(srv.base, sessionId, 'pikvm_get_resolution');
+    const { details } = parseKvmdToolError(result);
+    assert.equal(details.type.length, 1024);
+    assert.equal(details.message.length, 1024);
+    assert.equal(details.type, 'A'.repeat(1024));
+    assert.equal(details.message, 'A'.repeat(1024));
   });
 });
 
