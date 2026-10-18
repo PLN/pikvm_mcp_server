@@ -5,6 +5,7 @@
 // Modified 2026-10 by PLN: remove_incomplete defaults on (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: write_remote timeout is the connect timeout (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: connect timeout and DNS map to unreachable (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: pikvm_type delay is milliseconds (GPL-3.0; see NOTICE).
 // AbortSignal.timeout and PIKVM_UNREACHABLE / PIKVM_AUTH_FAILED no-retry codes
 // adapted from dtrukr/pikvm_mcp_server src/pikvm/client.ts @ d120243 (GPL-3.0).
 // Snapshot HTTP 503 retry-once adapted from dvaerum/pikvm_mcp_server
@@ -61,6 +62,7 @@ import {
   HID_PRINT_REFUSE_MS,
   HID_STATE_UNKNOWN_MESSAGE,
   hidPrintCeilingMs,
+  hidDelayQueryValue,
 } from '../hid-deadline.js';
 import { capKvmdField, redactSecrets } from '../redact.js';
 import {
@@ -95,6 +97,7 @@ export interface PiKVMConfig {
 export interface TypeOptions {
   keymap?: string;
   slow?: boolean;
+  /** Milliseconds between keystrokes. Sent to kvmd as seconds. */
   delay?: number;
 }
 
@@ -1181,7 +1184,7 @@ export class PiKVMClient {
     const params = new URLSearchParams();
     params.set('keymap', options?.keymap || this.config.defaultKeymap);
     if (options?.slow) params.set('slow', '1');
-    if (options?.delay !== undefined) params.set('delay', options.delay.toString());
+    if (options?.delay !== undefined) params.set('delay', hidDelayQueryValue(options.delay));
 
     await this.request('POST', `/hid/print?${params}`, text, 'text/plain');
   }

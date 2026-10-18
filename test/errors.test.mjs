@@ -1,5 +1,6 @@
 // Modified 2026-10 by PLN: KvmdError, timeout, and GET retry tests (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: connect timeout and DNS unreachable tests (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: pikvm_type delay is milliseconds (GPL-3.0; see NOTICE).
 
 /**
  * KvmdError, request timeout, and bounded GET retry.
@@ -642,20 +643,51 @@ test('other HID POST ceiling expiry is PIKVM_HID_STATE_UNKNOWN and is sent once'
 });
 
 test('a print whose ceiling is above 50s is refused with zero kvmd calls', async () => {
-  // delay 1 is one second per event, which kvmd accepts. Ten characters
-  // estimate 73s, above the 50s ceiling.
+  // delay 200 is 0.2s per event. 33 characters estimate 50.2s.
   await withSession({
     'POST /api/hid/print': { status: 204, body: '' },
   }, false, async ({ mock, srv, sessionId }) => {
     const result = await callTool(srv.base, sessionId, 'pikvm_type', {
-      text: '0123456789',
-      delay: 1,
+      text: 'a'.repeat(33),
+      delay: 200,
     });
     assert.equal(result.isError, true);
     const text = result.content[0].text;
     assert.match(text, /Shorten the text/);
     assert.match(text, /lower the delay/);
     assert.equal(mock.calls.length, 0);
+  });
+});
+
+test('pikvm_type sends delay 0, 50, and 200 as seconds', async () => {
+  await withSession({
+    'POST /api/hid/print': { status: 204, body: '' },
+  }, false, async ({ mock, srv, sessionId }) => {
+    for (const [delay, sent] of [[0, '0'], [50, '0.05'], [200, '0.2']]) {
+      mock.calls.length = 0;
+      const result = await callTool(srv.base, sessionId, 'pikvm_type', {
+        text: 'ab',
+        delay,
+      });
+      assert.equal(result.isError, undefined, result.content?.[0]?.text);
+      const call = mock.calls.find((item) => item.path === '/api/hid/print');
+      assert.equal(new URLSearchParams(call.query).get('delay'), sent);
+    }
+  });
+});
+
+test('32 characters at delay 200 stay under the ceiling and send 0.2', async () => {
+  await withSession({
+    'POST /api/hid/print': { status: 204, body: '' },
+  }, false, async ({ mock, srv, sessionId }) => {
+    const result = await callTool(srv.base, sessionId, 'pikvm_type', {
+      text: 'a'.repeat(32),
+      delay: 200,
+    });
+    assert.equal(result.isError, undefined, result.content?.[0]?.text);
+    const call = mock.calls.find((item) => item.path === '/api/hid/print');
+    assert.equal(new URLSearchParams(call.query).get('delay'), '0.2');
+    assert.equal(mock.calls.filter((item) => item.path === '/api/hid/print').length, 1);
   });
 });
 

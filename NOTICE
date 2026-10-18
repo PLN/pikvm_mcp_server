@@ -11,6 +11,7 @@ Modified 2026-10 by PLN: close the upload file handle once (GPL-3.0; see below).
 Modified 2026-10 by PLN: the upload double close was the EBADF (GPL-3.0; see below).
 Modified 2026-10 by PLN: abort tests reject a raw-fd upload read (GPL-3.0; see below).
 Modified 2026-10 by PLN: connect timeout and DNS map to unreachable (GPL-3.0; see below).
+Modified 2026-10 by PLN: pikvm_type delay is milliseconds (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -391,4 +392,13 @@ No code from another pikvm_mcp_server fork was added for these methods.
   retries these the same way it retries connection refused. A POST,
   including HID and an MSD upload, does not, and a HID connect
   failure is not PIKVM_HID_STATE_UNKNOWN. No code from another
+  pikvm_mcp_server fork was added.
+
+2026-10, by PLN:
+  pikvm_type delay is milliseconds, 0 to 200. kvmd reads the query
+  value as seconds, so the client sends delay/1000. 0 is sent as 0,
+  50 as 0.05, and 200 as 0.2. The print ceiling uses that seconds
+  value: 5s + 1.5 × (4·min(length,1024) + 2) × perEventSec + 5s.
+  32 characters at 200 ms is 49s and is sent. 33 characters at 200 ms
+  is 50.2s and is refused before the call. No code from another
   pikvm_mcp_server fork was added.

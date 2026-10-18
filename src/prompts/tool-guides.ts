@@ -1,5 +1,6 @@
 /**
  * Tool guide prompts — one per PiKVM tool that agents commonly use.
+ * Modified 2026-10 by PLN: pikvm_type delay is milliseconds (GPL-3.0; see NOTICE).
  */
 
 import type { PromptDefinition } from './types.js';
@@ -106,7 +107,7 @@ Type a string of text on the remote machine. The server converts characters into
 | text | string | *(required)* | The text to type |
 | keymap | string | en-us | Keyboard layout for character-to-key conversion |
 | slow | boolean | false | Use slow typing mode (adds extra delays for compatibility) |
-| delay | number | *(default)* | Delay between keystrokes in ms (0-200) |
+| delay | number | *(default)* | Delay between keystrokes in ms (0-200). Sent to kvmd as seconds |
 
 ## Example Call
 \`\`\`json

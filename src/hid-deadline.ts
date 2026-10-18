@@ -1,4 +1,5 @@
 // Modified 2026-10 by PLN: per-call HID deadlines (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: pikvm_type delay is milliseconds (GPL-3.0; see NOTICE).
 
 /**
  * PiKVM's nginx likely applies the default 60s proxy_read_timeout on
@@ -20,9 +21,10 @@ export const HID_SLOW_EVENT_SEC = 0.02;
 export const HID_STATE_UNKNOWN_MESSAGE = 'input may still be applying; do not resend';
 
 /**
- * Seconds kvmd will wait between HID events for this print.
- * `delaySent` is the `delay` query value as it is sent today (kvmd
- * reads that number as seconds). When it is omitted, slow uses 0.02s.
+ * Seconds kvmd waits between HID events for this print.
+ * `delaySent` is the query value, which is the tool delay in
+ * milliseconds divided by 1000. kvmd reads that number as seconds.
+ * When it is omitted, slow uses 0.02s.
  */
 export function hidPrintPerEventSec(delaySent: number | undefined, slow: boolean): number {
   if (delaySent !== undefined && Number.isFinite(delaySent) && delaySent >= 0) {
@@ -46,4 +48,14 @@ export function hidPrintCeilingMs(
   const events = 4 * Math.min(len, 1024) + 2;
   const seconds = 5 + 1.5 * events * perEventSec + 5;
   return Math.max(HID_PRINT_MIN_MS, Math.round(seconds * 1000));
+}
+
+/**
+ * Tool `delay` is milliseconds. kvmd's query is seconds.
+ * Three decimal places is one millisecond, which is the step this
+ * conversion keeps.
+ */
+export function hidDelayQueryValue(delayMs: number): string {
+  const ms = Number.isFinite(delayMs) && delayMs > 0 ? delayMs : 0;
+  return (ms / 1000).toFixed(3).replace(/\.?0+$/, '');
 }
