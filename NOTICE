@@ -1,5 +1,6 @@
 Modified 2026-10 by PLN: added this NOTICE (GPL-3.0; see below).
 Modified 2026-10 by PLN: MSD tools, ARM_MSD, and source-error flag (GPL-3.0; see below).
+Modified 2026-10 by PLN: mount expectImage, preflight, and MSD mutex (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -221,3 +222,17 @@ No code from another pikvm_mcp_server fork was added for these methods.
   /api/msd". An abort or reset while kvmd is not reading stays
   PIKVM_MSD_STATE_UNKNOWN. No code from another pikvm_mcp_server fork
   was added. Mount and eject use the kvmd MSD API already cited above.
+
+2026-10, by PLN:
+  Mount takes expectImage. It is required when the drive is already
+  connected and must equal the snapshot image name. A missing or
+  different value makes no POST and returns MsdExpectImageError naming
+  the connected image. Before any mutation, mount also requires kvmd
+  online, not busy, a stored image with complete true, and a name
+  with no ://. Those refusals make no POST. Mount and eject take a
+  per-device mutex, separate from BusyLock. The MSD arm-gate applies
+  to every pikvm_msd_* tool except the read-only allowlist
+  (pikvm_msd_status). Rollback records every failed step. An NBD or
+  URL snapshot image cannot be restored, because msdSetParams refuses
+  URLs. An eject error other than MsdDisconnectedError is surfaced.
+  No code from another pikvm_mcp_server fork was added.

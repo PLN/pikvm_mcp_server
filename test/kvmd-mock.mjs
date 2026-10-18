@@ -2,6 +2,7 @@
 // Modified 2026-10 by PLN: MSD state machine (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: incomplete images and kvmd error classes (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: pauseWrite and seeded images (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: holdMutations for the MSD mutex test (GPL-3.0; see NOTICE).
 
 /**
  * Minimal KVMD REST mock implementing exactly the routes src/pikvm/client.ts
@@ -23,7 +24,8 @@
  * `legacyFreeShape`, `writeHoldMs`, `pauseWrite`, and `remote` (`lines`,
  * `chunks`, `gapMs`, `headerDelayMs`, `stallAfterHeadersMs`, `redirectTo`).
  * `pauseWrite` accepts POST /api/msd/write, pauses the request, and does
- * not read the body until the socket closes. `images` seeds storage
+ * not read the body until the socket closes. `holdMutations` is how many
+ * MSD set_params calls wait until `releaseHold()`. `images` seeds storage
  * (`'name.img'` or `{name,size,complete}`). `drive` sets the initial
  * selection (`image` is a seeded name or null, plus connected/cdrom/rw).
  * A write that is aborted or shorter than Content-Length keeps a
@@ -211,6 +213,16 @@ export async function startKvmdMock(options = {}) {
       bytes.set(name, body);
     }
   }
+  const heldMutations = [];
+  let holdsLeft = Number.isInteger(options.holdMutations) ? options.holdMutations : 0;
+  async function maybeHoldMutation() {
+    if (holdsLeft <= 0) return;
+    holdsLeft -= 1;
+    await new Promise((resolve) => {
+      heldMutations.push(resolve);
+    });
+  }
+
   if (options.drive && typeof options.drive === 'object') {
     const drive = options.drive;
     if (typeof drive.image === 'string') {
@@ -316,6 +328,7 @@ export async function startKvmdMock(options = {}) {
       return true;
     }
     if (req.method === 'POST' && u.pathname === '/api/msd/set_params') {
+      await maybeHoldMutation();
       if (guardMutation(res)) return true;
       if (state.drive.connected) {
         kvmdFail(res, 400, 'MsdConnectedError', MSD_CONNECTED);
@@ -601,5 +614,9 @@ export async function startKvmdMock(options = {}) {
       server.close(resolve);
       server.closeAllConnections();
     }),
+    releaseHold() {
+      const pending = heldMutations.splice(0);
+      for (const release of pending) release();
+    },
   };
 }

@@ -2,6 +2,7 @@
 <!-- Modified 2026-10 by PLN: MSD upload deadlines (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: cap MSD job at 7 days and idle at 1 hour (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: PIKVM_MCP_ARM_MSD and MSD status, mount, eject (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: mount expectImage and MSD preflight (GPL-3.0; see NOTICE) -->
 
 # PiKVM MCP Server
 
@@ -130,10 +131,10 @@ PIKVM_MCP_NO_DOTENV=0
   `pikvm_get/set/clear_calibration`) stay available. Set `1` to arm. stdio
   mode is never gated — local callers gate on their own side.
 - **`PIKVM_MCP_ARM_MSD`** — the MSD arm-gate, separate from HID. HTTP mode
-  defaults to **disarmed**: `pikvm_msd_mount` and `pikvm_msd_eject` return a
-  typed error naming this variable and no mass-storage change reaches the
-  device. `PIKVM_MCP_ARM_HID=1` does not arm them. `pikvm_msd_status` stays
-  available. Set `1` to arm. stdio mode is never gated.
+  defaults to **disarmed**: every `pikvm_msd_*` tool except the read-only
+  allowlist (`pikvm_msd_status`) returns a typed error naming this variable
+  and no mass-storage change reaches the device. `PIKVM_MCP_ARM_HID=1` does
+  not arm them. Set `1` to arm. stdio mode is never gated.
 - **`PIKVM_MCP_NO_DOTENV`** — set `1` to skip `.env` loading entirely (for
   systemd/gateway units that export env directly; a stray `.env` on disk must
   not win). Only read from the real process environment, so a `.env` cannot
@@ -239,10 +240,10 @@ Or if using the .env file:
 
 ### Mass storage
 - **`pikvm_msd_status`** - Read mass-storage state (optional: device). Read-only.
-- **`pikvm_msd_mount`** - Select an image and connect the virtual drive (required: image, mode `cdrom` or `flash`, confirmImage; optional: rw, connect, device). `confirmImage` must equal `image`. Returns the drive re-read after the change. On failure the previous selection is restored.
-- **`pikvm_msd_eject`** - Disconnect the virtual drive (required: expectImage; optional: device). `expectImage` must equal the current image name, or `""` when none is selected. A second eject returns `alreadyDisconnected`.
+- **`pikvm_msd_mount`** - Select an image and connect the virtual drive (required: image, mode `cdrom` or `flash`, confirmImage; optional: rw, connect, expectImage, device). `confirmImage` must equal `image`. When a drive is already connected, `expectImage` must equal that image or the mount is refused and the drive stays connected. The image must already be in storage and complete. Returns the drive re-read after the change. On failure the previous selection is restored. An NBD or URL snapshot image cannot be restored, because `set_params` refuses a name that contains `://`.
+- **`pikvm_msd_eject`** - Disconnect the virtual drive (required: expectImage; optional: device). `expectImage` must equal the current image name, or `""` when none is selected. A second eject returns `alreadyDisconnected`. Any other kvmd error is returned as an error.
 
-In HTTP mode, mount and eject stay disarmed until `PIKVM_MCP_ARM_MSD=1`. Status stays available. stdio is not gated.
+In HTTP mode, MSD changes stay disarmed until `PIKVM_MCP_ARM_MSD=1`. Status stays available. stdio is not gated. Mount and eject run one at a time per device.
 
 ## Skills (Prompts & Skill Tools)
 

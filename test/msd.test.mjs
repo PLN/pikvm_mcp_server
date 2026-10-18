@@ -1,4 +1,5 @@
 // Modified 2026-10 by PLN: MSD status, mount, eject, and arm-gate tests (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: expectImage, preflight, and MSD mutex tests (GPL-3.0; see NOTICE).
 
 /**
  * MSD tools against the mock. The HTTP harness matches test/http.test.mjs.
@@ -13,7 +14,7 @@ import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { PiKVMClient } from '../dist/pikvm/client.js';
 import { BusyLock } from '../dist/pikvm/lock.js';
-import { createMcpServer, ARM_GATED_TOOLS, ARM_MSD_GATED_TOOLS } from '../dist/server.js';
+import { createMcpServer, ARM_GATED_TOOLS, MSD_READ_ONLY_TOOLS, msdToolRequiresArm } from '../dist/server.js';
 import { startHttpServer } from '../dist/http.js';
 import { startKvmdMock } from './kvmd-mock.mjs';
 
@@ -92,6 +93,20 @@ function msdPosts(mock) {
   return mock.calls.filter((call) => call.method === 'POST' && call.path.startsWith('/api/msd'));
 }
 
+async function waitFor(fn, ms = 2000) {
+  const start = Date.now();
+  while (!fn()) {
+    if (Date.now() - start > ms) return false;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  return true;
+}
+
+const CONNECTED = {
+  images: ['disk.img', 'other.img'],
+  drive: { image: 'disk.img', connected: true, cdrom: false, rw: false },
+};
+
 async function withSession(mockOptions, flags, fn) {
   const mock = await startKvmdMock(mockOptions);
   const httpServer = await startHttpServer({
@@ -122,12 +137,13 @@ function freePort() {
   });
 }
 
-test('ARM_MSD_GATED_TOOLS is mount and eject, separate from HID', () => {
-  assert.deepEqual(
-    [...ARM_MSD_GATED_TOOLS].sort(),
-    ['pikvm_msd_eject', 'pikvm_msd_mount'],
-  );
-  assert.equal(ARM_MSD_GATED_TOOLS.has('pikvm_msd_status'), false);
+test('MSD arm-gate allows only the read-only list', () => {
+  assert.deepEqual([...MSD_READ_ONLY_TOOLS], ['pikvm_msd_status']);
+  assert.equal(msdToolRequiresArm('pikvm_msd_status'), false);
+  assert.equal(msdToolRequiresArm('pikvm_msd_mount'), true);
+  assert.equal(msdToolRequiresArm('pikvm_msd_eject'), true);
+  assert.equal(msdToolRequiresArm('pikvm_msd_upload'), true);
+  assert.equal(msdToolRequiresArm('pikvm_type'), false);
   assert.equal(ARM_GATED_TOOLS.has('pikvm_msd_mount'), false);
   assert.equal(ARM_GATED_TOOLS.has('pikvm_msd_eject'), false);
   assert.equal(ARM_GATED_TOOLS.has('pikvm_msd_status'), false);
@@ -141,6 +157,7 @@ test('HTTP: MSD disarmed blocks mount and eject, status still reads', async () =
       for (const [name, args] of [
         ['pikvm_msd_mount', { image: 'disk.img', mode: 'flash', confirmImage: 'disk.img' }],
         ['pikvm_msd_eject', { expectImage: '' }],
+        ['pikvm_msd_upload', {}],
       ]) {
         const result = await callTool(base, sessionId, name, args);
         assert.equal(result.isError, true, name);
@@ -287,13 +304,15 @@ test('a failed mount rollback reports rollbackError', async () => {
         mode: 'flash',
         rw: false,
         confirmImage: 'next.img',
+        expectImage: 'orig.img',
       });
       assert.equal(result.isError, true);
       const body = JSON.parse(result.content[0].text);
       assert.equal(body.error.type, 'MsdOperationError');
       assert.equal(body.error.endpoint, 'POST /api/msd/set_connected');
-      assert.equal(body.rollbackError.type, 'MsdOperationError');
-      assert.equal(body.rollbackError.endpoint, 'POST /api/msd/set_connected');
+      assert.equal(body.rollbackError.length, 1);
+      assert.equal(body.rollbackError[0].type, 'MsdOperationError');
+      assert.equal(body.rollbackError[0].endpoint, 'POST /api/msd/set_connected');
       assert.equal(body.restored.connected, false);
       assert.equal(body.restored.image.name, 'orig.img');
       assert.equal(body.restored.cdrom, false);
@@ -327,6 +346,7 @@ test('cdrom and non-writable images report rw false after kvmd coercion', async 
       mode: 'flash',
       rw: true,
       confirmImage: 'os.iso',
+      expectImage: 'disk.img',
     });
     assert.equal(flash.isError, undefined, flash.content[0].text);
     const flashBody = JSON.parse(flash.content[0].text);
@@ -338,6 +358,219 @@ test('cdrom and non-writable images report rw false after kvmd coercion', async 
     assert.match(isoParams.query, /cdrom=0/);
     assert.match(isoParams.query, /rw=1/);
   });
+});
+
+test('mount refuses to eject a connected drive unless expectImage matches', async () => {
+  await withSession(CONNECTED, OPEN, async ({ mock, base, sessionId }) => {
+    const mountOther = {
+      image: 'other.img',
+      mode: 'flash',
+      confirmImage: 'other.img',
+    };
+    const missing = await callTool(base, sessionId, 'pikvm_msd_mount', mountOther);
+    assert.equal(missing.isError, true);
+    assert.match(missing.content[0].text, /MsdExpectImageError/);
+    assert.match(missing.content[0].text, /disk\.img/);
+    assert.deepEqual(msdPosts(mock), []);
+
+    const mismatch = await callTool(base, sessionId, 'pikvm_msd_mount', {
+      ...mountOther,
+      expectImage: 'nope.img',
+    });
+    assert.equal(mismatch.isError, true);
+    assert.match(mismatch.content[0].text, /MsdExpectImageError/);
+    assert.match(mismatch.content[0].text, /disk\.img/);
+    assert.deepEqual(msdPosts(mock), []);
+    assert.equal(mock.state.drive.connected, true);
+    assert.equal(mock.state.drive.image.name, 'disk.img');
+
+    const match = await callTool(base, sessionId, 'pikvm_msd_mount', {
+      ...mountOther,
+      expectImage: 'disk.img',
+    });
+    assert.equal(match.isError, undefined, match.content[0].text);
+    const body = JSON.parse(match.content[0].text);
+    assert.equal(body.drive.connected, true);
+    assert.equal(body.drive.image.name, 'other.img');
+  });
+});
+
+test('a URL image makes no MSD POST', async () => {
+  await withSession(CONNECTED, OPEN, async ({ mock, base, sessionId }) => {
+    const result = await callTool(base, sessionId, 'pikvm_msd_mount', {
+      image: 'nbd://host/disk',
+      mode: 'flash',
+      confirmImage: 'nbd://host/disk',
+      expectImage: 'disk.img',
+    });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /:\/\//);
+    assert.deepEqual(msdPosts(mock), []);
+    assert.equal(mock.state.drive.connected, true);
+    assert.equal(mock.state.drive.image.name, 'disk.img');
+  });
+});
+
+test('an unknown image makes no MSD POST', async () => {
+  await withSession(CONNECTED, OPEN, async ({ mock, base, sessionId }) => {
+    const result = await callTool(base, sessionId, 'pikvm_msd_mount', {
+      image: 'missing.img',
+      mode: 'flash',
+      confirmImage: 'missing.img',
+      expectImage: 'disk.img',
+    });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /not in storage/);
+    assert.deepEqual(msdPosts(mock), []);
+    assert.equal(mock.state.drive.connected, true);
+    assert.equal(mock.state.drive.image.name, 'disk.img');
+  });
+});
+
+test('an incomplete image makes no MSD POST', async () => {
+  await withSession({
+    images: ['disk.img', { name: 'part.img', complete: false }],
+    drive: { image: 'disk.img', connected: true, cdrom: false, rw: false },
+  }, OPEN, async ({ mock, base, sessionId }) => {
+    const result = await callTool(base, sessionId, 'pikvm_msd_mount', {
+      image: 'part.img',
+      mode: 'flash',
+      confirmImage: 'part.img',
+      expectImage: 'disk.img',
+    });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /incomplete/);
+    assert.deepEqual(msdPosts(mock), []);
+    assert.equal(mock.state.drive.connected, true);
+    assert.equal(mock.state.drive.image.name, 'disk.img');
+  });
+});
+
+test('a busy kvmd makes no MSD POST', async () => {
+  await withSession({ ...CONNECTED, busyFor: 1 }, OPEN, async ({ mock, base, sessionId }) => {
+    const result = await callTool(base, sessionId, 'pikvm_msd_mount', {
+      image: 'other.img',
+      mode: 'flash',
+      confirmImage: 'other.img',
+      expectImage: 'disk.img',
+    });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /busy/);
+    assert.deepEqual(msdPosts(mock), []);
+    assert.equal(mock.state.drive.connected, true);
+    assert.equal(mock.state.drive.image.name, 'disk.img');
+  });
+});
+
+test('an offline kvmd makes no MSD POST', async () => {
+  await withSession({
+    ...CONNECTED,
+    online: false,
+  }, OPEN, async ({ mock, base, sessionId }) => {
+    const result = await callTool(base, sessionId, 'pikvm_msd_mount', {
+      image: 'other.img',
+      mode: 'flash',
+      confirmImage: 'other.img',
+      expectImage: 'disk.img',
+    });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /offline/);
+    assert.deepEqual(msdPosts(mock), []);
+    assert.equal(mock.state.drive.connected, true);
+    assert.equal(mock.state.drive.image.name, 'disk.img');
+  });
+});
+
+test('rollback keeps every error, including an unrestorable URL image', async () => {
+  await withSession({
+    images: ['disk.img'],
+    drive: { image: 'nbd://host/disk', connected: true, cdrom: false, rw: false },
+    failSetConnected: true,
+  }, OPEN, async ({ mock, base, sessionId }) => {
+    const result = await callTool(base, sessionId, 'pikvm_msd_mount', {
+      image: 'disk.img',
+      mode: 'flash',
+      confirmImage: 'disk.img',
+      expectImage: 'nbd://host/disk',
+    });
+    assert.equal(result.isError, true);
+    const body = JSON.parse(result.content[0].text);
+    assert.equal(body.rollbackError.length, 2);
+    assert.match(body.rollbackError[0].message, /msdSetParams refuses URLs/);
+    assert.equal(body.rollbackError[1].type, 'MsdOperationError');
+    assert.equal(body.rollbackError[1].endpoint, 'POST /api/msd/set_connected');
+    const restores = mock.calls.filter((call) => (
+      call.path === '/api/msd/set_params' && call.query.includes('nbd')
+    ));
+    assert.deepEqual(restores, []);
+    assert.equal(mock.state.drive.connected, false);
+  });
+});
+
+test('eject surfaces a kvmd error other than MsdDisconnectedError', async () => {
+  await withSession({
+    images: ['disk.img'],
+    drive: { image: 'disk.img', connected: true, cdrom: true, rw: false },
+    routes: {
+      'POST /api/msd/set_connected': {
+        status: 409,
+        body: {
+          ok: false,
+          result: {
+            error: 'MsdIsBusyError',
+            error_msg: 'Performing another MSD operation, please try again later',
+          },
+        },
+      },
+    },
+  }, OPEN, async ({ mock, base, sessionId }) => {
+    const result = await callTool(base, sessionId, 'pikvm_msd_eject', { expectImage: 'disk.img' });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /MsdIsBusyError/);
+    assert.doesNotMatch(result.content[0].text, /alreadyDisconnected/);
+    assert.equal(mock.state.drive.connected, true);
+    assert.equal(mock.state.drive.image.name, 'disk.img');
+  });
+});
+
+test('MSD mount is single-flight across HTTP sessions', { timeout: 15000 }, async () => {
+  await withSession(
+    { images: ['a.img', 'b.img'], holdMutations: 1 },
+    OPEN,
+    async ({ mock, base, sessionId }) => {
+      const other = await openSession(base);
+      const first = callTool(base, sessionId, 'pikvm_msd_mount', {
+        image: 'a.img',
+        mode: 'flash',
+        confirmImage: 'a.img',
+      });
+      assert.equal(await waitFor(() => msdPosts(mock).length >= 1), true);
+      const second = callTool(base, other, 'pikvm_msd_mount', {
+        image: 'b.img',
+        mode: 'flash',
+        confirmImage: 'b.img',
+        expectImage: 'a.img',
+      });
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      assert.equal(msdPosts(mock).length, 1);
+      mock.releaseHold();
+      const [mountedA, mountedB] = await Promise.all([first, second]);
+      assert.equal(mountedA.isError, undefined, mountedA.content[0].text);
+      assert.equal(mountedB.isError, undefined, mountedB.content[0].text);
+      assert.equal(JSON.parse(mountedA.content[0].text).drive.image.name, 'a.img');
+      assert.equal(JSON.parse(mountedB.content[0].text).drive.image.name, 'b.img');
+      const order = msdPosts(mock).map((call) => `${call.path}${call.query}`);
+      const params = order.filter((item) => item.startsWith('/api/msd/set_params'));
+      assert.equal(params.length, 2);
+      assert.match(params[0], /a\.img/);
+      assert.match(params[1], /b\.img/);
+      const firstConnect = order.findIndex((item) => item.startsWith('/api/msd/set_connected'));
+      const secondParams = order.findIndex((item) => item.includes('b.img'));
+      assert.ok(firstConnect !== -1 && firstConnect < secondParams);
+      assert.equal(mock.state.drive.image.name, 'b.img');
+      assert.equal(mock.state.drive.connected, true);
+    },
+  );
 });
 
 test('HTTP process: PIKVM_MCP_ARM_HID=1 leaves MSD disarmed', { timeout: 20000 }, async () => {
