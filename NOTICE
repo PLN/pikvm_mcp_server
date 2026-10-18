@@ -33,6 +33,7 @@ Modified 2026-10 by PLN: screenshot defaults, local crop, and optional OCR (GPL-
 Modified 2026-10 by PLN: click frames stay on the full preview (GPL-3.0; see below).
 Modified 2026-10 by PLN: OCR is not retried after it is sent (GPL-3.0; see below).
 Modified 2026-10 by PLN: redaction stays bounded, and sharp refuses an oversized image (GPL-3.0; see below).
+Modified 2026-10 by PLN: a mouse echo is the frame that move applied (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -705,4 +706,11 @@ No code from another pikvm_mcp_server fork was added for these methods.
   length 2^25 stays inside that cap. sharp decodes for a crop and for
   auto-calibrate use limitInputPixels 8192*8192. An image above that
   is an error and does not replace the click frame.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  A mouse tool resolves its click frame once and passes that frame into
+  the move and the result echo. A full capture that finishes while the
+  move is waiting on the streamer does not change either one. The HID
+  values are the ones mapped from the resolved frame.
   No code from another pikvm_mcp_server fork was copied.

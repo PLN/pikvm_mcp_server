@@ -8,6 +8,7 @@
 // Modified 2026-10 by PLN: kvmd removes an incomplete download unless storeIncomplete (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: preview sizing and OCR routes (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: hold a snapshot so two captures can overlap (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: hold one streamer read so a capture can finish first (GPL-3.0; see NOTICE).
 
 /**
  * Minimal KVMD REST mock implementing exactly the routes src/pikvm/client.ts
@@ -37,7 +38,9 @@
  * `state.busy` and `state.uploading`. `holdMutations` is how many
  * MSD set_params calls wait until `releaseHold()`. `images` seeds storage
  * (`'name.img'` or `{name,size,complete}`). `holdSnapshots` is how many
- * image snapshots wait until `releaseSnapshots()`. `drive` sets the initial
+ * image snapshots wait until `releaseSnapshots()`. `holdNextStreamer()`
+ * makes the next GET /api/streamer wait until `releaseStreamer()`.
+ * `drive` sets the initial
  * selection (`image` is a seeded name or null, plus connected/cdrom/rw).
  * A write that is aborted or shorter than Content-Length keeps a
  * complete:false image unless remove_incomplete is set. Image writable
@@ -258,6 +261,8 @@ export async function startKvmdMock(options = {}) {
   }
   const heldMutations = [];
   const heldSnapshots = [];
+  const heldStreamer = [];
+  let streamerHolds = 0;
   let imageSnapshots = 0;
   let holdsLeft = Number.isInteger(options.holdMutations) ? options.holdMutations : 0;
   async function maybeHoldMutation() {
@@ -652,6 +657,13 @@ export async function startKvmdMock(options = {}) {
       return;
     }
     if (req.method === 'GET' && u.pathname === '/api/streamer') {
+      if (streamerHolds > 0) {
+        streamerHolds -= 1;
+        await new Promise((resolve) => {
+          heldStreamer.push(resolve);
+        });
+        if (req.destroyed || res.writableEnded || res.destroyed) return;
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         ok: true,
@@ -751,6 +763,13 @@ export async function startKvmdMock(options = {}) {
     },
     releaseSnapshots() {
       const pending = heldSnapshots.splice(0);
+      for (const release of pending) release();
+    },
+    holdNextStreamer() {
+      streamerHolds += 1;
+    },
+    releaseStreamer() {
+      const pending = heldStreamer.splice(0);
       for (const release of pending) release();
     },
   };

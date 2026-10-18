@@ -12,6 +12,7 @@
 // Modified 2026-10 by PLN: screenshot metadata, crop, and optional OCR (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: click frames and frameId (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: OCR stays listed until a device says disabled (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: mouse tools pass the resolved click frame (GPL-3.0; see NOTICE).
 
 /**
  * MCP server factory for PiKVM tools
@@ -1188,7 +1189,7 @@ export function createMcpServer(deps: McpServerDeps): Server {
             // Absolute moves should be positive pixel coordinates
             const clampedX = Math.max(0, Math.round(x));
             const clampedY = Math.max(0, Math.round(y));
-            const result = await deviceClient.mouseMove(clampedX, clampedY, frameId);
+            const result = await deviceClient.mouseMove(clampedX, clampedY, described);
             if (result.calibrationInvalidated) {
               calibrationWarning = '\n⚠️ Resolution changed - calibration has been cleared. Recalibrate with pikvm_auto_calibrate (preferred) or pikvm_calibrate.';
             }
@@ -1212,9 +1213,9 @@ export function createMcpServer(deps: McpServerDeps): Server {
           const frameId = parseFrameId(args.frameId);
           const described = deviceClient.describeFrame(frameId);
 
-          // Move to position first if specified
+          // Move to position first if specified. Same resolved frame as the echo.
           if (clickX !== undefined && clickY !== undefined) {
-            await deviceClient.mouseMove(Math.round(clickX), Math.round(clickY), frameId);
+            await deviceClient.mouseMove(Math.round(clickX), Math.round(clickY), described);
           }
 
           const state = validateEnum(args.state, VALID_KEY_STATES, 'click');
