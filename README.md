@@ -448,6 +448,8 @@ pixelToNormalized(80, 120, {width: 1920, height: 1080}, null)
 
 `null` calibration uses factors of 1. An uncropped image uses a crop origin of 0, so `(30, 40)` at scale 2 is screen `(60, 80)`.
 
+Every capture has a random `frameId`. The default click frame is the last full preview, chosen in request order: a slower earlier capture does not replace a later one that already finished. A crop does not change the default. Internal captures, including auto-calibrate's raw screenshots, do not change it either. Mouse tools take an optional `frameId`. With it, `x` and `y` are pixels in that capture and are mapped with that frame's scale, crop origin, and calibration. Without it, they are pixels in the default frame. The tool result echoes `frameId` or `default`, plus width, height, scale, and origin. The device keeps the last 16 captures. An unknown, evicted, or other-device `frameId` is `PIKVM_UNKNOWN_FRAME` and sends no HID event. On a 1920×1080 screen, a 960×540 preview (scale 2) maps a click at `(480, 270)` to screen `(960, 540)`, which is HID `(17, 30)`. A later crop does not change that click. Passing the crop's `frameId` adds the crop origin before the scale.
+
 `pikvm_read_text` is a passthrough to `GET /streamer/snapshot?ocr=1`. Startup probes each device's `GET /streamer/ocr` with that device's TLS mode and a short timeout. A probe failure is non-fatal and is redacted. The tool is registered only when at least one device reports OCR enabled. A call on a device whose OCR is disabled or unknown returns `PIKVM_OCR_UNAVAILABLE` and does not fetch an image. `langs` must be a comma-separated list of languages that device reported. `left`, `top`, `right`, and `bottom` are an optional box. Recognition runs on the PiKVM and is slow on small boards.
 
 ### Keyboard
@@ -456,9 +458,9 @@ pixelToNormalized(80, 120, {width: 1920, height: 1080}, null)
 - **`pikvm_shortcut`** - Send multiple keys pressed simultaneously (required: keys array)
 
 ### Mouse
-- **`pikvm_mouse_move`** - Move cursor to absolute pixel position or relative delta (required: x, y; optional: relative)
-- **`pikvm_mouse_click`** - Click a mouse button, optionally at a position (optional: button, x, y, state)
-- **`pikvm_mouse_scroll`** - Scroll the mouse wheel (required: deltaY; optional: deltaX)
+- **`pikvm_mouse_move`** - Move cursor in the default click frame, or in `frameId` (required: x, y; optional: relative, frameId)
+- **`pikvm_mouse_click`** - Click a mouse button, optionally at a position in that frame (optional: button, x, y, state, frameId)
+- **`pikvm_mouse_scroll`** - Scroll the mouse wheel (required: deltaY; optional: deltaX, frameId)
 
 ### Calibration
 - **`pikvm_auto_calibrate`** - Automatically detect cursor and compute calibration factors *(preferred)*

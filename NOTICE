@@ -30,6 +30,7 @@ Modified 2026-10 by PLN: test certificate serials are minimal DER (GPL-3.0; see 
 Modified 2026-10 by PLN: redact a non-Error cause, and one host across schemes (GPL-3.0; see below).
 Modified 2026-10 by PLN: a throwing getter and a deep cause stay redacted (GPL-3.0; see below).
 Modified 2026-10 by PLN: screenshot defaults, local crop, and optional OCR (GPL-3.0; see below).
+Modified 2026-10 by PLN: click frames stay on the full preview (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -668,3 +669,15 @@ No code from another pikvm_mcp_server fork was added for these methods.
   unknown device returns PIKVM_OCR_UNAVAILABLE and does not fetch an
   image. OCR is slow on small boards. No code from another
   pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  The default click frame is the last full preview, stored in request
+  order. A capture that finishes later does not replace a newer
+  request. A crop is stored under its own frameId and does not become
+  the default. Auto-calibrate's raw screenshots pass track:false, so
+  they never enter the store. Mouse tools take an optional frameId.
+  Coordinates are mapped with that frame's scale, crop origin, and
+  calibration. The device keeps 16 captures. An unknown, evicted, or
+  other-device id is PIKVM_UNKNOWN_FRAME and sends no HID event.
+  The tool result echoes frameId or default, width, height, scale,
+  and origin. No code from another pikvm_mcp_server fork was copied.

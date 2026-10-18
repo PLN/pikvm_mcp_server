@@ -16,7 +16,7 @@ Capture the current screen of the remote machine as a JPEG image. This is your p
 | maxHeight | number | 600 | Maximum preview height. Omitted uses the device default |
 | quality | number | 70 | JPEG quality (1-100). Omitted uses the device default |
 
-Scaling preserves aspect ratio. When you scale a screenshot, the server tracks the scale factor so that mouse coordinates you derive from the image are automatically mapped back to native resolution.
+Scaling preserves aspect ratio. The default click frame is the last full preview, in request order. A crop does not change it. Pass the capture's `frameId` to a mouse tool to use that image, including a crop.
 
 ## Example Call
 

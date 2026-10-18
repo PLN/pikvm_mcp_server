@@ -1,4 +1,5 @@
 // Modified 2026-10 by PLN: screenshot defaults, crop bounds, and OCR state (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: unknown click frame error (GPL-3.0; see NOTICE).
 
 /**
  * Preview defaults, crop checks, and OCR state for one device.
@@ -47,6 +48,17 @@ export class OcrUnavailableError extends Error {
     super(`OCR is not available on device ${JSON.stringify(device)}`);
     this.name = 'OcrUnavailableError';
     this.type = 'PIKVM_OCR_UNAVAILABLE';
+  }
+}
+
+/** A mouse frameId this device does not have. No HID event is sent. */
+export class UnknownFrameError extends Error {
+  readonly type: string;
+
+  constructor(frameId: string) {
+    super(`frame ${JSON.stringify(frameId)} is unknown on this device`);
+    this.name = 'UnknownFrameError';
+    this.type = 'PIKVM_UNKNOWN_FRAME';
   }
 }
 

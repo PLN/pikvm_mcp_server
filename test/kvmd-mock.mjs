@@ -7,6 +7,7 @@
 // Modified 2026-10 by PLN: storeIncomplete for fetch cleanup tests (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: kvmd removes an incomplete download unless storeIncomplete (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: preview sizing and OCR routes (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: hold a snapshot so two captures can overlap (GPL-3.0; see NOTICE).
 
 /**
  * Minimal KVMD REST mock implementing exactly the routes src/pikvm/client.ts
@@ -35,7 +36,8 @@
  * the socket after the first body chunk. A write in progress sets
  * `state.busy` and `state.uploading`. `holdMutations` is how many
  * MSD set_params calls wait until `releaseHold()`. `images` seeds storage
- * (`'name.img'` or `{name,size,complete}`). `drive` sets the initial
+ * (`'name.img'` or `{name,size,complete}`). `holdSnapshots` is how many
+ * image snapshots wait until `releaseSnapshots()`. `drive` sets the initial
  * selection (`image` is a seeded name or null, plus connected/cdrom/rw).
  * A write that is aborted or shorter than Content-Length keeps a
  * complete:false image unless remove_incomplete is set. Image writable
@@ -255,6 +257,8 @@ export async function startKvmdMock(options = {}) {
     }
   }
   const heldMutations = [];
+  const heldSnapshots = [];
+  let imageSnapshots = 0;
   let holdsLeft = Number.isInteger(options.holdMutations) ? options.holdMutations : 0;
   async function maybeHoldMutation() {
     if (holdsLeft <= 0) return;
@@ -685,6 +689,15 @@ export async function startKvmdMock(options = {}) {
         res.end(options.ocrText ?? 'screen text');
         return;
       }
+      const hold = options.holdSnapshots ?? 0;
+      const snapshotIndex = imageSnapshots;
+      imageSnapshots += 1;
+      if (snapshotIndex < hold) {
+        await new Promise((resolve) => {
+          heldSnapshots.push(resolve);
+        });
+        if (req.destroyed || res.writableEnded || res.destroyed) return;
+      }
       if (u.searchParams.get('preview') === '1') {
         const maxWidth = Number(u.searchParams.get('preview_max_width') || 0);
         const maxHeight = Number(u.searchParams.get('preview_max_height') || 0);
@@ -726,6 +739,10 @@ export async function startKvmdMock(options = {}) {
     }),
     releaseHold() {
       const pending = heldMutations.splice(0);
+      for (const release of pending) release();
+    },
+    releaseSnapshots() {
+      const pending = heldSnapshots.splice(0);
       for (const release of pending) release();
     },
   };

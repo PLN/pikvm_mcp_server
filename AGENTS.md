@@ -76,7 +76,7 @@ The server is configured via environment variables or a config file:
 ## MCP Tools Provided
 
 ### Display
-1. **`pikvm_screenshot`** - Capture current screen as a JPEG preview (default 960×600, quality 70). Optional `region` is cropped locally.
+1. **`pikvm_screenshot`** - Capture current screen as a JPEG preview (default 960×600, quality 70). Optional `region` is cropped locally. The default click frame is the last full preview, in request order. A crop does not change it.
 2. **`pikvm_get_resolution`** - Get current screen resolution (useful for mouse coordinates)
 
 `pikvm_read_text` is registered only when at least one device reports OCR enabled. It is slow on small boards.

@@ -189,6 +189,8 @@ describe('read-only hardware', { concurrency: false }, () => {
       assert.ok(meta.width >= 1 && meta.height >= 1);
       assert.equal(typeof meta.scaleX, 'number');
       assert.equal(typeof meta.scaleY, 'number');
+      assert.equal(typeof meta.frameId, 'string');
+      assert.ok(meta.frameId.length > 0);
       const cropped = await session.call('pikvm_screenshot', {
         region: { x: 0, y: 0, width: 1, height: 1 },
       });
@@ -197,6 +199,8 @@ describe('read-only hardware', { concurrency: false }, () => {
       assert.deepEqual(regionMeta.region, { x: 0, y: 0, width: 1, height: 1 });
       assert.equal(regionMeta.width, 1);
       assert.equal(regionMeta.height, 1);
+      assert.equal(typeof regionMeta.frameId, 'string');
+      assert.notEqual(regionMeta.frameId, meta.frameId);
       assert.equal(regionMeta.actualWidth, meta.actualWidth);
       assert.equal(regionMeta.actualHeight, meta.actualHeight);
       const image = cropped.content.find((part) => part.type === 'image');

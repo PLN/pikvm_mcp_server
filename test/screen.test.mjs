@@ -130,6 +130,28 @@ function metadataOf(result) {
   return JSON.parse(line);
 }
 
+function hidMoves(mock) {
+  return mock.calls.filter((call) => call.path === '/api/hid/events/send_mouse_move');
+}
+
+function hidButtons(mock) {
+  return mock.calls.filter((call) => call.path === '/api/hid/events/send_mouse_button');
+}
+
+function moveTarget(call) {
+  const query = new URLSearchParams(call.query);
+  return { x: Number(query.get('to_x')), y: Number(query.get('to_y')) };
+}
+
+async function waitUntil(fn, ms = 2000) {
+  const start = Date.now();
+  for (;;) {
+    if (fn()) return;
+    if (Date.now() - start > ms) throw new Error('timed out');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 async function startLegacy(mock, extraEnv = {}) {
   const config = withEnv({
     PIKVM_HOST: mock.url,
@@ -591,6 +613,257 @@ test('OCR errors are redacted', async () => {
     } finally {
       await srv.close();
       await reading.close();
+    }
+  } finally {
+    await mock.close();
+  }
+});
+
+test('a crop does not move the default click frame', async () => {
+  const mock = await startKvmdMock();
+  try {
+    const session = await startLegacy(mock);
+    try {
+      const full = await rpc(session.srv.base, session.sessionId, 'tools/call', {
+        name: 'pikvm_screenshot',
+        arguments: {},
+      });
+      const fullMeta = metadataOf(full.result);
+      const cropped = await rpc(session.srv.base, session.sessionId, 'tools/call', {
+        name: 'pikvm_screenshot',
+        arguments: { region: { x: 100, y: 50, width: 10, height: 10 } },
+      });
+      const cropMeta = metadataOf(cropped.result);
+      assert.notEqual(cropMeta.frameId, fullMeta.frameId);
+      const fromFull = await rpc(session.srv.base, session.sessionId, 'tools/call', {
+        name: 'pikvm_mouse_click',
+        arguments: { x: 480, y: 270 },
+      });
+      assert.notEqual(fromFull.result.isError, true, fromFull.result.content[0].text);
+      const fullEcho = metadataOf(fromFull.result);
+      assert.equal(fullEcho.frameId, 'default');
+      assert.equal(fullEcho.width, 960);
+      assert.equal(fullEcho.height, 540);
+      assert.equal(fullEcho.scaleX, 2);
+      assert.equal(fullEcho.scaleY, 2);
+      assert.deepEqual(fullEcho.origin, { x: 0, y: 0 });
+      assert.deepEqual(moveTarget(hidMoves(mock).at(-1)), { x: 17, y: 30 });
+
+      const fromCrop = await rpc(session.srv.base, session.sessionId, 'tools/call', {
+        name: 'pikvm_mouse_click',
+        arguments: { x: 480, y: 270, frameId: cropMeta.frameId },
+      });
+      assert.notEqual(fromCrop.result.isError, true, fromCrop.result.content[0].text);
+      const cropEcho = metadataOf(fromCrop.result);
+      assert.equal(cropEcho.frameId, cropMeta.frameId);
+      assert.equal(cropEcho.width, 10);
+      assert.equal(cropEcho.height, 10);
+      assert.deepEqual(cropEcho.origin, { x: 100, y: 50 });
+      assert.equal(cropEcho.scaleX, 2);
+      assert.equal(cropEcho.scaleY, 2);
+      const screenX = Math.round((480 + 100) * 2);
+      const screenY = Math.round((270 + 50) * 2);
+      assert.deepEqual(
+        moveTarget(hidMoves(mock).at(-1)),
+        pixelToNormalized(screenX, screenY, { width: 1920, height: 1080 }, null),
+      );
+      assert.deepEqual(moveTarget(hidMoves(mock).at(-1)), { x: 6847, y: 6104 });
+    } finally {
+      await session.close();
+    }
+  } finally {
+    await mock.close();
+  }
+});
+
+test('interleaved screenshots keep request order, and frameId is exact', async () => {
+  const mock = await startKvmdMock({ holdSnapshots: 1 });
+  try {
+    const session = await startLegacy(mock);
+    try {
+      const otherId = await openSession(session.srv.base);
+      const firstPromise = rpc(session.srv.base, session.sessionId, 'tools/call', {
+        name: 'pikvm_screenshot',
+        arguments: { maxWidth: 480, maxHeight: 270 },
+      });
+      await waitUntil(() => mock.calls.some((call) => call.path === '/api/streamer/snapshot'));
+      const second = await rpc(session.srv.base, otherId, 'tools/call', {
+        name: 'pikvm_screenshot',
+        arguments: {},
+      });
+      const secondMeta = metadataOf(second.result);
+      assert.equal(secondMeta.width, 960);
+      assert.equal(secondMeta.height, 540);
+      mock.releaseSnapshots();
+      const first = await firstPromise;
+      const firstMeta = metadataOf(first.result);
+      assert.equal(firstMeta.width, 480);
+      assert.equal(firstMeta.height, 270);
+      assert.notEqual(firstMeta.frameId, secondMeta.frameId);
+
+      const clicked = await rpc(session.srv.base, session.sessionId, 'tools/call', {
+        name: 'pikvm_mouse_click',
+        arguments: { x: 480, y: 270 },
+      });
+      const echo = metadataOf(clicked.result);
+      assert.equal(echo.frameId, 'default');
+      assert.equal(echo.width, 960);
+      assert.equal(echo.height, 540);
+      assert.deepEqual(moveTarget(hidMoves(mock).at(-1)), { x: 17, y: 30 });
+
+      const byFirst = await rpc(session.srv.base, session.sessionId, 'tools/call', {
+        name: 'pikvm_mouse_click',
+        arguments: { x: 480, y: 270, frameId: firstMeta.frameId },
+      });
+      assert.equal(metadataOf(byFirst.result).frameId, firstMeta.frameId);
+      assert.equal(metadataOf(byFirst.result).width, 480);
+      assert.deepEqual(
+        moveTarget(hidMoves(mock).at(-1)),
+        pixelToNormalized(480 * 4, 270 * 4, { width: 1920, height: 1080 }, null),
+      );
+      const bySecond = await rpc(session.srv.base, session.sessionId, 'tools/call', {
+        name: 'pikvm_mouse_click',
+        arguments: { x: 480, y: 270, frameId: secondMeta.frameId },
+      });
+      assert.equal(metadataOf(bySecond.result).frameId, secondMeta.frameId);
+      assert.deepEqual(moveTarget(hidMoves(mock).at(-1)), { x: 17, y: 30 });
+    } finally {
+      mock.releaseSnapshots();
+      await session.close();
+    }
+  } finally {
+    await mock.close();
+  }
+});
+
+test('an evicted or cross-device frameId sends no HID', async () => {
+  const mock = await startKvmdMock();
+  const other = await startKvmdMock();
+  const dir = mkdtempSync(join(tmpdir(), 'pikvm-frame-'));
+  try {
+    const session = await startLegacy(mock);
+    try {
+      const ids = [];
+      for (let i = 0; i < 17; i += 1) {
+        const shot = await rpc(session.srv.base, session.sessionId, 'tools/call', {
+          name: 'pikvm_screenshot',
+          arguments: {},
+        });
+        ids.push(metadataOf(shot.result).frameId);
+      }
+      const moves = hidMoves(mock).length;
+      const buttons = hidButtons(mock).length;
+      const evicted = await rpc(session.srv.base, session.sessionId, 'tools/call', {
+        name: 'pikvm_mouse_click',
+        arguments: { x: 1, y: 1, frameId: ids[0] },
+      });
+      assert.equal(evicted.result.isError, true);
+      assert.match(evicted.result.content[0].text, /PIKVM_UNKNOWN_FRAME/);
+      const unknown = await rpc(session.srv.base, session.sessionId, 'tools/call', {
+        name: 'pikvm_mouse_move',
+        arguments: { x: 1, y: 1, frameId: '00000000-0000-4000-8000-000000000000' },
+      });
+      assert.equal(unknown.result.isError, true);
+      assert.match(unknown.result.content[0].text, /PIKVM_UNKNOWN_FRAME/);
+      assert.equal(hidMoves(mock).length, moves);
+      assert.equal(hidButtons(mock).length, buttons);
+      const kept = await rpc(session.srv.base, session.sessionId, 'tools/call', {
+        name: 'pikvm_mouse_click',
+        arguments: { x: 480, y: 270, frameId: ids[16] },
+      });
+      assert.notEqual(kept.result.isError, true, kept.result.content[0].text);
+      assert.deepEqual(moveTarget(hidMoves(mock).at(-1)), { x: 17, y: 30 });
+    } finally {
+      await session.close();
+    }
+
+    const passwordFile = join(dir, 'pw');
+    writeFileSync(passwordFile, 'testpw\n', { mode: 0o600 });
+    const config = withEnv({
+      PIKVM_DEVICES: JSON.stringify({
+        default: 'lab1',
+        devices: {
+          lab1: {
+            host: mock.url,
+            username: 'admin',
+            passwordFile,
+            tls: { mode: 'insecure' },
+          },
+          lab2: {
+            host: other.url,
+            username: 'admin',
+            passwordFile,
+            tls: { mode: 'insecure' },
+          },
+        },
+      }),
+    }, () => loadConfig());
+    const fleet = buildFleet(config, { hid: true, msd: true });
+    const srv = await listen(() => createMcpServer({
+      pikvm: fleet.devices.get('lab1').client,
+      lock: fleet.devices.get('lab1').lock,
+      fleet,
+      calibrationConfig,
+      armGateEnforced: false,
+    }));
+    try {
+      const sessionId = await openSession(srv.base);
+      const shot = await rpc(srv.base, sessionId, 'tools/call', {
+        name: 'pikvm_screenshot',
+        arguments: { device: 'lab2' },
+      });
+      const frameId = metadataOf(shot.result).frameId;
+      mock.calls.length = 0;
+      other.calls.length = 0;
+      const crossed = await rpc(srv.base, sessionId, 'tools/call', {
+        name: 'pikvm_mouse_click',
+        arguments: { device: 'lab1', x: 10, y: 10, frameId },
+      });
+      assert.equal(crossed.result.isError, true);
+      assert.match(crossed.result.content[0].text, /PIKVM_UNKNOWN_FRAME/);
+      assert.equal(hidMoves(mock).length, 0);
+      assert.equal(hidButtons(mock).length, 0);
+      assert.equal(hidMoves(other).length, 0);
+      assert.equal(hidButtons(other).length, 0);
+    } finally {
+      await srv.close();
+      await closeFleet(fleet);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    await mock.close();
+    await other.close();
+  }
+});
+
+test('screenshot, auto_calibrate, then click keeps the preview frame', { timeout: 60000 }, async () => {
+  const mock = await startKvmdMock();
+  try {
+    const session = await startLegacy(mock);
+    try {
+      await rpc(session.srv.base, session.sessionId, 'tools/call', {
+        name: 'pikvm_screenshot',
+        arguments: {},
+      });
+      const calibrated = await rpc(session.srv.base, session.sessionId, 'tools/call', {
+        name: 'pikvm_auto_calibrate',
+        arguments: { rounds: 2, verifyRounds: 1, moveDelayMs: 20, minSamples: 3 },
+      });
+      assert.equal(typeof calibrated.result.content[0].text, 'string');
+      const clicked = await rpc(session.srv.base, session.sessionId, 'tools/call', {
+        name: 'pikvm_mouse_click',
+        arguments: { x: 480, y: 270 },
+      });
+      assert.notEqual(clicked.result.isError, true, clicked.result.content[0].text);
+      const echo = metadataOf(clicked.result);
+      assert.equal(echo.frameId, 'default');
+      assert.equal(echo.width, 960);
+      assert.equal(echo.height, 540);
+      assert.equal(echo.scaleX, 2);
+      assert.deepEqual(moveTarget(hidMoves(mock).at(-1)), { x: 17, y: 30 });
+      assert.notDeepEqual(moveTarget(hidMoves(mock).at(-1)), { x: -16376, y: -16369 });
+    } finally {
+      await session.close();
     }
   } finally {
     await mock.close();

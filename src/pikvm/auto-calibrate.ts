@@ -1,3 +1,5 @@
+// Modified 2026-10 by PLN: internal captures do not change the click frame (GPL-3.0; see NOTICE).
+
 /**
  * Auto-calibration via visual cursor detection.
  *
@@ -303,7 +305,7 @@ function randomDelta(round: number): Point {
  * Take a raw screenshot (no preview scaling) and return the buffer.
  */
 async function takeRawScreenshot(client: PiKVMClient): Promise<Buffer> {
-  const result = await client.screenshot();
+  const result = await client.screenshot({ track: false });
   return result.buffer;
 }
 
@@ -571,8 +573,8 @@ export async function autoCalibrate(
     const target = randomSafePosition(resolution);
     vlog(`Verify ${round + 1}/${config.verifyRounds}: target=(${target.x},${target.y})`);
 
-    // Move to target (now with calibration applied)
-    await client.mouseMove(target.x, target.y);
+    // Screen pixels. A prior preview stays the click frame.
+    await client.mouseMoveScreen(target.x, target.y);
     await sleep(config.moveDelayMs);
     const screenshotC = await takeRawScreenshot(client);
 
@@ -581,7 +583,7 @@ export async function autoCalibrate(
       x: target.x + 120,
       y: target.y + 120,
     };
-    await client.mouseMove(
+    await client.mouseMoveScreen(
       Math.min(awayPos.x, resolution.width - 20),
       Math.min(awayPos.y, resolution.height - 20),
     );

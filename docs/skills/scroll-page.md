@@ -14,6 +14,7 @@ Scroll the mouse wheel vertically or horizontally.
 |-----------|------|---------|-------------|
 | deltaY | number | *(required)* | Vertical scroll: negative = scroll up, positive = scroll down |
 | deltaX | number | 0 | Horizontal scroll: negative = scroll left, positive = scroll right |
+| frameId | string | default frame | Checked when given. Unknown sends no HID. The result echoes the frame |
 
 ## Example Calls
 

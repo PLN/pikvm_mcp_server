@@ -10,6 +10,7 @@
 // Modified 2026-10 by PLN: per-device client, lock, arm, and pikvm_devices (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: pikvm_devices lists an origin (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: screenshot metadata, crop, and optional OCR (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: click frames and frameId (GPL-3.0; see NOTICE).
 
 /**
  * MCP server factory for PiKVM tools
@@ -28,13 +29,14 @@ import {
   GetPromptRequestSchema,
   Tool,
 } from '@modelcontextprotocol/sdk/types.js';
-import { type PiKVMClient, KvmdError, redactionPassword } from './pikvm/client.js';
+import { type PiKVMClient, type FrameEcho, KvmdError, redactionPassword } from './pikvm/client.js';
 import { redactSecrets } from './redact.js';
 import type { BusyLock } from './pikvm/lock.js';
 import { type Fleet, type FleetDevice, resolveFleetDevice } from './devices.js';
 import {
   defaultScreenshotSettings,
   OcrUnavailableError,
+  UnknownFrameError,
   parseOcrBox,
   parseOcrLangs,
   parseRegion,
@@ -280,6 +282,7 @@ export function formatToolError(error: unknown, password = ''): string {
     || error instanceof MsdUploadBusyError
     || error instanceof MsdUrlPolicyError
     || error instanceof OcrUnavailableError
+    || error instanceof UnknownFrameError
   ) {
     const message = redact(error.message);
     const details = JSON.stringify({ type: error.type, message });
@@ -342,6 +345,18 @@ function jsonText(value: unknown) {
   return {
     content: [{ type: 'text' as const, text: JSON.stringify(value) }],
   };
+}
+
+function withFrame(text: string, echo: FrameEcho): string {
+  return `${text}\n${JSON.stringify(echo)}`;
+}
+
+function parseFrameId(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || value === '') {
+    throw new UnknownFrameError(typeof value === 'string' ? value : typeof value);
+  }
+  return value;
 }
 
 /** Tool-output origin. A legacy host may still carry userinfo, a path, and a query. */
@@ -431,7 +446,7 @@ function tagFleetResult<T extends { content?: Array<{ type?: string; text?: stri
 const tools: Tool[] = [
   {
     name: 'pikvm_screenshot',
-    description: 'Capture a screenshot from the PiKVM video stream. Returns a JPEG plus coordinate metadata. Defaults are PIKVM_SCREENSHOT_MAX_WIDTH 960, PIKVM_SCREENSHOT_MAX_HEIGHT 600, and PIKVM_SCREENSHOT_QUALITY 70, unless the device registry sets screenshot. A per-call value wins. region crops the captured image locally and must lie inside it.',
+    description: 'Capture a screenshot from the PiKVM video stream. Returns a JPEG plus coordinate metadata, including frameId. Defaults are PIKVM_SCREENSHOT_MAX_WIDTH 960, PIKVM_SCREENSHOT_MAX_HEIGHT 600, and PIKVM_SCREENSHOT_QUALITY 70, unless the device registry sets screenshot. A per-call value wins. region crops the captured image locally and must lie inside it. The default click frame is the last full preview, in request order rather than completion order. A crop does not change it. Pass that capture\'s frameId to a mouse tool to click in the crop.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -553,7 +568,7 @@ const tools: Tool[] = [
   },
   {
     name: 'pikvm_mouse_move',
-    description: 'Move the mouse cursor to a position on the remote machine. For absolute moves, coordinates are in screen pixels (0,0 = top-left). For relative moves, deltas are clamped to -127 to 127.',
+    description: 'Move the mouse cursor. Absolute coordinates are pixels in the default click frame, which is the last full preview in request order. Pass frameId to use that capture, including a crop: the point is mapped with that frame\'s scale, crop origin, and calibration. An unknown, evicted, or other-device frameId is PIKVM_UNKNOWN_FRAME and sends no HID event. Relative deltas are clamped to -127 to 127 and are not mapped through the frame. The result echoes frameId or default, width, height, scale, and origin.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -569,13 +584,17 @@ const tools: Tool[] = [
           type: 'boolean',
           description: 'If true, move relative to current position (delta -127 to 127). Default: false (absolute pixel position)',
         },
+        frameId: {
+          type: 'string',
+          description: 'Capture whose pixels x and y are in. Omitted uses the default click frame (last full preview, request order).',
+        },
       },
       required: ['x', 'y'],
     },
   },
   {
     name: 'pikvm_mouse_click',
-    description: 'Click a mouse button on the remote machine. Optionally move to a pixel position first.',
+    description: 'Click a mouse button. Optional x and y are pixels in the default click frame (the last full preview, in request order). Pass frameId to move in that capture, including a crop. An unknown, evicted, or other-device frameId is PIKVM_UNKNOWN_FRAME and sends no HID event. The result echoes frameId or default, width, height, scale, and origin.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -597,12 +616,16 @@ const tools: Tool[] = [
           enum: ['press', 'release', 'click'],
           description: 'Button state: press (hold), release, or click (default)',
         },
+        frameId: {
+          type: 'string',
+          description: 'Capture whose pixels x and y are in. Omitted uses the default click frame (last full preview, request order).',
+        },
       },
     },
   },
   {
     name: 'pikvm_mouse_scroll',
-    description: 'Scroll the mouse wheel on the remote machine.',
+    description: 'Scroll the mouse wheel. frameId is checked when given: an unknown, evicted, or other-device id is PIKVM_UNKNOWN_FRAME and sends no HID event. The result echoes frameId or default, width, height, scale, and origin.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -613,6 +636,10 @@ const tools: Tool[] = [
         deltaY: {
           type: 'number',
           description: 'Vertical scroll amount (negative = up, positive = down)',
+        },
+        frameId: {
+          type: 'string',
+          description: 'Checked when given. Omitted echoes the default click frame.',
         },
       },
       required: ['deltaY'],
@@ -1003,6 +1030,7 @@ export function createMcpServer(deps: McpServerDeps): Server {
           const region = parseRegion(args.region);
           const result = await deviceClient.screenshot({ maxWidth, maxHeight, quality, region });
           const meta = {
+            frameId: result.frameId,
             width: result.width,
             height: result.height,
             actualWidth: result.actualWidth,
@@ -1019,7 +1047,9 @@ export function createMcpServer(deps: McpServerDeps): Server {
             infoText += `, scaled from ${result.actualWidth}x${result.actualHeight}`;
             infoText += `, scale factor: ${result.scaleX.toFixed(2)}x${result.scaleY.toFixed(2)}`;
           }
-          infoText += '). Mouse coordinates from this image will be auto-scaled.';
+          infoText += result.region
+            ? '). This crop does not change the default click frame. Pass frameId to click in this image.'
+            : '). This full preview is the default click frame, in request order.';
           infoText += `\n${JSON.stringify(meta)}`;
 
           return {
@@ -1132,15 +1162,18 @@ export function createMcpServer(deps: McpServerDeps): Server {
           const x = requireNumber(args.x, 'x');
           const y = requireNumber(args.y, 'y');
           const relative = validateBoolean(args.relative) ?? false;
+          const frameId = parseFrameId(args.frameId);
+          const described = deviceClient.describeFrame(frameId);
           let calibrationWarning = '';
           if (relative) {
-            // Relative moves are clamped to -127 to 127 in the client
+            // Relative moves are clamped to -127 to 127 in the client.
+            // The frame is checked and echoed, and the delta is not scaled.
             await deviceClient.mouseMoveRelative(x, y);
           } else {
             // Absolute moves should be positive pixel coordinates
             const clampedX = Math.max(0, Math.round(x));
             const clampedY = Math.max(0, Math.round(y));
-            const result = await deviceClient.mouseMove(clampedX, clampedY);
+            const result = await deviceClient.mouseMove(clampedX, clampedY, frameId);
             if (result.calibrationInvalidated) {
               calibrationWarning = '\n⚠️ Resolution changed - calibration has been cleared. Recalibrate with pikvm_auto_calibrate (preferred) or pikvm_calibrate.';
             }
@@ -1149,9 +1182,9 @@ export function createMcpServer(deps: McpServerDeps): Server {
             content: [
               {
                 type: 'text',
-                text: (relative
+                text: withFrame((relative
                   ? `Moved mouse by (${x}, ${y})`
-                  : `Moved mouse to pixel (${Math.max(0, Math.round(x))}, ${Math.max(0, Math.round(y))})`) + calibrationWarning,
+                  : `Moved mouse to pixel (${Math.max(0, Math.round(x))}, ${Math.max(0, Math.round(y))})`) + calibrationWarning, described.echo),
               },
             ],
           };
@@ -1161,10 +1194,12 @@ export function createMcpServer(deps: McpServerDeps): Server {
           const button = validateEnum(args.button, VALID_BUTTONS, 'left');
           const clickX = validateNumber(args.x, 0);
           const clickY = validateNumber(args.y, 0);
+          const frameId = parseFrameId(args.frameId);
+          const described = deviceClient.describeFrame(frameId);
 
           // Move to position first if specified
           if (clickX !== undefined && clickY !== undefined) {
-            await deviceClient.mouseMove(Math.round(clickX), Math.round(clickY));
+            await deviceClient.mouseMove(Math.round(clickX), Math.round(clickY), frameId);
           }
 
           const state = validateEnum(args.state, VALID_KEY_STATES, 'click');
@@ -1177,19 +1212,21 @@ export function createMcpServer(deps: McpServerDeps): Server {
           }
 
           return {
-            content: [{ type: 'text', text: `${button} click` }],
+            content: [{ type: 'text', text: withFrame(`${button} click`, described.echo) }],
           };
         }
 
         case 'pikvm_mouse_scroll': {
           const deltaY = requireNumber(args.deltaY, 'deltaY');
           const deltaX = validateNumber(args.deltaX) ?? 0;
+          const frameId = parseFrameId(args.frameId);
+          const described = deviceClient.describeFrame(frameId);
           await deviceClient.mouseScroll(deltaX, deltaY);
           return {
             content: [
               {
                 type: 'text',
-                text: `Scrolled (${deltaX}, ${deltaY})`,
+                text: withFrame(`Scrolled (${deltaX}, ${deltaY})`, described.echo),
               },
             ],
           };

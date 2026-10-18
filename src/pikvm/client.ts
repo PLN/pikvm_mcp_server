@@ -12,6 +12,7 @@
 // Modified 2026-10 by PLN: configured host and TLS mode for the device list (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: redactUrl on kvmd error text (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: screenshot preview, crop, and OCR (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: click frames stay on the full preview (GPL-3.0; see NOTICE).
 // AbortSignal.timeout and PIKVM_UNREACHABLE / PIKVM_AUTH_FAILED no-retry codes
 // adapted from dtrukr/pikvm_mcp_server src/pikvm/client.ts @ d120243 (GPL-3.0).
 // Snapshot HTTP 503 retry-once adapted from dvaerum/pikvm_mcp_server
@@ -59,6 +60,7 @@
  * All mouse operations use the REST API which is more reliable than WebSocket.
  */
 
+import { randomUUID } from 'node:crypto';
 import { Readable } from 'node:stream';
 import { fetch, request as undiciRequest } from 'undici';
 import type { Agent, Dispatcher } from 'undici';
@@ -84,6 +86,7 @@ import {
   assertRegionInside,
   OCR_PROBE_TIMEOUT_MS,
   parseOcrState,
+  UnknownFrameError,
   type OcrBox,
   type OcrState,
   type ScreenshotRegion,
@@ -154,7 +157,38 @@ export interface ScreenshotResult {
   region?: ScreenshotRegion;
   calibration: { factorX: number; factorY: number } | null;
   hid: { min: number; max: number };
+  /** Random id for this capture. Internal captures are not stored. */
+  frameId: string;
 }
+
+/** One stored capture. Mouse coordinates in this image use its scale and origin. */
+export interface ClickFrame {
+  id: string;
+  width: number;
+  height: number;
+  scaleX: number;
+  scaleY: number;
+  originX: number;
+  originY: number;
+  /** A full preview. A crop is stored, and it does not become the default. */
+  full: boolean;
+}
+
+/**
+ * What a mouse tool applied. `frameId` is `default` when the caller did
+ * not pass one. Width and height are null when no full preview is stored.
+ */
+export interface FrameEcho {
+  frameId: string;
+  width: number | null;
+  height: number | null;
+  scaleX: number;
+  scaleY: number;
+  origin: { x: number; y: number };
+}
+
+/** Stored captures per device. Older than this are PIKVM_UNKNOWN_FRAME. */
+const FRAME_STORE_LIMIT = 16;
 
 /** PiKVM absolute mouse range. */
 export const HID_MOUSE_MIN = -32768;
@@ -797,12 +831,13 @@ export class PiKVMClient {
   private config: ResolvedPiKVMConfig;
   private dispatcher: Agent;
   private cachedResolution: ScreenResolution | null = null;
-  private screenshotScale: {
-    scaleX: number;
-    scaleY: number;
-  } | null = null;
-  /** Origin of the last cropped screenshot. Uncropped captures leave this unset. */
-  private screenshotRegion: ScreenshotRegion | null = null;
+  /** Last full preview, chosen by request order. Crops do not replace it. */
+  private defaultFrame: ClickFrame | null = null;
+  private readonly frames = new Map<string, ClickFrame>();
+  private readonly frameOrder: string[] = [];
+  private frameSeq = 0;
+  /** Highest full-preview sequence that has been stored. */
+  private appliedFullSeq = -1;
   private ocr: OcrState = { status: 'unknown', langs: [] };
   private calibration: CalibrationState | null = null;
 
@@ -1091,13 +1126,21 @@ export class PiKVMClient {
    * A region is cropped locally and must lie inside the captured image.
    * Cropping uses sharp().extract, the technique from
    * dvaerum/pikvm_mcp_server src/pikvm/snapshot.ts at 2d6fa16 (GPL-3.0).
+   * `track: false` is an internal capture. It does not enter the frame
+   * store and does not change the default click frame.
+   * A tracked full preview becomes the default only when its request
+   * sequence is the newest one stored. A crop is stored and is not the default.
    */
   async screenshot(options?: {
     maxWidth?: number;
     maxHeight?: number;
     quality?: number;
     region?: ScreenshotRegion;
+    track?: boolean;
   }): Promise<ScreenshotResult> {
+    const track = options?.track !== false;
+    const seq = track ? this.frameSeq++ : -1;
+    const frameId = randomUUID();
     const params = new URLSearchParams();
     if (options?.maxWidth || options?.maxHeight || options?.quality) {
       params.set('preview', '1');
@@ -1134,8 +1177,17 @@ export class PiKVMClient {
       height = region.height;
     }
 
-    this.screenshotScale = { scaleX, scaleY };
-    this.screenshotRegion = region ?? null;
+    const frame: ClickFrame = {
+      id: frameId,
+      width,
+      height,
+      scaleX,
+      scaleY,
+      originX: region?.x ?? 0,
+      originY: region?.y ?? 0,
+      full: !region,
+    };
+    if (track) this.storeFrame(frame, seq);
     const factors = this.calibration
       ? { factorX: this.calibration.factorX, factorY: this.calibration.factorY }
       : null;
@@ -1153,7 +1205,60 @@ export class PiKVMClient {
       ...(region ? { region } : {}),
       calibration: factors,
       hid: { min: HID_MOUSE_MIN, max: HID_MOUSE_MAX },
+      frameId,
     };
+  }
+
+  /**
+   * Remember a tracked capture. The default click frame is the newest
+   * full preview by request sequence, not by which call finishes last.
+   */
+  private storeFrame(frame: ClickFrame, seq: number): void {
+    this.frames.set(frame.id, frame);
+    this.frameOrder.push(frame.id);
+    while (this.frameOrder.length > FRAME_STORE_LIMIT) {
+      const dropped = this.frameOrder.shift();
+      if (dropped !== undefined) this.frames.delete(dropped);
+    }
+    if (frame.full && seq >= this.appliedFullSeq) {
+      this.appliedFullSeq = seq;
+      this.defaultFrame = frame;
+    }
+  }
+
+  private frameEcho(frame: ClickFrame | null, explicit: boolean): FrameEcho {
+    if (!frame) {
+      return {
+        frameId: 'default',
+        width: null,
+        height: null,
+        scaleX: 1,
+        scaleY: 1,
+        origin: { x: 0, y: 0 },
+      };
+    }
+    return {
+      frameId: explicit ? frame.id : 'default',
+      width: frame.width,
+      height: frame.height,
+      scaleX: frame.scaleX,
+      scaleY: frame.scaleY,
+      origin: { x: frame.originX, y: frame.originY },
+    };
+  }
+
+  /**
+   * Frame for a mouse or OCR call. An unknown, evicted, or other-device
+   * id throws UnknownFrameError before any HID event.
+   * Omitted uses the last full preview in request order.
+   */
+  describeFrame(frameId?: string): { frame: ClickFrame | null; echo: FrameEcho } {
+    if (frameId !== undefined) {
+      const frame = this.frames.get(frameId);
+      if (!frame) throw new UnknownFrameError(frameId);
+      return { frame, echo: this.frameEcho(frame, true) };
+    }
+    return { frame: this.defaultFrame, echo: this.frameEcho(this.defaultFrame, false) };
   }
 
   /** Last OCR probe. Unknown until probeOcr succeeds. */
@@ -1342,20 +1447,29 @@ export class PiKVMClient {
            this.calibration.resolution.height !== currentResolution.height;
   }
 
-  /**
-   * Scale coordinates from screenshot space to actual screen space
-   * If no screenshot has been taken, coordinates pass through unchanged
-   */
-  private scaleCoordinates(x: number, y: number): { x: number; y: number } {
-    if (!this.screenshotScale) {
-      return { x, y };
-    }
-    const originX = this.screenshotRegion?.x ?? 0;
-    const originY = this.screenshotRegion?.y ?? 0;
+  /** Map pixels in a click frame to screen pixels. No frame means screen pixels. */
+  private mapFrame(frame: ClickFrame | null, x: number, y: number): { x: number; y: number } {
+    if (!frame) return { x, y };
     return {
-      x: Math.round((x + originX) * this.screenshotScale.scaleX),
-      y: Math.round((y + originY) * this.screenshotScale.scaleY),
+      x: Math.round((x + frame.originX) * frame.scaleX),
+      y: Math.round((y + frame.originY) * frame.scaleY),
     };
+  }
+
+  /** Absolute screen pixels, with calibration. Does not consult a click frame. */
+  private async postMouseMove(pixelX: number, pixelY: number): Promise<{ calibrationInvalidated: boolean }> {
+    const resolution = await this.getResolution(true);
+    let calibrationInvalidated = false;
+    if (this.hasResolutionChanged(resolution)) {
+      this.calibration = null;
+      calibrationInvalidated = true;
+    }
+    const normalized = pixelToNormalized(pixelX, pixelY, resolution, this.calibration);
+    const params = new URLSearchParams();
+    params.set('to_x', normalized.x.toString());
+    params.set('to_y', normalized.y.toString());
+    await this.request('POST', `/hid/events/send_mouse_move?${params}`);
+    return { calibrationInvalidated };
   }
 
   /**
@@ -1391,37 +1505,30 @@ export class PiKVMClient {
   }
 
   /**
-   * Move mouse to absolute pixel position (via REST API)
-   * Coordinates are automatically scaled from screenshot space to screen space
-   * if a scaled screenshot was previously taken.
-   * @param x - X coordinate in pixels (0 = left edge), in screenshot space
-   * @param y - Y coordinate in pixels (0 = top edge), in screenshot space
-   * @returns Object with calibrationInvalidated flag if resolution changed
+   * Move mouse to absolute pixel position (via REST API).
+   * Coordinates are in the default click frame, or in `frameId` when given.
+   * The default is the last full preview in request order. A crop is not
+   * the default. An unknown frameId throws before any HID event.
+   * @param x - X coordinate in that frame (0 = left edge of the image)
+   * @param y - Y coordinate in that frame (0 = top edge of the image)
    */
-  async mouseMove(x: number, y: number): Promise<{ calibrationInvalidated: boolean }> {
-    // Scale coordinates from screenshot space to screen space
-    const scaled = this.scaleCoordinates(x, y);
+  async mouseMove(
+    x: number,
+    y: number,
+    frameId?: string,
+  ): Promise<{ calibrationInvalidated: boolean; frame: FrameEcho }> {
+    const described = this.describeFrame(frameId);
+    const scaled = this.mapFrame(described.frame, x, y);
+    const posted = await this.postMouseMove(scaled.x, scaled.y);
+    return { calibrationInvalidated: posted.calibrationInvalidated, frame: described.echo };
+  }
 
-    // Get screen resolution for coordinate conversion (force refresh to detect changes)
-    const resolution = await this.getResolution(true);
-
-    // Check if resolution changed since calibration
-    let calibrationInvalidated = false;
-    if (this.hasResolutionChanged(resolution)) {
-      // Clear calibration since it's no longer valid
-      this.calibration = null;
-      calibrationInvalidated = true;
-    }
-
-    const normalized = pixelToNormalized(scaled.x, scaled.y, resolution, this.calibration);
-
-    const params = new URLSearchParams();
-    params.set('to_x', normalized.x.toString());
-    params.set('to_y', normalized.y.toString());
-
-    await this.request('POST', `/hid/events/send_mouse_move?${params}`);
-
-    return { calibrationInvalidated };
+  /**
+   * Move in screen pixels. Calibration applies. The click frame does not.
+   * Auto-calibrate verification uses this so a prior preview stays put.
+   */
+  async mouseMoveScreen(x: number, y: number): Promise<{ calibrationInvalidated: boolean }> {
+    return this.postMouseMove(x, y);
   }
 
   /**
