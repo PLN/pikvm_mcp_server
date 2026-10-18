@@ -2,6 +2,7 @@
  * Modified 2026-10 by PLN: PIKVM_REQUEST_TIMEOUT_MS (GPL-3.0; see NOTICE).
  * Modified 2026-10 by PLN: MSD upload deadlines (GPL-3.0; see NOTICE).
  * Modified 2026-10 by PLN: cap MSD job at 7 days and idle at 1 hour (GPL-3.0; see NOTICE).
+ * Modified 2026-10 by PLN: PIKVM_MCP_ARM_MSD (GPL-3.0; see NOTICE).
  *
  * loadEnvFile unit tests — verify PIKVM_MCP_NO_DOTENV=1 makes .env lose to
  * explicitly-set process env (the gateway systemd landmine fix).
@@ -215,6 +216,38 @@ test('MSD upload deadlines default to 6 hours and 60 seconds', () => {
     assert.equal(loadConfig().pikvm.msdIdleTimeoutMs, MSD_IDLE_TIMEOUT_MAX_MS);
     assert.equal(MSD_JOB_TIMEOUT_MAX_MS, 604800000);
     assert.equal(MSD_IDLE_TIMEOUT_MAX_MS, 3600000);
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+});
+
+test('PIKVM_MCP_ARM_MSD defaults off and ARM_HID does not arm it', () => {
+  const keys = [
+    'PIKVM_HOST',
+    'PIKVM_PASSWORD',
+    'PIKVM_MCP_PORT',
+    'PIKVM_MCP_ARM_HID',
+    'PIKVM_MCP_ARM_MSD',
+  ];
+  const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  process.env.PIKVM_HOST = 'http://mock.test';
+  process.env.PIKVM_PASSWORD = 'testpw';
+  process.env.PIKVM_MCP_PORT = '8675';
+  try {
+    delete process.env.PIKVM_MCP_ARM_HID;
+    delete process.env.PIKVM_MCP_ARM_MSD;
+    assert.equal(loadConfig().http.armHid, false);
+    assert.equal(loadConfig().http.armMsd, false);
+    process.env.PIKVM_MCP_ARM_HID = '1';
+    assert.equal(loadConfig().http.armHid, true);
+    assert.equal(loadConfig().http.armMsd, false);
+    process.env.PIKVM_MCP_ARM_MSD = '1';
+    assert.equal(loadConfig().http.armMsd, true);
+    process.env.PIKVM_MCP_ARM_MSD = 'true';
+    assert.equal(loadConfig().http.armMsd, false);
   } finally {
     for (const [k, v] of Object.entries(saved)) {
       if (v === undefined) delete process.env[k];

@@ -1,12 +1,14 @@
 #!/usr/bin/env node
+// Modified 2026-10 by PLN: MSD arm-gate (GPL-3.0; see NOTICE).
 /**
  * PiKVM MCP Server
  *
  * Provides MCP tools for controlling remote machines via PiKVM.
  *
  * Transport selection: PIKVM_MCP_PORT set -> Streamable HTTP (bearer auth,
- * HID arm-gate); otherwise stdio (default — PC-Control and other local MCP
- * clients spawn it directly and gate HID on their own side).
+ * HID arm-gate and a separate MSD arm-gate); otherwise stdio (default —
+ * PC-Control and other local MCP clients spawn it directly and gate HID
+ * and MSD on their own side).
  */
 
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -31,7 +33,7 @@ async function main() {
   }
 
   if (config.http) {
-    const { port, host, bearerToken, armHid } = config.http;
+    const { port, host, bearerToken, armHid, armMsd } = config.http;
     // Fail closed: an unauthenticated network listener on a HID server would
     // let anyone type on the remote machine.
     if (!bearerToken) {
@@ -39,18 +41,33 @@ async function main() {
       process.exit(1);
     }
     const armGateEnforced = !armHid;
+    const msdArmGateEnforced = !armMsd;
     await startHttpServer({
       port,
       host,
       bearerToken,
-      createServer: () => createMcpServer({ pikvm, lock, calibrationConfig, armGateEnforced }),
+      createServer: () => createMcpServer({
+        pikvm,
+        lock,
+        calibrationConfig,
+        armGateEnforced,
+        msdArmGateEnforced,
+      }),
     });
-    console.error(`PiKVM MCP Server running (HTTP on ${host}:${port}, HID ${armHid ? 'ARMED' : 'DISARMED'})`);
+    console.error(
+      `PiKVM MCP Server running (HTTP on ${host}:${port}, HID ${armHid ? 'ARMED' : 'DISARMED'}, MSD ${armMsd ? 'ARMED' : 'DISARMED'})`,
+    );
     return;
   }
 
-  // stdio mode: behavior unchanged from pre-HTTP releases (no arm-gate).
-  const server = createMcpServer({ pikvm, lock, calibrationConfig, armGateEnforced: false });
+  // stdio mode: HID and MSD stay ungated. Local callers gate on their own side.
+  const server = createMcpServer({
+    pikvm,
+    lock,
+    calibrationConfig,
+    armGateEnforced: false,
+    msdArmGateEnforced: false,
+  });
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error('PiKVM MCP Server running');

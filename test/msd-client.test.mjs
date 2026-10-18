@@ -1,5 +1,6 @@
 // Modified 2026-10 by PLN: MSD client tests (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: MSD deadline caps and upload error codes (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: source-error flag and partial-image message (GPL-3.0; see NOTICE).
 
 /**
  * Plain kvmd MSD client methods against the mock. No MCP tools.
@@ -777,13 +778,62 @@ test('a local source read error is PIKVM_SOURCE_READ_ERROR', async () => {
       (err) => {
         assert.ok(err instanceof KvmdError);
         assert.equal(err.type, 'PIKVM_SOURCE_READ_ERROR');
-        assert.equal(err.message, 'failed to read the upload source');
+        assert.equal(err.message, 'image may be partial; re-read /api/msd');
         assert.equal(err.endpoint, 'POST /api/msd/write');
         return true;
       },
     );
     assert.equal(count(mock, 'POST', '/api/msd/write'), 0);
   });
+});
+
+test('a source read error after the first chunk is PIKVM_SOURCE_READ_ERROR', async () => {
+  await withMock({}, async (_mock, client) => {
+    let sent = false;
+    const src = new Readable({
+      read() {
+        if (!sent) {
+          sent = true;
+          this.push(Buffer.from('ab'));
+          return;
+        }
+        const err = new Error('disk read failed');
+        err.code = 'EIO';
+        this.destroy(err);
+      },
+    });
+    await assert.rejects(
+      () => client.msdWrite('partial.img', src, 8),
+      (err) => {
+        assert.ok(err instanceof KvmdError);
+        assert.equal(err.type, 'PIKVM_SOURCE_READ_ERROR');
+        assert.equal(err.message, 'image may be partial; re-read /api/msd');
+        assert.equal(err.endpoint, 'POST /api/msd/write');
+        return true;
+      },
+    );
+  });
+});
+
+test('an idle timeout while kvmd is not reading is PIKVM_MSD_STATE_UNKNOWN', { timeout: 15000 }, async () => {
+  const stalled = new Readable({
+    read() {
+      this.push(Buffer.alloc(64 * 1024, 1));
+    },
+  });
+  await withMock({ pauseWrite: true }, async (mock, client) => {
+    await assert.rejects(
+      () => client.msdWrite('stall.img', stalled, 8 * 1024 * 1024),
+      (err) => {
+        assert.ok(err instanceof KvmdError);
+        assert.equal(err.type, 'PIKVM_MSD_STATE_UNKNOWN');
+        assert.equal(err.message, MSD_UNKNOWN);
+        assert.equal(err.endpoint, 'POST /api/msd/write');
+        return true;
+      },
+    );
+    assert.ok(count(mock, 'POST', '/api/msd/write') >= 1);
+  }, { msdJobTimeoutMs: 20000, msdIdleTimeoutMs: 400 });
 });
 
 test('connection refused before an upload is sent stays PIKVM_UNREACHABLE', async () => {

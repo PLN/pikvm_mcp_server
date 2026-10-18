@@ -1,6 +1,8 @@
 <!-- Modified 2026-10 by PLN: Node.js engines note, GPL-3.0-only licence line, and PIKVM_REQUEST_TIMEOUT_MS (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: MSD upload deadlines (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: cap MSD job at 7 days and idle at 1 hour (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: PIKVM_MCP_ARM_MSD and MSD status, mount, eject (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: mount expectImage and MSD preflight (GPL-3.0; see NOTICE) -->
 
 # PiKVM MCP Server
 
@@ -101,6 +103,7 @@ PIKVM_MCP_PORT=8675
 PIKVM_MCP_HOST=127.0.0.1
 PIKVM_MCP_BEARER=<openssl rand -hex 32>
 PIKVM_MCP_ARM_HID=0
+PIKVM_MCP_ARM_MSD=0
 PIKVM_MCP_NO_DOTENV=0
 ```
 
@@ -127,6 +130,11 @@ PIKVM_MCP_NO_DOTENV=0
   Read-only tools (`pikvm_screenshot`, `pikvm_get_resolution`,
   `pikvm_get/set/clear_calibration`) stay available. Set `1` to arm. stdio
   mode is never gated — local callers gate on their own side.
+- **`PIKVM_MCP_ARM_MSD`** — the MSD arm-gate, separate from HID. HTTP mode
+  defaults to **disarmed**: every `pikvm_msd_*` tool except the read-only
+  allowlist (`pikvm_msd_status`) returns a typed error naming this variable
+  and no mass-storage change reaches the device. `PIKVM_MCP_ARM_HID=1` does
+  not arm them. Set `1` to arm. stdio mode is never gated.
 - **`PIKVM_MCP_NO_DOTENV`** — set `1` to skip `.env` loading entirely (for
   systemd/gateway units that export env directly; a stray `.env` on disk must
   not win). Only read from the real process environment, so a `.env` cannot
@@ -156,8 +164,9 @@ curl -i -X POST http://localhost:8675/mcp \
   the machine it is connected to.
 - Keep the HTTP server behind a trusted network (WireGuard/VPN); bearer-only
   transport is not a substitute for network isolation.
-- Run with `PIKVM_MCP_ARM_HID=0` unless the deployment is explicitly supposed
-  to drive HID; arming is a per-deployment, explicit decision.
+- Run with `PIKVM_MCP_ARM_HID=0` and `PIKVM_MCP_ARM_MSD=0` unless the
+  deployment is explicitly supposed to drive HID or change virtual media;
+  arming is a per-deployment, explicit decision.
 - Bind defaults to `127.0.0.1`; widen it only when a local proxy/gateway
   actually needs the network, and front with a reverse proxy for TLS
   termination or origin/host filtering.
@@ -228,6 +237,13 @@ Or if using the .env file:
 - **`pikvm_set_calibration`** - Apply correction factors calculated from calibration (required: factorX, factorY)
 - **`pikvm_get_calibration`** - Get current calibration state
 - **`pikvm_clear_calibration`** - Reset to uncalibrated mode
+
+### Mass storage
+- **`pikvm_msd_status`** - Read mass-storage state (optional: device). Read-only.
+- **`pikvm_msd_mount`** - Select an image and connect the virtual drive (required: image, mode `cdrom` or `flash`, confirmImage; optional: rw, connect, expectImage, device). `confirmImage` must equal `image`. When a drive is already connected, `expectImage` must equal that image or the mount is refused and the drive stays connected. The image must already be in storage and complete. Returns the drive re-read after the change. On failure the previous selection is restored. An NBD or URL snapshot image cannot be restored, because `set_params` refuses a name that contains `://`.
+- **`pikvm_msd_eject`** - Disconnect the virtual drive (required: expectImage; optional: device). `expectImage` must equal the current image name, or `""` when none is selected. A second eject returns `alreadyDisconnected`. Any other kvmd error is returned as an error.
+
+In HTTP mode, MSD changes stay disarmed until `PIKVM_MCP_ARM_MSD=1`. Status stays available. stdio is not gated. Mount and eject run one at a time per device.
 
 ## Skills (Prompts & Skill Tools)
 

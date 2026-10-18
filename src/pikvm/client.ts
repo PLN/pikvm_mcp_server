@@ -1,6 +1,7 @@
 // Modified 2026-10 by PLN: typed KvmdError, timeouts, GET retry (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: client MSD methods (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: MSD deadline caps and upload error codes (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: source-error flag and partial-image message (GPL-3.0; see NOTICE).
 // AbortSignal.timeout and PIKVM_UNREACHABLE / PIKVM_AUTH_FAILED no-retry codes
 // adapted from dtrukr/pikvm_mcp_server src/pikvm/client.ts @ d120243 (GPL-3.0).
 // Snapshot HTTP 503 retry-once adapted from dvaerum/pikvm_mcp_server
@@ -33,7 +34,10 @@
 // After POST /msd/write or /msd/write_remote has started, a timeout, a
 // socket reset, or HTTP 504 is PIKVM_MSD_STATE_UNKNOWN. Connection refused
 // before the request is sent stays PIKVM_UNREACHABLE. An error reading
-// the local source is PIKVM_SOURCE_READ_ERROR.
+// the local source is PIKVM_SOURCE_READ_ERROR ("image may be partial;
+// re-read /api/msd"). That flag is the source stream's own error event.
+// On undici 7.24.1 an abort or reset while kvmd is not reading destroys
+// the upload wrapper; that is not a source error.
 // MSD facts are from pikvm/kvmd v4.227 (0dd244f) and docs.pikvm.org.
 
 /**
@@ -406,7 +410,7 @@ function isContentLengthMismatch(err: unknown): boolean {
 const MSD_STATE_UNKNOWN_MESSAGE =
   'image may be partial or complete; re-read /api/msd; do not resend';
 
-const SOURCE_READ_MESSAGE = 'failed to read the upload source';
+const SOURCE_READ_MESSAGE = 'image may be partial; re-read /api/msd';
 
 function isSourceReadError(err: unknown): boolean {
   return errorCodes(err).includes('EIO') || errorCodes(err).includes('PIKVM_SOURCE_READ_ERROR');
@@ -571,19 +575,21 @@ function trackUpload(
   disarm: () => void,
   watch: MsdWatch,
 ): Readable {
+  // Set the flag from the source only. The wrapper's own failure is how
+  // undici 7.24.1 reports an abort or reset while kvmd is not reading, and
+  // that must stay PIKVM_MSD_STATE_UNKNOWN rather than a source error.
+  const onSourceError = () => {
+    watch.sourceError = true;
+  };
+  source.on('error', onSourceError);
   return Readable.from(async function* () {
     try {
       for await (const chunk of source) {
         bump();
         yield chunk;
       }
-    } catch (err) {
-      watch.sourceError = true;
-      const wrapped = new Error(SOURCE_READ_MESSAGE);
-      (wrapped as { code?: string; cause?: unknown }).code = 'PIKVM_SOURCE_READ_ERROR';
-      (wrapped as { cause?: unknown }).cause = err;
-      throw wrapped;
     } finally {
+      source.off('error', onSourceError);
       disarm();
     }
   }());
@@ -1515,7 +1521,9 @@ export class PiKVMClient {
       return { statusCode: response.statusCode, result: parsed.result };
     } catch (err) {
       if (err instanceof KvmdError) throw err;
-      if (watch.sourceError && !isContentLengthMismatch(err)) {
+      // The flag is only the source stream's error event, so an idle abort
+      // is not rewritten into a source error here.
+      if (watch.sourceError) {
         throw new KvmdError(0, 'PIKVM_SOURCE_READ_ERROR', SOURCE_READ_MESSAGE, endpoint);
       }
       throw this.msdTransport(err, endpoint);
@@ -1561,7 +1569,7 @@ export class PiKVMClient {
       });
       return response;
     } catch (err) {
-      if (!isContentLengthMismatch(err) && (watch?.sourceError || isSourceReadError(err))) {
+      if (watch?.sourceError || (!isContentLengthMismatch(err) && isSourceReadError(err))) {
         throw new KvmdError(0, 'PIKVM_SOURCE_READ_ERROR', SOURCE_READ_MESSAGE, endpoint);
       }
       throw this.msdTransport(err, endpoint);
