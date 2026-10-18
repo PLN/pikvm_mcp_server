@@ -1,5 +1,6 @@
 // Modified 2026-10 by PLN: test-only self-signed certificates (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: CA, path length, and expired test certificates (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: minimal certificate serial and keyUsage bits (GPL-3.0; see NOTICE).
 
 /**
  * A self-signed certificate minted at test time with node:crypto.
@@ -69,12 +70,23 @@ function basicCa(ca, pathLen) {
   return seq(...parts);
 }
 
+/**
+ * Positive minimal INTEGER. A leading 0x00 before a byte below 0x80
+ * is non-minimal DER, and OpenSSL rejects it as illegal padding.
+ * The high bit stays clear so the value is not negative.
+ */
+export function certificateSerial(raw) {
+  const serial = Buffer.from(raw ?? crypto.randomBytes(8));
+  if (serial.length === 0) throw new Error('certificate serial is empty');
+  serial[0] = (serial[0] & 0x7f) | 0x40;
+  return serial;
+}
+
 /** Leaf certificate whose name does not match 127.0.0.1. */
 export function mintCert(cn = 'pikvm.example.ts.net') {
   const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
   const spki = publicKey.export({ type: 'spki', format: 'der' });
-  const serial = crypto.randomBytes(8);
-  serial[0] &= 0x7f;
+  const serial = certificateSerial();
   const now = Date.now();
   const tbs = seq(
     Buffer.from('a003020102', 'hex'),
@@ -116,7 +128,8 @@ export function mintNode(opts = {}) {
     extensions.push(extension('551d0f', true, bitString(Buffer.from([0x06]), 1)));
   } else if (opts.ca === false) {
     extensions.push(extension('551d13', true, basicCa(false)));
-    extensions.push(extension('551d0f', true, bitString(Buffer.from([0xa0]), 0)));
+    // 0xa0 is digitalSignature and keyEncipherment. Five trailing zeros are unused.
+    extensions.push(extension('551d0f', true, bitString(Buffer.from([0xa0]), 5)));
   }
   if (opts.dns) {
     extensions.push(extension('551d11', false, seq(tlv(0x82, Buffer.from(opts.dns)))));
@@ -124,8 +137,7 @@ export function mintNode(opts = {}) {
   const notBefore = opts.notBefore ?? new Date(Date.now() - 86_400_000);
   const notAfter = opts.notAfter ?? new Date(Date.now() + 365 * 86_400_000);
   const spki = keys.publicKey.export({ type: 'spki', format: 'der' });
-  const serial = crypto.randomBytes(8);
-  serial[0] &= 0x7f;
+  const serial = certificateSerial(opts.serial);
   const extra = extensions.length ? tlv(0xa3, seq(...extensions)) : Buffer.alloc(0);
   const tbs = seq(
     Buffer.from('a003020102', 'hex'),

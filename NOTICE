@@ -26,6 +26,7 @@ Modified 2026-10 by PLN: a reset after the certificate stays unreachable (GPL-3.
 Modified 2026-10 by PLN: device registry (GPL-3.0; see below).
 Modified 2026-10 by PLN: listed host is an origin (GPL-3.0; see below).
 Modified 2026-10 by PLN: duplicate devices, a shared origin, and a per-device job cap (GPL-3.0; see below).
+Modified 2026-10 by PLN: test certificate serials are minimal DER (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -621,3 +622,10 @@ No code from another pikvm_mcp_server fork was added for these methods.
   its own. Calibration and the screenshot scale stay on the device
   and are shared by every HTTP session for that device. Per-session
   state is deferred. No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  Test certificates use one serial helper. The first byte is
+  (byte & 0x7f) | 0x40, so the INTEGER is positive and does not start
+  with 0x00. A 0x00 0x12 serial used to be non-minimal DER, and
+  OpenSSL rejected it as illegal padding. Leaf keyUsage 0xa0 declares
+  five unused bits. No code from another pikvm_mcp_server fork was copied.

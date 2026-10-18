@@ -2,6 +2,7 @@
 // Modified 2026-10 by PLN: invalid-CA, partial trust, expiry, and IPv6 pin tests (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: TLS 1.2 reset stays unreachable (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: pin without a registry names only default (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: a leading-zero serial stays a minimal INTEGER (GPL-3.0; see NOTICE).
 
 /**
  * Self-signed server minted in this process. No committed key.
@@ -46,7 +47,7 @@ import {
   writeCertAtomic,
 } from '../dist/tls.js';
 import { kvmdGet } from './hw/session.mjs';
-import { mintCert, mintExpired, mintNode } from './tls-cert.mjs';
+import { certificateSerial, mintCert, mintExpired, mintNode } from './tls-cert.mjs';
 
 const REPO = join(fileURLToPath(import.meta.url), '..', '..');
 const right = mintCert();
@@ -98,6 +99,17 @@ function assertMismatch(err) {
   assert.equal(err.type === 'PIKVM_UNREACHABLE', false);
   return true;
 }
+
+test('a 0x00 0x12 serial is normalised and the certificate parses', () => {
+  const raw = Buffer.from([0x00, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde]);
+  const serial = certificateSerial(raw);
+  assert.equal(serial[0], 0x40);
+  assert.equal(serial[1], 0x12);
+  assert.equal(raw[0], 0x00);
+  const minted = mintNode({ ca: false, serial: raw, dns: 'pikvm.example.ts.net' });
+  const parsed = new crypto.X509Certificate(minted.cert);
+  assert.equal(parsed.serialNumber.toLowerCase(), '40123456789abcde');
+});
 
 describe('pin dispatcher', { concurrency: false }, () => {
   let server;
