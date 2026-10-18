@@ -2,6 +2,7 @@
 // Modified 2026-10 by PLN: expectImage, preflight, and MSD mutex tests (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: upload jobs, remove, and disconnected expectImage (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: hashing jobs, bad-image cleanup, upload try-lock (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: upload abort must not crash the process (GPL-3.0; see NOTICE).
 
 /**
  * MSD tools against the mock. The HTTP harness matches test/http.test.mjs.
@@ -10,6 +11,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import net from 'node:net';
 import { execFile, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -36,6 +38,8 @@ function depsFactory(mock, flags) {
     username: 'admin',
     password: 'testpw',
     verifySsl: false,
+    msdIdleTimeoutMs: flags.msdIdleTimeoutMs,
+    msdJobTimeoutMs: flags.msdJobTimeoutMs,
   });
   return () => createMcpServer({
     pikvm,
@@ -769,6 +773,65 @@ async function pollJob(base, sessionId, jobId) {
   return body;
 }
 
+function crashReason(err) {
+  if (err instanceof Error) return err.stack || err.message;
+  return String(err);
+}
+
+/**
+ * Listens for the whole call. A mid-upload abort used to surface as an
+ * uncaught EBADF after the job had already been marked failed.
+ */
+async function whileWatchingProcess(fn) {
+  const crashes = [];
+  const onException = (err) => {
+    crashes.push(err);
+  };
+  const onRejection = (err) => {
+    crashes.push(err);
+  };
+  process.on('uncaughtException', onException);
+  process.on('unhandledRejection', onRejection);
+  let failure;
+  try {
+    await fn();
+  } catch (err) {
+    failure = err;
+  } finally {
+    process.off('uncaughtException', onException);
+    process.off('unhandledRejection', onRejection);
+  }
+  assert.equal(crashes.length, 0, crashes.map(crashReason).join('\n\n'));
+  if (failure) throw failure;
+}
+
+async function assertKvmdStillAnswers(base, sessionId) {
+  const status = await callTool(base, sessionId, 'pikvm_msd_status', {});
+  assert.equal(status.isError, undefined, status.content[0].text);
+  const state = JSON.parse(status.content[0].text);
+  assert.equal(state.online, true);
+}
+
+/**
+ * Hold fs.read callbacks so closeUpload runs while a read is still
+ * outstanding. That is the window where a second close of the same
+ * numeric descriptor throws. FileHandle.createReadStream does not use
+ * fs.read, so the delay does not apply once the handle owns the stream.
+ */
+async function withStalledFsRead(ms, fn) {
+  const orig = fs.read;
+  fs.read = function stalledRead(fd, buffer, offset, length, position, callback) {
+    return orig.call(fs, fd, buffer, offset, length, position, (err, bytesRead, buf) => {
+      setTimeout(() => callback(err, bytesRead, buf), ms);
+    });
+  };
+  try {
+    await fn();
+  } finally {
+    fs.read = orig;
+  }
+}
+
 test('expectImage is checked when the drive is disconnected', async () => {
   await withSession({
     images: ['disk.img', 'other.img'],
@@ -798,7 +861,7 @@ test('expectImage is checked when the drive is disconnected', async () => {
   });
 });
 
-test('upload, remove, and job polling', { timeout: 30000 }, async (t) => {
+test('upload, remove, and job polling', { timeout: 60000 }, async (t) => {
   const body = Buffer.from('abcd');
   const sum = digest(body);
 
@@ -1206,6 +1269,84 @@ test('upload, remove, and job polling', { timeout: 30000 }, async (t) => {
       assert.equal(outcome.removed, true);
       assert.equal(outcome.drive.connected, false);
       assert.equal(mock.state.images['disk.img'], undefined);
+    });
+  });
+
+  await t.test('a connection reset mid-upload does not crash the process', async () => {
+    await withDir(async (dir) => {
+      await writeFile(join(dir, 'disk.img'), Buffer.alloc(256 * 1024, 4));
+      await withStalledFsRead(200, () => whileWatchingProcess(async () => {
+        await withSession({ images: [], resetDuringWrite: true }, uploadMsd(dir), async ({ base, sessionId }) => {
+          const started = await callTool(base, sessionId, 'pikvm_msd_upload', {
+            file: 'disk.img',
+            confirmImage: 'disk.img',
+          });
+          assert.equal(started.isError, undefined, started.content[0].text);
+          const { jobId } = JSON.parse(started.content[0].text);
+          const failed = await pollJob(base, sessionId, jobId);
+          assert.equal(failed.state, 'failed');
+          assert.equal(failed.error.type, 'PIKVM_MSD_STATE_UNKNOWN');
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          await assertKvmdStillAnswers(base, sessionId);
+        });
+      }));
+    });
+  });
+
+  await t.test('an idle timeout mid-upload does not crash the process', async () => {
+    await withDir(async (dir) => {
+      const size = 8 * 1024 * 1024;
+      await writeFile(join(dir, 'disk.img'), Buffer.alloc(size, 5));
+      const flags = uploadMsd(dir, { maxBytes: 16 * 1024 * 1024 });
+      flags.msdIdleTimeoutMs = 400;
+      flags.msdJobTimeoutMs = 20000;
+      await withStalledFsRead(800, () => whileWatchingProcess(async () => {
+        await withSession({ images: [], pauseWrite: true }, flags, async ({ base, sessionId }) => {
+          const started = await callTool(base, sessionId, 'pikvm_msd_upload', {
+            file: 'disk.img',
+            confirmImage: 'disk.img',
+          });
+          assert.equal(started.isError, undefined, started.content[0].text);
+          const { jobId } = JSON.parse(started.content[0].text);
+          const failed = await pollJob(base, sessionId, jobId);
+          assert.equal(failed.state, 'failed');
+          assert.equal(failed.error.type, 'PIKVM_MSD_STATE_UNKNOWN');
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          await assertKvmdStillAnswers(base, sessionId);
+        });
+      }));
+    });
+  });
+
+  await t.test('a source read error mid-upload does not crash the process', async () => {
+    await withDir(async (dir) => {
+      await writeFile(join(dir, 'disk.img'), Buffer.alloc(64 * 1024, 6));
+      await writeFile(join(dir, 'next.img'), Buffer.from('wxyz'));
+      const flags = uploadMsd(dir, { failSourceRead: true });
+      await withStalledFsRead(200, () => whileWatchingProcess(async () => {
+        await withSession({ images: [] }, flags, async ({ mock, base, sessionId }) => {
+          const started = await callTool(base, sessionId, 'pikvm_msd_upload', {
+            file: 'disk.img',
+            confirmImage: 'disk.img',
+          });
+          assert.equal(started.isError, undefined, started.content[0].text);
+          const { jobId } = JSON.parse(started.content[0].text);
+          const failed = await pollJob(base, sessionId, jobId);
+          assert.equal(failed.state, 'failed');
+          assert.equal(failed.error.type, 'PIKVM_SOURCE_READ_ERROR');
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          await assertKvmdStillAnswers(base, sessionId);
+          flags.msd.failSourceRead = false;
+          const again = await callTool(base, sessionId, 'pikvm_msd_upload', {
+            file: 'next.img',
+            confirmImage: 'next.img',
+          });
+          assert.equal(again.isError, undefined, again.content[0].text);
+          const done = await pollJob(base, sessionId, JSON.parse(again.content[0].text).jobId);
+          assert.equal(done.state, 'done');
+          assert.equal(mock.bytes.get('next.img').toString(), 'wxyz');
+        });
+      }));
     });
   });
 });

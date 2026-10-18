@@ -2,6 +2,7 @@
 // Modified 2026-10 by PLN: expectImage, preflight, and MSD mutex (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: upload jobs, remove, and job lock (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: hashing jobs, bad-image cleanup, upload try-lock (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: close the upload file handle once (GPL-3.0; see NOTICE).
 
 /**
  * Policy for MSD status, mount, eject, upload, and remove.
@@ -14,7 +15,7 @@
  */
 
 import { createHash, randomBytes } from 'node:crypto';
-import { constants, createReadStream } from 'node:fs';
+import { constants } from 'node:fs';
 import { lstat, open, realpath } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import path from 'node:path';
@@ -502,6 +503,11 @@ export interface UploadRequest {
   jobLimit?: number;
   /** Finished-job TTL in ms. Default 24h. Unset in production. */
   jobTtlMs?: number;
+  /**
+   * Test-only. After the first byte is queued, the upload body throws
+   * EIO. Unset in production.
+   */
+  failSourceRead?: boolean;
 }
 
 export interface RemoveResult {
@@ -606,6 +612,13 @@ async function assertUploadAllowed(client: PiKVMClient, image: string, size: num
   }
 }
 
+/**
+ * One owner. fh.createReadStream holds a ref on the handle, and
+ * destroy() drops it. That closes the descriptor once. fh.close()
+ * does nothing after that, and it is the only close when the stream
+ * was never opened. A numeric fd passed to fs.createReadStream is
+ * closed again by destroy(), and the second close throws EBADF.
+ */
 function closeUpload(stream: Readable | undefined, fh: FileHandle): Promise<void> {
   stream?.destroy();
   return fh.close().catch(() => undefined);
@@ -656,17 +669,24 @@ async function runUpload(
     await assertUploadAllowed(client, file, size);
     job.state = 'running';
     const hash = createHash('sha256');
-    stream = createReadStream(file, {
-      fd: fh.fd,
-      autoClose: false,
+    stream = fh.createReadStream({
       start: 0,
       end: size - 1,
+      autoClose: false,
     });
     const source = stream;
     const body = Readable.from((async function* () {
       if (request.beforeUploadStream) await request.beforeUploadStream();
       for await (const chunk of source) {
         const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        if (request.failSourceRead) {
+          const head = buf.subarray(0, 1);
+          hash.update(head);
+          sent.n += head.length;
+          job.bytes = sent.n;
+          yield head;
+          throw Object.assign(new Error('disk read failed'), { code: 'EIO' });
+        }
         hash.update(buf);
         sent.n += buf.length;
         job.bytes = sent.n;
