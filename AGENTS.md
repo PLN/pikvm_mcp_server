@@ -1,6 +1,7 @@
 <!-- Modified 2026-10 by PLN: PIKVM_REQUEST_TIMEOUT_MS (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: connect timeout and DNS map to unreachable (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: pikvm_type delay is milliseconds (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: opt-in hardware suite (GPL-3.0; see NOTICE) -->
 
 # AGENTS.md - PiKVM MCP Server
 
@@ -133,8 +134,10 @@ Implementation: `src/prompts/` (types.ts, tool-guides.ts, workflows.ts, skill-to
 
 ## Testing
 
+`npm test` runs `test/*.test.mjs` only. The opt-in hardware suite is `npm run test:hw` (`test/hw/*.hw.test.mjs`). It stays skipped unless `PIKVM_HW_TEST_DEVICE=default`, and CI does not call it. How to run it against one PiKVM is `test/hw/README.md`.
+
 Test against a real PiKVM device:
-- URL: `https://<your-pikvm-ip>`
+- URL: `https://pikvm.example.ts.net` (placeholder; do not commit a real host)
 - Access via: PiKVM web interface at `/kvm/`
 
 ## References

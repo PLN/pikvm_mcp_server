@@ -11,6 +11,7 @@
 <!-- Modified 2026-10 by PLN: connect timeout is independent of the idle timeout (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: connect timeout and DNS map to unreachable (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: pikvm_type delay is milliseconds (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: opt-in hardware suite (GPL-3.0; see NOTICE) -->
 
 # PiKVM MCP Server
 
@@ -352,6 +353,10 @@ Common key codes for `pikvm_key` and `pikvm_shortcut`:
 - Modifiers: `ShiftLeft`, `ShiftRight`, `ControlLeft`, `ControlRight`, `AltLeft`, `AltRight`, `MetaLeft`, `MetaRight`
 - Special: `Enter`, `Escape`, `Backspace`, `Tab`, `Space`, `Delete`, `Insert`, `Home`, `End`, `PageUp`, `PageDown`
 - Arrows: `ArrowUp`, `ArrowDown`, `ArrowLeft`, `ArrowRight`
+
+## Hardware suite
+
+Opt-in checks against one real PiKVM. They are not part of `npm test` and CI does not run them. See [test/hw/README.md](test/hw/README.md) for the environment variables, the read-only / MSD / HID levels, and cleanup.
 
 ## License
 
