@@ -8,6 +8,8 @@
 // Modified 2026-10 by PLN: warn on a junk connect timeout (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: password and bearer secret files (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: empty secret vars are unset (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: bearer whitespace is HTTP-only (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: TLS verify, pin, and insecure modes (GPL-3.0; see NOTICE).
 // Env read adapted from dtrukr/pikvm_mcp_server src/config.ts @ d120243 (GPL-3.0).
 
 /**
@@ -29,6 +31,11 @@ import {
   parseRequestTimeoutMs,
 } from './request-timeout.js';
 import { resolveSecret } from './secrets.js';
+import {
+  readPinnedCert,
+  type DeviceTls,
+  type TlsMode,
+} from './tls.js';
 import { parseUrlAllowlist, type UrlAllowlist } from './url-policy.js';
 
 // Load .env file from project root
@@ -142,6 +149,11 @@ export interface Config {
     username: string;
     password: string;
     verifySsl: boolean;
+    /**
+     * Per-device TLS. Only "default" is filled in until the registry.
+     * TODO(registry): Phase B item 10 copies this map per device name.
+     */
+    tls: { default: DeviceTls };
     defaultKeymap: string;
     /** Abort deadline for one ordinary kvmd call, from PIKVM_REQUEST_TIMEOUT_MS. */
     requestTimeoutMs: number;
@@ -158,6 +170,61 @@ export interface Config {
   msd: MsdConfig;
   /** Present only when PIKVM_MCP_PORT is set (HTTP mode). */
   http?: HttpConfig;
+}
+
+/**
+ * D1 (a): an unset PIKVM_TLS_MODE follows PIKVM_VERIFY_SSL. Exactly "true"
+ * means verify. Anything else, including unset, means insecure and warns.
+ * Switching that default waits for a later major release.
+ * An explicit mode wins over a contradicting PIKVM_VERIFY_SSL.
+ */
+function resolveDefaultTls(host: string): DeviceTls {
+  const raw = process.env.PIKVM_TLS_MODE;
+  const modeSet = raw !== undefined && raw.trim() !== '';
+  const legacy = process.env.PIKVM_VERIFY_SSL;
+  const legacySet = legacy !== undefined && legacy !== '';
+  const legacyVerify = legacy === 'true';
+  let mode: TlsMode;
+  if (!modeSet) {
+    mode = legacyVerify ? 'verify' : 'insecure';
+    if (mode === 'insecure') {
+      console.error(
+        'PIKVM_TLS_MODE=insecure because PIKVM_TLS_MODE is unset and PIKVM_VERIFY_SSL is not true. Pin the certificate with: pikvm-mcp-server pin default',
+      );
+    }
+  } else {
+    const trimmed = (raw ?? '').trim();
+    if (trimmed !== 'verify' && trimmed !== 'pin' && trimmed !== 'insecure') {
+      throw new Error(`PIKVM_TLS_MODE must be verify, pin, or insecure (got ${JSON.stringify(trimmed)})`);
+    }
+    mode = trimmed;
+    if (legacySet && (legacyVerify ? 'verify' : 'insecure') !== mode) {
+      console.error(`PIKVM_TLS_MODE=${mode} overrides PIKVM_VERIFY_SSL`);
+    }
+    if (mode === 'insecure') {
+      console.error(
+        'PIKVM_TLS_MODE=insecure (certificate checks are off). Pin the certificate with: pikvm-mcp-server pin default',
+      );
+    }
+  }
+  if ((mode === 'pin' || mode === 'verify') && !host.startsWith('https:')) {
+    throw new Error(`PIKVM_TLS_MODE=${mode} requires an https PIKVM_HOST`);
+  }
+  if (mode !== 'pin') {
+    return { device: 'default', mode };
+  }
+  const certFile = process.env.PIKVM_TLS_CERT_FILE;
+  if (certFile === undefined || certFile === '') {
+    throw new Error('PIKVM_TLS_CERT_FILE is required when PIKVM_TLS_MODE=pin');
+  }
+  const pinned = readPinnedCert(certFile);
+  return {
+    device: 'default',
+    mode,
+    certFile,
+    certPem: pinned.pem,
+    spkiSha256: pinned.spkiSha256,
+  };
 }
 
 export function loadConfig(): Config {
@@ -188,26 +255,30 @@ export function loadConfig(): Config {
     name: 'PIKVM_MCP_BEARER',
     credName: 'pikvm-mcp-bearer',
   });
-  if (typeof bearerToken === 'string' && bearerToken !== bearerToken.trim()) {
-    throw new Error('PIKVM_MCP_BEARER has leading or trailing whitespace');
-  }
   const port = parseInt(process.env.PIKVM_MCP_PORT || '', 10);
-  const http: HttpConfig | undefined = Number.isFinite(port) && port > 0
-    ? {
-        port,
-        host: process.env.PIKVM_MCP_HOST || '127.0.0.1',
-        bearerToken,
-        armHid: process.env.PIKVM_MCP_ARM_HID === '1',
-        armMsd: process.env.PIKVM_MCP_ARM_MSD === '1',
-      }
-    : undefined;
+  // stdio does not send the bearer. A whitespace token must not block it.
+  let http: HttpConfig | undefined;
+  if (Number.isFinite(port) && port > 0) {
+    if (typeof bearerToken === 'string' && bearerToken !== bearerToken.trim()) {
+      throw new Error('PIKVM_MCP_BEARER has leading or trailing whitespace');
+    }
+    http = {
+      port,
+      host: process.env.PIKVM_MCP_HOST || '127.0.0.1',
+      bearerToken,
+      armHid: process.env.PIKVM_MCP_ARM_HID === '1',
+      armMsd: process.env.PIKVM_MCP_ARM_MSD === '1',
+    };
+  }
 
+  const deviceTls = resolveDefaultTls(host);
   return {
     pikvm: {
       host,
       username: process.env.PIKVM_USERNAME || 'admin',
       password,
-      verifySsl: process.env.PIKVM_VERIFY_SSL === 'true',
+      verifySsl: deviceTls.mode === 'verify',
+      tls: { default: deviceTls },
       defaultKeymap: process.env.PIKVM_DEFAULT_KEYMAP || 'en-us',
       requestTimeoutMs,
       msdJobTimeoutMs,

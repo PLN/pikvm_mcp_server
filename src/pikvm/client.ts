@@ -7,6 +7,8 @@
 // Modified 2026-10 by PLN: connect timeout and DNS map to unreachable (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: pikvm_type delay is milliseconds (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: header and body timeouts stay timeouts (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: TLS verify, pin, and insecure modes (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: kvmd redirects are not followed (GPL-3.0; see NOTICE).
 // AbortSignal.timeout and PIKVM_UNREACHABLE / PIKVM_AUTH_FAILED no-retry codes
 // adapted from dtrukr/pikvm_mcp_server src/pikvm/client.ts @ d120243 (GPL-3.0).
 // Snapshot HTTP 503 retry-once adapted from dvaerum/pikvm_mcp_server
@@ -55,8 +57,16 @@
  */
 
 import { Readable } from 'node:stream';
-import { Agent, fetch, request as undiciRequest } from 'undici';
-import type { Dispatcher } from 'undici';
+import { fetch, request as undiciRequest } from 'undici';
+import type { Agent, Dispatcher } from 'undici';
+import {
+  TLS_PIN_MISMATCH,
+  TLS_VERIFY_FAILED,
+  classifyTlsFailure,
+  createKvmdAgent,
+  deviceTlsFrom,
+  type DeviceTls,
+} from '../tls.js';
 import sharp from 'sharp';
 import {
   HID_OTHER_DEADLINE_MS,
@@ -80,6 +90,11 @@ export interface PiKVMConfig {
   username: string;
   password: string;
   verifySsl?: boolean;
+  /**
+   * Per-device TLS. Only "default" is used until the registry.
+   * TODO(registry): Phase B item 10 selects this by device name.
+   */
+  tls?: { default: DeviceTls };
   defaultKeymap?: string;
   /** Abort deadline for one ordinary kvmd call. Default 5000. */
   requestTimeoutMs?: number;
@@ -375,7 +390,11 @@ function isPreSendFailure(err: unknown): boolean {
   return errorCodes(err).some((code) => PRE_SEND_CODES.has(code));
 }
 
-function transportError(err: unknown, endpoint: string, hid: boolean): KvmdError {
+function transportError(err: unknown, endpoint: string, hid: boolean, device = 'default'): KvmdError {
+  const tlsFailure = classifyTlsFailure(err, device);
+  if (tlsFailure) {
+    return new KvmdError(0, tlsFailure.type, tlsFailure.message, endpoint);
+  }
   // A connect timeout or DNS failure can sit under a TimeoutError.
   // Nothing was sent, so this stays unreachable rather than a timeout.
   if (isPreSendFailure(err)) {
@@ -393,8 +412,37 @@ function transportError(err: unknown, endpoint: string, hid: boolean): KvmdError
   return new KvmdError(0, 'PIKVM_UNREACHABLE', 'kvmd network error', endpoint);
 }
 
+/** No existing code fits: unreachable is retried, and an HTTP error hides the redirect. */
+export const UNEXPECTED_REDIRECT = 'PIKVM_UNEXPECTED_REDIRECT';
+
+/** `protocol//host` only. Userinfo, path, and query are dropped. */
+export function redirectTargetOrigin(location: string | null, requestUrl: string): string {
+  if (!location) return 'unknown';
+  let parsed: URL;
+  try {
+    parsed = new URL(location, requestUrl);
+  } catch {
+    return 'unreadable';
+  }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return 'unreadable';
+  return `${parsed.protocol}//${parsed.host}`;
+}
+
+export function unexpectedRedirectMessage(status: number, location: string | null, requestUrl: string): string {
+  const origin = redirectTargetOrigin(location, requestUrl);
+  return `${UNEXPECTED_REDIRECT}: kvmd returned an unexpected HTTP ${status} redirect to ${origin}. The redirect was not followed.`;
+}
+
+function headerValue(headers: Record<string, string | string[] | undefined>, name: string): string | null {
+  const value = headers[name];
+  if (Array.isArray(value)) return value[0] ?? null;
+  return typeof value === 'string' ? value : null;
+}
+
 function isRetryableGetError(err: KvmdError): boolean {
   if (err.type === 'PIKVM_HID_STATE_UNKNOWN') return false;
+  if (err.type === TLS_PIN_MISMATCH || err.type === TLS_VERIFY_FAILED) return false;
+  if (err.type === UNEXPECTED_REDIRECT) return false;
   if (err.type === 'PIKVM_UNREACHABLE' || err.type === 'PIKVM_TIMEOUT') return true;
   return err.status === 502 || err.status === 503;
 }
@@ -690,8 +738,17 @@ export function redactionPassword(client: PiKVMClient): string {
   return redactionPasswords.get(client) ?? '';
 }
 
+interface ResolvedPiKVMConfig extends PiKVMConfig {
+  verifySsl: boolean;
+  defaultKeymap: string;
+  requestTimeoutMs: number;
+  msdJobTimeoutMs: number;
+  msdIdleTimeoutMs: number;
+  tls: { default: DeviceTls };
+}
+
 export class PiKVMClient {
-  private config: Required<PiKVMConfig>;
+  private config: ResolvedPiKVMConfig;
   private dispatcher: Agent;
   private cachedResolution: ScreenResolution | null = null;
   private screenshotScale: {
@@ -701,7 +758,7 @@ export class PiKVMClient {
   private calibration: CalibrationState | null = null;
 
   constructor(config: PiKVMConfig) {
-    this.config = {
+    const base = {
       verifySsl: false,
       defaultKeymap: 'en-us',
       requestTimeoutMs: 5000,
@@ -709,35 +766,41 @@ export class PiKVMClient {
       msdIdleTimeoutMs: MSD_IDLE_TIMEOUT_DEFAULT_MS,
       ...config,
     };
-    this.config.requestTimeoutMs = clampRequestTimeoutMs(this.config.requestTimeoutMs);
-    this.config.msdJobTimeoutMs = normalizeMsdTimeoutMs(
-      this.config.msdJobTimeoutMs,
+    base.requestTimeoutMs = clampRequestTimeoutMs(base.requestTimeoutMs);
+    base.msdJobTimeoutMs = normalizeMsdTimeoutMs(
+      base.msdJobTimeoutMs,
       MSD_JOB_TIMEOUT_DEFAULT_MS,
       MSD_JOB_TIMEOUT_MAX_MS,
     );
-    this.config.msdIdleTimeoutMs = normalizeMsdTimeoutMs(
-      this.config.msdIdleTimeoutMs,
+    base.msdIdleTimeoutMs = normalizeMsdTimeoutMs(
+      base.msdIdleTimeoutMs,
       MSD_IDLE_TIMEOUT_DEFAULT_MS,
       MSD_IDLE_TIMEOUT_MAX_MS,
     );
+    const resolved: ResolvedPiKVMConfig = {
+      ...base,
+      tls: {
+        default: deviceTlsFrom({
+          host: base.host,
+          verifySsl: base.verifySsl,
+          tls: config.tls,
+        }),
+      },
+    };
+    this.config = resolved;
     redactionPasswords.set(this, this.config.password);
 
     // headersTimeout and bodyTimeout 0 turn off undici's 300s defaults.
     // Each call sets its own AbortSignal, including HID ceilings.
-    this.dispatcher = new Agent({
-      connect: {
-        rejectUnauthorized: this.config.verifySsl,
-      },
-      headersTimeout: 0,
-      bodyTimeout: 0,
-    });
+    // The same agent is used for GET, POST, HID, and both MSD upload paths.
+    this.dispatcher = createKvmdAgent(this.config, { headersTimeout: 0, bodyTimeout: 0 });
   }
 
   /**
-   * Close any resources (no-op for REST-only client, kept for API compatibility)
+   * Close the kvmd dispatcher.
    */
-  close(): void {
-    // No resources to close when using REST API only
+  async close(): Promise<void> {
+    await this.dispatcher.close();
   }
 
   /**
@@ -827,9 +890,21 @@ export class PiKVMClient {
         body: body ? (typeof body === 'object' ? JSON.stringify(body) : body) : undefined,
         dispatcher: testDispatchers.get(this) ?? this.dispatcher,
         signal: AbortSignal.timeout(timeoutMs),
+        redirect: 'manual',
       });
     } catch (err) {
-      throw transportError(err, endpoint, hidPost);
+      throw transportError(err, endpoint, hidPost, this.config.tls.default.device);
+    }
+
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get('location');
+      await this.cancelBody(response);
+      throw new KvmdError(
+        response.status,
+        UNEXPECTED_REDIRECT,
+        this.redact(unexpectedRedirectMessage(response.status, location, url.toString())),
+        endpoint,
+      );
     }
 
     if (!response.ok) {
@@ -946,7 +1021,7 @@ export class PiKVMClient {
     try {
       return await read();
     } catch (err) {
-      throw transportError(err, endpoint, hid);
+      throw transportError(err, endpoint, hid, this.config.tls.default.device);
     }
   }
 
@@ -1583,16 +1658,36 @@ export class PiKVMClient {
       deadline.disarm();
     }
     try {
-      const response = await undiciRequest(url, {
-        method: 'POST',
+      // request() does not follow redirects. maxRedirections 0 is the
+      // explicit off switch; the type omits the field.
+      const requestOptions = {
+        method: 'POST' as const,
         headers,
         body: upload,
         dispatcher: testDispatchers.get(this) ?? this.dispatcher,
         headersTimeout: this.config.msdJobTimeoutMs,
         bodyTimeout: this.config.msdIdleTimeoutMs,
         signal: deadline.signal,
-        idempotent: false,
-      });
+        idempotent: false as const,
+        maxRedirections: 0,
+      };
+      const response = await undiciRequest(url, requestOptions);
+      if (response.statusCode >= 300 && response.statusCode < 400) {
+        const location = headerValue(response.headers, 'location');
+        try {
+          for await (const chunk of response.body) {
+            void chunk;
+          }
+        } catch {
+          // The redirect body is already finished.
+        }
+        throw new KvmdError(
+          response.statusCode,
+          UNEXPECTED_REDIRECT,
+          this.redact(unexpectedRedirectMessage(response.statusCode, location, url.toString())),
+          endpoint,
+        );
+      }
       return response;
     } catch (err) {
       if (watch?.sourceError || (!isContentLengthMismatch(err) && isSourceReadError(err))) {
@@ -1610,6 +1705,10 @@ export class PiKVMClient {
 
   private msdTransport(err: unknown, endpoint: string): KvmdError {
     if (err instanceof KvmdError) return err;
+    const tlsFailure = classifyTlsFailure(err, this.config.tls.default.device);
+    if (tlsFailure) {
+      return new KvmdError(0, tlsFailure.type, tlsFailure.message, endpoint);
+    }
     if (isContentLengthMismatch(err)) {
       return new KvmdError(
         0,
@@ -1638,6 +1737,16 @@ export class PiKVMClient {
       chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
     }
     return Buffer.concat(chunks).toString('utf8');
+  }
+
+  private async cancelBody(response: { body?: { cancel?: () => Promise<void> } | null }): Promise<void> {
+    const cancel = response.body?.cancel;
+    if (typeof cancel !== 'function') return;
+    try {
+      await cancel.call(response.body);
+    } catch {
+      // The redirect body is already closed.
+    }
   }
 
   private async dumpBody(body: unknown): Promise<void> {

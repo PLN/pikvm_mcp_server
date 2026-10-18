@@ -18,6 +18,10 @@ Modified 2026-10 by PLN: hardware ISO, net check, and cleanup names (GPL-3.0; se
 Modified 2026-10 by PLN: password and bearer secret files (GPL-3.0; see below).
 Modified 2026-10 by PLN: empty secret vars are unset (GPL-3.0; see below).
 Modified 2026-10 by PLN: restore leftover images and reject fetch bad ports (GPL-3.0; see below).
+Modified 2026-10 by PLN: bearer whitespace check is HTTP-only (GPL-3.0; see below).
+Modified 2026-10 by PLN: TLS verify, pin, and insecure modes (GPL-3.0; see below).
+Modified 2026-10 by PLN: TLS failures follow the socket, and a pinned leaf may be CA-signed (GPL-3.0; see below).
+Modified 2026-10 by PLN: kvmd redirects are not followed (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -491,8 +495,74 @@ No code from another pikvm_mcp_server fork was added for these methods.
   by name only. No code from another pikvm_mcp_server fork was copied.
 
 2026-10, by PLN:
+  The bearer whitespace check runs only when PIKVM_MCP_PORT selects HTTP
+  mode. stdio does not send that bearer, so a token with surrounding
+  whitespace does not stop a stdio process. The HTTP error still names
+  PIKVM_MCP_BEARER and not the value. No code from another
+  pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
   Hardware cleanup restores the snapshot image when this run did not
   create that name, including a leftover mcp-hwtest-* image that was
   already selected. The closed-port probe rejects ports on the Fetch
   bad-port list before a connection. No code from another
   pikvm_mcp_server fork was added.
+
+2026-10, by PLN:
+  PIKVM_TLS_MODE is verify, pin, or insecure. The only device is default
+  until the registry. An unset mode follows PIKVM_VERIFY_SSL: exactly
+  true is verify, and anything else is insecure with one stderr warning
+  that names the mode and pikvm-mcp-server pin default. That insecure
+  default stays until a later major release. An explicit mode wins over
+  a contradicting PIKVM_VERIFY_SSL. pin reads PIKVM_TLS_CERT_FILE with
+  the same non-blocking regular-file checks as a secret, including the
+  64 KiB cap, and does not warn about the mode because the file is not
+  a secret. verify uses the system CAs and the hostname. pin sets the
+  pinned PEM as ca, rejectUnauthorized true, and a checkServerIdentity
+  that compares SPKI sha256 and ignores the hostname. insecure sets
+  rejectUnauthorized false. Pin is never combined with that false flag,
+  because Node then skips checkServerIdentity. A mismatch is
+  PIKVM_TLS_PIN_MISMATCH and names the device, both SPKI sha256 values,
+  and the pin command. A chain or hostname failure is
+  PIKVM_TLS_VERIFY_FAILED. Neither is retried or mapped to
+  PIKVM_UNREACHABLE, and neither falls back to insecure. The same
+  dispatcher is used for GET, POST, HID, msdWrite, msdWriteRemote, and
+  the hardware suite's kvmd GET. pikvm-mcp-server pin default prints the
+  leaf and writes the PEM only after yes on a TTY, or --yes after
+  out-of-band verification. The write is a temp file plus rename, mode
+  0644. The command is not run on a pin failure. The read-only hardware
+  check logs the mode and, in pin mode, that the pin matched. With the
+  device unset, the suite skips 8 tests. No code from another
+  pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  A TLS socket that is destroyed while it is not authorized, after the
+  handshake has presented a certificate, is a TLS failure in both verify
+  and pin mode. Pin mode compares the leaf SPKI first and reports
+  PIKVM_TLS_PIN_MISMATCH when the key differs, including when the chain
+  error is an invalid CA. Otherwise the result is
+  PIKVM_TLS_VERIFY_FAILED. The full X509 verify code set remains a
+  backstop. Neither code is retried or mapped to PIKVM_UNREACHABLE.
+  Pin mode sets allowPartialTrustChain so the leaf written by pin
+  default can be a CA-signed Tailscale or Let's Encrypt certificate.
+  engines is >=22.9.0, which is the Node release that added that flag,
+  and CI installs Node 22.14.0. An expired pinned certificate stays
+  rejected and the message says to regenerate or renew the kvmd
+  certificate, then pin the new one. pin writes the leaf only. A CA or
+  intermediate pin does not match that leaf. A destination that is not
+  a certificate is shown as unreadable and does not block a re-pin.
+  rename replaces a   symlink at --out and does not write through it, and
+  the directory fsync after the rename is best-effort. An IPv6 literal
+  is connected without the URL brackets and without an SNI name. No
+  code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  Every kvmd call uses redirect manual, including HID and the upload
+  path. undici strips Authorization on a cross-origin redirect and does
+  not strip X-KVMD-Passwd or X-KVMD-User, so a redirect to another host
+  or to http:// would have resent the password. A 3xx is
+  PIKVM_UNEXPECTED_REDIRECT. No existing code fits: PIKVM_UNREACHABLE
+  is retried, and an HTTP error would not say that the redirect was
+  refused. The message includes the status and the Location origin
+  only, with no userinfo, path, query, or password. The error is not
+  retried. No code from another pikvm_mcp_server fork was copied.

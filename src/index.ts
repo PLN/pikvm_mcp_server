@@ -4,6 +4,7 @@
 // Modified 2026-10 by PLN: URL fetch allowlist (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: password and bearer secret files (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: empty secret vars are unset (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: pikvm-mcp-server pin (GPL-3.0; see NOTICE).
 /**
  * PiKVM MCP Server
  *
@@ -21,6 +22,7 @@ import { loadConfig } from './config.js';
 import { BusyLock } from './pikvm/lock.js';
 import { createMcpServer } from './server.js';
 import { startHttpServer } from './http.js';
+import { pinCommand } from './pin.js';
 
 // Start server
 async function main() {
@@ -82,7 +84,11 @@ async function main() {
   console.error('PiKVM MCP Server running');
 }
 
-main().catch((error) => {
+const started = process.argv[2] === 'pin'
+  ? pinCommand(process.argv.slice(3))
+  : main();
+
+started.catch((error) => {
   console.error('Fatal error:', error);
   process.exit(1);
 });

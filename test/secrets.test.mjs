@@ -1,5 +1,6 @@
 // Modified 2026-10 by PLN: password and bearer secret files (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: empty secret vars are unset (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: bearer whitespace is HTTP-only (GPL-3.0; see NOTICE).
 
 /**
  * resolveSecret order and file rules. Temp directories are removed.
@@ -448,12 +449,13 @@ describe('loadConfig secrets', () => {
     }
   }
 
-  test('a bearer with surrounding whitespace is rejected by name only', () => {
+  test('a bearer with surrounding whitespace is rejected in HTTP mode by name only', () => {
     const token = ' bearer-with-space ';
     assert.throws(
       () => withProcessEnv({
         PIKVM_HOST: 'https://pikvm.example.ts.net',
         PIKVM_PASSWORD: 'testpw',
+        PIKVM_MCP_PORT: '8974',
         PIKVM_MCP_BEARER: token,
       }, () => loadConfig()),
       (err) => {
@@ -464,6 +466,16 @@ describe('loadConfig secrets', () => {
         return true;
       },
     );
+  });
+
+  test('stdio accepts a bearer with surrounding whitespace', () => {
+    const token = ' bearer-with-space ';
+    const config = withProcessEnv({
+      PIKVM_HOST: 'https://pikvm.example.ts.net',
+      PIKVM_PASSWORD: 'testpw',
+      PIKVM_MCP_BEARER: token,
+    }, () => loadConfig());
+    assert.equal(config.http, undefined);
   });
 
   test('redactConfig hides the password and the bearer', async () => {
@@ -548,7 +560,7 @@ describe('loadConfig secrets', () => {
         body,
       });
       assert.equal(denied.status, 401);
-      pikvm.close();
+      await pikvm.close();
     } finally {
       if (httpServer) await new Promise((resolve) => httpServer.close(resolve));
       await mock.close();
