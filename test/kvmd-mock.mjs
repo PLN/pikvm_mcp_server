@@ -5,6 +5,7 @@
 // Modified 2026-10 by PLN: holdMutations for the MSD mutex test (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: upload busy flag and resetDuringWrite (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: storeIncomplete for fetch cleanup tests (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: kvmd removes an incomplete download unless storeIncomplete (GPL-3.0; see NOTICE).
 
 /**
  * Minimal KVMD REST mock implementing exactly the routes src/pikvm/client.ts
@@ -26,6 +27,8 @@
  * `legacyFreeShape`, `writeHoldMs`, `pauseWrite`, and `remote` (`lines`,
  * `chunks`, `gapMs`, `headerDelayMs`, `stallAfterHeadersMs`, `redirectTo`,
  * `storeIncomplete`). `redirectTo` answers 302 and does not follow it.
+ * An error line does not leave an image: kvmd removes the incomplete
+ * file itself. `storeIncomplete` keeps that file so a test can see our remove.
  * `pauseWrite` accepts POST /api/msd/write, pauses the request, and does
  * not read the body until the socket closes. `resetDuringWrite` destroys
  * the socket after the first body chunk. A write in progress sets

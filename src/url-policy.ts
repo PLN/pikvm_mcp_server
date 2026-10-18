@@ -1,10 +1,13 @@
 // Modified 2026-10 by PLN: URL allowlist and SSRF address policy (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: metadata embeddings, Tailscale services, reserved ranges (GPL-3.0; see NOTICE).
 
 /**
  * https allowlist and address checks for pikvm_msd_fetch_url.
  * kvmd downloads the URL itself, so this only rejects names the MCP
- * host can see. Link-local and metadata addresses are never allowed.
- * Tailscale ranges need an explicit CIDR in the allowlist.
+ * host can see. Link-local, metadata, and Tailscale service addresses
+ * are never allowed. An IPv4 address embedded in ::/96, 64:ff9b::/96,
+ * 64:ff9b:1::/48, or 2002::/16 is extracted and checked with the IPv4
+ * rules. Tailscale ranges need an explicit CIDR in the allowlist.
  */
 
 import { lookup } from 'node:dns/promises';
@@ -14,10 +17,16 @@ const TAILSCALE_V4 = '100.64.0.0';
 const TAILSCALE_V4_PREFIX = 10;
 const TAILSCALE_V6 = 'fd7a:115c:a1e0::';
 const TAILSCALE_V6_PREFIX = 48;
+const NAT64 = 0x0064ff9b0000000000000000n;
+const NAT64_LOCAL = 0x0064ff9b0001n;
 
 const alwaysDeny = new BlockList();
 alwaysDeny.addSubnet('169.254.0.0', 16, 'ipv4');
 alwaysDeny.addSubnet('fe80::', 10, 'ipv6');
+alwaysDeny.addAddress('fd00:ec2::254', 'ipv6');
+alwaysDeny.addAddress('100.100.100.100', 'ipv4');
+alwaysDeny.addAddress('100.100.100.200', 'ipv4');
+alwaysDeny.addAddress('fd7a:115c:a1e0::53', 'ipv6');
 
 const tailscaleOuter = new BlockList();
 tailscaleOuter.addSubnet(TAILSCALE_V4, TAILSCALE_V4_PREFIX, 'ipv4');
@@ -36,6 +45,17 @@ privateRanges.addAddress('::1', 'ipv6');
 privateRanges.addSubnet('fc00::', 7, 'ipv6');
 privateRanges.addSubnet('ff00::', 8, 'ipv6');
 
+/** Denied even when PIKVM_MSD_URL_ALLOW_PRIVATE=1. Not Tailscale. */
+const reservedRanges = new BlockList();
+reservedRanges.addSubnet('192.0.0.0', 24, 'ipv4');
+reservedRanges.addSubnet('192.0.2.0', 24, 'ipv4');
+reservedRanges.addSubnet('198.18.0.0', 15, 'ipv4');
+reservedRanges.addSubnet('198.51.100.0', 24, 'ipv4');
+reservedRanges.addSubnet('203.0.113.0', 24, 'ipv4');
+reservedRanges.addSubnet('240.0.0.0', 4, 'ipv4');
+reservedRanges.addSubnet('fec0::', 10, 'ipv6');
+reservedRanges.addSubnet('2001:db8::', 32, 'ipv6');
+
 export interface UrlAllowEntry {
   /** URL.hostname, brackets included for IPv6. */
   host: string;
@@ -50,9 +70,20 @@ export interface UrlAllowlist {
   tailscale: BlockList;
 }
 
-/** Drop URL userinfo. The query string is left in place. */
+/**
+ * Drop URL userinfo, cutting at the last `@` before the path, and drop
+ * the query string and fragment. kvmd still logs the full URL.
+ */
 export function redactUrlUserinfo(text: string): string {
-  return text.replace(/\b([a-z][a-z0-9+.-]*:\/\/)[^/\s@]*@/gi, '$1');
+  return text.replace(
+    /\b([a-z][a-z0-9+.-]*:\/\/)([^\s/?#]*)([^\s]*)/gi,
+    (_match, scheme: string, authority: string, rest: string) => {
+      const at = authority.lastIndexOf('@');
+      const host = at === -1 ? authority : authority.slice(at + 1);
+      const path = rest.split(/[?#]/, 1)[0];
+      return `${scheme}${host}${path}`;
+    },
+  );
 }
 
 export class MsdUrlPolicyError extends Error {
@@ -67,6 +98,14 @@ export class MsdUrlPolicyError extends Error {
 
 function stripBrackets(host: string): string {
   if (host.startsWith('[') && host.endsWith(']')) return host.slice(1, -1);
+  return host;
+}
+
+/** Drop a trailing DNS dot. IPv6 hostnames keep their brackets. */
+function normalizeHost(hostname: string): string {
+  if (hostname.startsWith('[')) return hostname;
+  let host = hostname;
+  while (host.endsWith('.') && host.length > 1) host = host.slice(0, -1);
   return host;
 }
 
@@ -139,12 +178,46 @@ function cidrEnds(address: string, prefix: number, family: 'ipv4' | 'ipv6'): [st
   return [bigToIpv6(start), bigToIpv6(end)];
 }
 
+type EmbeddedIpv4 = { kind: 'ipv4'; address: string } | { kind: 'invalid' };
+
+/**
+ * IPv4 carried in ::/96, 64:ff9b::/96, 64:ff9b:1::/48 (RFC 6052), or
+ * 2002::/16. The caller runs the IPv4 policy on the extracted address.
+ * A local NAT64 address whose u byte is not zero is invalid.
+ */
+function embeddedIpv4(bare: string): EmbeddedIpv4 | undefined {
+  if (isIP(bare) !== 6) return undefined;
+  let value: bigint;
+  try {
+    value = ipv6ToBig(bare);
+  } catch {
+    return undefined;
+  }
+  const high96 = value >> 32n;
+  if (high96 === 0n || high96 === NAT64) {
+    return { kind: 'ipv4', address: bigToIpv4(value & 0xffffffffn) };
+  }
+  if ((value >> 112n) === 0x2002n) {
+    return { kind: 'ipv4', address: bigToIpv4((value >> 80n) & 0xffffffffn) };
+  }
+  if ((value >> 80n) === NAT64_LOCAL) {
+    const high = (value >> 64n) & 0xffffn;
+    const marker = (value >> 56n) & 0xffn;
+    const low = (value >> 40n) & 0xffffn;
+    if (marker !== 0n) return { kind: 'invalid' };
+    return { kind: 'ipv4', address: bigToIpv4((high << 16n) | low) };
+  }
+  return undefined;
+}
+
 const CIDR_ERROR = 'PIKVM_MSD_URL_ALLOWLIST tailscale opt-in must be a CIDR inside 100.64.0.0/10 or fd7a:115c:a1e0::/48';
 
 function addTailscaleCidr(list: BlockList, token: string): void {
   const slash = token.lastIndexOf('/');
   const address = token.slice(0, slash).trim();
-  const prefix = Number(token.slice(slash + 1));
+  const prefixText = token.slice(slash + 1);
+  if (!/^(0|[1-9][0-9]{0,2})$/.test(prefixText)) throw new Error(CIDR_ERROR);
+  const prefix = Number(prefixText);
   const kind = isIP(address);
   if (kind === 0 || !Number.isInteger(prefix)) throw new Error(CIDR_ERROR);
   const family = kind === 4 ? 'ipv4' : 'ipv6';
@@ -154,6 +227,9 @@ function addTailscaleCidr(list: BlockList, token: string): void {
   let start: string;
   let end: string;
   try {
+    const value = family === 'ipv4' ? ipv4ToBig(address) : ipv6ToBig(address);
+    const hostBits = BigInt(bits - prefix);
+    if (((value >> hostBits) << hostBits) !== value) throw new Error('host bits');
     [start, end] = cidrEnds(address, prefix, family);
   } catch {
     throw new Error(CIDR_ERROR);
@@ -162,6 +238,19 @@ function addTailscaleCidr(list: BlockList, token: string): void {
     throw new Error(CIDR_ERROR);
   }
   list.addSubnet(address, prefix, family);
+}
+
+/** True for a literal that stays denied with private and Tailscale opted in. */
+function isAlwaysDeniedAddress(address: string): boolean {
+  const bare = stripBrackets(address.trim());
+  const kind = isIP(bare);
+  if (kind !== 4 && kind !== 6) return false;
+  const family = kind === 4 ? 'ipv4' : 'ipv6';
+  if (alwaysDeny.check(bare, family) || reservedRanges.check(bare, family)) return true;
+  const embedded = embeddedIpv4(bare);
+  if (!embedded) return false;
+  if (embedded.kind === 'invalid') return true;
+  return isAlwaysDeniedAddress(embedded.address);
 }
 
 function parseHttpsEntry(item: string): UrlAllowEntry {
@@ -180,11 +269,16 @@ function parseHttpsEntry(item: string): UrlAllowEntry {
   if (url.search || url.hash) {
     throw new Error('PIKVM_MSD_URL_ALLOWLIST entry must not contain a query or hash');
   }
+  const host = normalizeHost(url.hostname);
+  const bare = stripBrackets(host);
+  if (isIP(bare) && isAlwaysDeniedAddress(bare)) {
+    throw new Error('PIKVM_MSD_URL_ALLOWLIST host is always denied');
+  }
   const port = url.port === '' ? 443 : Number(url.port);
   let pathPrefix = url.pathname;
   if (pathPrefix.length > 1 && pathPrefix.endsWith('/')) pathPrefix = pathPrefix.slice(0, -1);
   if (pathPrefix === '') pathPrefix = '/';
-  return { host: url.hostname, port, pathPrefix };
+  return { host, port, pathPrefix };
 }
 
 /** Comma-separated https prefixes and Tailscale CIDR opt-ins. Empty hides the tool. */
@@ -207,17 +301,18 @@ export function parseUrlAllowlist(raw: string | undefined): UrlAllowlist {
 export function matchAllowEntry(allow: UrlAllowlist, url: URL): boolean {
   const port = url.port === '' ? 443 : Number(url.port);
   const path = url.pathname;
+  const host = normalizeHost(url.hostname);
   return allow.entries.some((entry) => {
-    if (entry.host !== url.hostname || entry.port !== port) return false;
+    if (entry.host !== host || entry.port !== port) return false;
     if (entry.pathPrefix === '/') return true;
     return path === entry.pathPrefix || path.startsWith(`${entry.pathPrefix}/`);
   });
 }
 
 export interface InspectedUrl {
-  /** URL sent to kvmd. Userinfo is already rejected. */
+  /** URL sent to kvmd, with the fragment removed. Userinfo is already rejected. */
   href: string;
-  /** Host without brackets, for DNS or a literal address check. */
+  /** Host without brackets or a trailing dot, for DNS or a literal address check. */
   hostname: string;
   imageFromPath: string;
 }
@@ -236,6 +331,7 @@ export function inspectFetchUrl(raw: string, allow: UrlAllowlist): InspectedUrl 
   if (!matchAllowEntry(allow, url)) {
     throw new MsdUrlPolicyError('MsdUrlAllowlistError', 'url is not allowlisted');
   }
+  url.hash = '';
   const segments = url.pathname.split('/').filter((part) => part.length > 0);
   const last = segments.length > 0 ? segments[segments.length - 1] : '';
   let imageFromPath = '';
@@ -244,19 +340,32 @@ export function inspectFetchUrl(raw: string, allow: UrlAllowlist): InspectedUrl 
   } catch {
     imageFromPath = '';
   }
-  return { href: url.href, hostname: stripBrackets(url.hostname), imageFromPath };
+  return {
+    href: url.href,
+    hostname: stripBrackets(normalizeHost(url.hostname)),
+    imageFromPath,
+  };
 }
 
 /**
  * Empty string when the address may be used. Otherwise a denial message.
- * Tailscale is checked before ULA so ALLOW_PRIVATE does not cover it.
- * Link-local and metadata are checked first and are never opted in.
+ * Always-deny is checked before Tailscale and private ranges.
+ * Embedded IPv4 uses the same IPv4 policy, including that order.
  */
 export function addressDenial(address: string, allow: UrlAllowlist, allowPrivate: boolean): string | undefined {
   const bare = stripBrackets(address.trim());
   const family = familyOf(bare);
   if (alwaysDeny.check(bare, family)) {
     return `resolved address ${bare} is link-local or metadata and is always denied`;
+  }
+  const embedded = embeddedIpv4(bare);
+  if (embedded?.kind === 'invalid') {
+    return `resolved address ${bare} is an invalid IPv4 embedding and is always denied`;
+  }
+  if (embedded?.kind === 'ipv4') {
+    const inner = addressDenial(embedded.address, allow, allowPrivate);
+    if (inner) return `resolved address ${bare} is denied: ${inner}`;
+    return undefined;
   }
   if (tailscaleOuter.check(bare, family)) {
     if (!allow.tailscale.check(bare, family)) {
@@ -267,6 +376,9 @@ export function addressDenial(address: string, allow: UrlAllowlist, allowPrivate
   if (privateRanges.check(bare, family)) {
     if (!allowPrivate) return `resolved address ${bare} is a private address`;
     return undefined;
+  }
+  if (reservedRanges.check(bare, family)) {
+    return `resolved address ${bare} is a reserved or documentation address`;
   }
   return undefined;
 }

@@ -3,6 +3,7 @@
 // Modified 2026-10 by PLN: upload jobs, remove, and disconnected expectImage (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: hashing jobs, bad-image cleanup, upload try-lock (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: URL fetch jobs and mount block during a transfer (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: fetch cleanup only after our progress line (GPL-3.0; see NOTICE).
 
 /**
  * MSD tools against the mock. The HTTP harness matches test/http.test.mjs.
@@ -1258,8 +1259,8 @@ function fetchFlags(allowRaw, extra = {}) {
       extensions: ['.iso', '.img'],
       urlAllow: parseUrlAllowlist(allowRaw),
       allowPrivate: false,
-      remoteTimeoutSec: 30,
-      resolveUrl: async () => ['203.0.113.10'],
+      connectTimeoutSec: 30,
+      resolveUrl: async () => ['192.0.3.10'],
       ...extra,
     },
   };
@@ -1309,7 +1310,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
       ['rfc1918', FETCH_ALLOW, { url: FETCH_URL, confirmImage: 'disk.img' }, /private/, { resolveUrl: async () => ['10.1.2.3'] }],
       ['tailscale', FETCH_ALLOW, { url: FETCH_URL, confirmImage: 'disk.img' }, /tailscale/, { resolveUrl: async () => ['100.101.102.103'] }],
       ['metadata', `${FETCH_ALLOW}`, { url: FETCH_URL, confirmImage: 'disk.img' }, /link-local or metadata/, { allowPrivate: true, resolveUrl: async () => ['169.254.169.254'] }],
-      ['fe80', 'https://[fe80::1]/', { url: 'https://[fe80::1]/disk.img', confirmImage: 'disk.img' }, /link-local or metadata/, { allowPrivate: true, resolveUrl: async () => { throw new Error('dns'); } }],
+      ['fe80', FETCH_ALLOW, { url: FETCH_URL, confirmImage: 'disk.img' }, /link-local or metadata/, { allowPrivate: true, resolveUrl: async () => ['fe80::1'] }],
       ['mapped metadata', FETCH_ALLOW, { url: FETCH_URL, confirmImage: 'disk.img' }, /link-local or metadata/, { allowPrivate: true, resolveUrl: async () => ['::ffff:169.254.169.254'] }],
     ];
     for (const [label, allowRaw, args, pattern, extra] of cases) {
@@ -1495,7 +1496,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
     try {
       await withSession({ images: [] }, fetchFlags(FETCH_ALLOW), async ({ mock, base, sessionId }) => {
         const started = await callTool(base, sessionId, 'pikvm_msd_fetch_url', {
-          url: 'https://images.example/iso/other.img?token=supersecret',
+          url: 'https://images.example/iso/other.img?token=supersecret#frag',
           image: 'disk.img',
           confirmImage: 'disk.img',
         });
@@ -1505,6 +1506,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
         const call = mock.calls.find((item) => item.path === '/api/msd/write_remote');
         assert.match(call.query, /image=disk\.img/);
         assert.match(decodeURIComponent(call.query), /token=supersecret/);
+        assert.equal(decodeURIComponent(call.query).includes('frag'), false);
       });
     } finally {
       console.error = orig;
@@ -1532,5 +1534,200 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
         assert.deepEqual(msdPosts(mock), [], label);
       });
     }
+  });
+
+  await t.test('service and embedded addresses make no kvmd call', async () => {
+    const wide = `${FETCH_ALLOW},100.64.0.0/10,fd7a:115c:a1e0::/48`;
+    const cases = [
+      ['aws', 'fd00:ec2::254', true],
+      ['quad100', '100.100.100.100', true],
+      ['quad200', '100.100.100.200', true],
+      ['quad6', 'fd7a:115c:a1e0::53', true],
+      ['nat64 metadata', '64:ff9b::a9fe:a9fe', true],
+      ['6to4 metadata', '2002:a9fe:a9fe::', true],
+      ['compatible metadata', '::a9fe:a9fe', true],
+      ['nat64 loopback', '64:ff9b::7f00:1', false],
+    ];
+    for (const [label, address, allowPrivate] of cases) {
+      await withSession({ images: [] }, fetchFlags(wide, {
+        allowPrivate,
+        resolveUrl: async () => [address],
+      }), async ({ mock, base, sessionId }) => {
+        await refusedFetch(base, sessionId, mock, {
+          url: FETCH_URL,
+          confirmImage: 'disk.img',
+        }, /denied|private/);
+      });
+    }
+  });
+
+  await t.test('decimal octal and hex loopback literals make no kvmd call', async () => {
+    const allow = 'https://127.0.0.1/';
+    for (const url of [
+      'https://2130706433/disk.img',
+      'https://0177.0.0.1/disk.img',
+      'https://0x7f.0.0.1/disk.img',
+    ]) {
+      await withSession({ images: [] }, fetchFlags(allow, {
+        resolveUrl: async () => { throw new Error('dns'); },
+      }), async ({ mock, base, sessionId }) => {
+        await refusedFetch(base, sessionId, mock, { url, confirmImage: 'disk.img' }, /private/);
+      });
+    }
+  });
+
+  await t.test('a trailing-dot host matches the allowlist', async () => {
+    let seen = '';
+    await withSession({ images: [] }, fetchFlags(FETCH_ALLOW, {
+      resolveUrl: async (host) => {
+        seen = host;
+        return ['192.0.3.10'];
+      },
+    }), async ({ mock, base, sessionId }) => {
+      const started = await callTool(base, sessionId, 'pikvm_msd_fetch_url', {
+        url: 'https://images.example./iso/disk.img',
+        confirmImage: 'disk.img',
+      });
+      const { jobId } = JSON.parse(started.content[0].text);
+      const done = await pollJob(base, sessionId, jobId);
+      assert.equal(done.state, 'done');
+      assert.equal(seen, 'images.example');
+      assert.ok(mock.calls.some((call) => call.path === '/api/msd/write_remote'));
+    });
+  });
+
+  await t.test('derived names with encoded separators are refused', async () => {
+    const cases = [
+      ['dot slash', 'https://images.example/iso/%2e%2e%2fsecret.img', '../secret.img', /bare image name/],
+      ['slash', 'https://images.example/iso/foo%2Fbar.img', 'foo/bar.img', /bare image name/],
+      ['iso', 'https://images.example/iso', 'iso', /suffix/],
+    ];
+    for (const [label, url, confirmImage, pattern] of cases) {
+      await withSession({ images: [] }, fetchFlags(FETCH_ALLOW), async ({ mock, base, sessionId }) => {
+        const result = await callTool(base, sessionId, 'pikvm_msd_fetch_url', { url, confirmImage });
+        assert.equal(result.isError, true, label);
+        assert.match(result.content[0].text, pattern, label);
+        assert.deepEqual(mock.calls, [], label);
+      });
+    }
+  });
+
+  await t.test('confirmImage must echo the derived name', async () => {
+    await withSession({ images: [] }, fetchFlags(FETCH_ALLOW), async ({ mock, base, sessionId }) => {
+      const result = await callTool(base, sessionId, 'pikvm_msd_fetch_url', {
+        url: FETCH_URL,
+        confirmImage: 'other.img',
+      });
+      assert.equal(result.isError, true);
+      assert.match(result.content[0].text, /confirmImage does not match image/);
+      assert.deepEqual(mock.calls, []);
+    });
+  });
+
+  await t.test('a DNS failure makes no kvmd call', async () => {
+    await withSession({ images: [] }, fetchFlags(FETCH_ALLOW, {
+      resolveUrl: async () => { throw new Error('dns down'); },
+    }), async ({ mock, base, sessionId }) => {
+      await refusedFetch(base, sessionId, mock, {
+        url: FETCH_URL,
+        confirmImage: 'disk.img',
+      }, /did not resolve/);
+    });
+  });
+
+  await t.test('an early write_remote error does not remove', async () => {
+    const bodies = [
+      [400, 'ValidatorError', 'missing Content-Length for https://alice:s3cret@images.example/iso/disk.img?token=supersecret'],
+      [404, 'NotFoundError', 'not found'],
+      [400, 'MsdImageExistsError', 'image already exists'],
+    ];
+    for (const [status, error, errorMsg] of bodies) {
+      await withSession({
+        images: [],
+        routes: {
+          'POST /api/msd/write_remote': {
+            status,
+            body: { ok: false, result: { error, error_msg: errorMsg } },
+          },
+        },
+      }, fetchFlags(FETCH_ALLOW), async ({ mock, base, sessionId }) => {
+        const started = await callTool(base, sessionId, 'pikvm_msd_fetch_url', {
+          url: FETCH_URL,
+          confirmImage: 'disk.img',
+        });
+        const { jobId } = JSON.parse(started.content[0].text);
+        const failed = await pollJob(base, sessionId, jobId);
+        assert.equal(failed.state, 'failed', error);
+        assert.equal(failed.error.type, error, error);
+        assert.equal(failed.removed, undefined, error);
+        assert.equal(mock.calls.some((call) => call.path === '/api/msd/remove'), false, error);
+        assert.equal(`${failed.error.message}`.includes('s3cret'), false);
+        assert.equal(`${failed.error.message}`.includes('supersecret'), false);
+        assert.equal(`${failed.error.message}`.includes('token='), false);
+      });
+    }
+  });
+
+  await t.test('an error after another image progress does not remove', async () => {
+    await withSession({
+      images: ['other.img'],
+      remote: {
+        lines: [
+          JSON.stringify({ ok: true, result: { image: { name: 'other.img', size: 4, written: 2 } } }),
+          JSON.stringify({ ok: false, result: { error: 'MsdOperationError', error_msg: 'disk failed' } }),
+        ],
+      },
+    }, fetchFlags(FETCH_ALLOW), async ({ mock, base, sessionId }) => {
+      const started = await callTool(base, sessionId, 'pikvm_msd_fetch_url', {
+        url: FETCH_URL,
+        confirmImage: 'disk.img',
+      });
+      const { jobId } = JSON.parse(started.content[0].text);
+      const failed = await pollJob(base, sessionId, jobId);
+      assert.equal(failed.state, 'failed');
+      assert.equal(failed.removed, undefined);
+      assert.equal(mock.calls.some((call) => call.path === '/api/msd/remove'), false);
+      assert.ok(mock.state.images['other.img']);
+    });
+  });
+
+  await t.test('kvmd removing the incomplete image is already gone', async () => {
+    await withSession({
+      images: [],
+      remote: {
+        lines: [
+          JSON.stringify({ ok: true, result: { image: { name: 'disk.img', size: 4, written: 2 } } }),
+          JSON.stringify({ ok: false, result: { error: 'MsdOperationError', error_msg: 'disk failed' } }),
+        ],
+      },
+    }, fetchFlags(FETCH_ALLOW), async ({ mock, base, sessionId }) => {
+      const started = await callTool(base, sessionId, 'pikvm_msd_fetch_url', {
+        url: FETCH_URL,
+        confirmImage: 'disk.img',
+      });
+      const { jobId } = JSON.parse(started.content[0].text);
+      const failed = await pollJob(base, sessionId, jobId);
+      assert.equal(failed.state, 'failed');
+      assert.equal(failed.error.type, 'MsdOperationError');
+      assert.equal(failed.removed, true);
+      assert.equal(failed.removeError, undefined);
+      assert.ok(mock.calls.some((call) => call.path === '/api/msd/remove'));
+    });
+  });
+
+  await t.test('connect timeout is the value sent to write_remote', async () => {
+    await withSession({ images: [] }, fetchFlags(FETCH_ALLOW, {
+      connectTimeoutSec: 12,
+    }), async ({ mock, base, sessionId }) => {
+      const started = await callTool(base, sessionId, 'pikvm_msd_fetch_url', {
+        url: FETCH_URL,
+        confirmImage: 'disk.img',
+      });
+      const { jobId } = JSON.parse(started.content[0].text);
+      const done = await pollJob(base, sessionId, jobId);
+      assert.equal(done.state, 'done');
+      const call = mock.calls.find((item) => item.path === '/api/msd/write_remote');
+      assert.match(call.query, /timeout=12/);
+    });
   });
 });

@@ -6,6 +6,7 @@
 <!-- Modified 2026-10 by PLN: MSD upload jobs and remove (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: hashing jobs, bad-image cleanup, upload try-lock (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: URL fetch allowlist and Tailscale opt-in (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: metadata embeddings, connect timeout, and fetch cleanup (GPL-3.0; see NOTICE) -->
 
 # PiKVM MCP Server
 
@@ -90,7 +91,7 @@ PIKVM_MSD_IDLE_TIMEOUT_MS=60000
 
 `PIKVM_REQUEST_TIMEOUT_MS` is the abort deadline, in milliseconds, for one ordinary kvmd call. It must be a string of digits from 1 to 600000 (default 5000). `5000abc`, `1e3`, ` 5000 `, `5.5`, and `0` use the default. A value above 600000 is clamped to 600000. An idempotent GET that fails with a network error, a timeout, HTTP 502, or HTTP 503 is tried up to 3 times (backoff 250 ms, then 500 ms, plus a little jitter). POST is not retried. HTTP 500 and 504 are not retried. `GET /streamer/snapshot` retries HTTP 503 once after a 1500 ms grace period, for the ustreamer idle-stop race. That extra try does not use up one of the three attempts, so a snapshot can make at most 4 calls.
 
-`PIKVM_MSD_JOB_TIMEOUT_MS` (default 21600000, six hours) is the wall-clock ceiling for an MSD image upload or URL download. `PIKVM_MSD_IDLE_TIMEOUT_MS` (default 60000) is how long the upload body or the progress stream may sit still. Those two calls do not use `PIKVM_REQUEST_TIMEOUT_MS`, because kvmd does not answer an upload until it has read the body. A value that is not a string of digits, or 0, uses the default. The job ceiling is clamped to 7 days (604800000) and the idle gap to 1 hour (3600000). They are not clamped to the ten-minute ordinary-call cap.
+`PIKVM_MSD_JOB_TIMEOUT_MS` (default 21600000, six hours) is the wall-clock ceiling for an MSD image upload or URL download. `PIKVM_MSD_IDLE_TIMEOUT_MS` (default 60000) is how long the upload body or the progress stream may sit still. Those two calls do not use `PIKVM_REQUEST_TIMEOUT_MS`, because kvmd does not answer an upload until it has read the body. A value that is not a string of digits, or 0, uses the default. The job ceiling is clamped to 7 days (604800000) and the idle gap to 1 hour (3600000). They are not clamped to the ten-minute ordinary-call cap. `write_remote` `timeout=` is a separate connect timeout (`PIKVM_MSD_URL_CONNECT_TIMEOUT_SEC`, default 30 seconds). It is not this job ceiling.
 
 POST `/hid/*` uses its own ceiling, because kvmd answers only after the input has been applied and a client abort does not cancel that work. `/hid/print` waits `5s + 1.5 × (4·min(length,1024) + 2) × perEventSec + 5s`, and at least 10s. `perEventSec` is the `delay` value sent to kvmd (kvmd treats that number as seconds), or 0.02s when `slow` is set and `delay` is omitted, or 0 otherwise. When that ceiling expires the tool returns `PIKVM_HID_STATE_UNKNOWN` (`input may still be applying; do not resend`) and the call is not retried. A print whose estimate is above 50s is refused before any kvmd call, with a message to shorten the text or lower the delay. With `slow` and no `delay`, that line is 333 characters: 332 still fits under 50s, and 333 does not. kvmd itself accepts up to 1024 characters. PiKVM's nginx likely applies the default 60s `proxy_read_timeout` on `/api/`; that has not been confirmed on hardware. Every other HID POST (key, shortcut, mouse, wheel, reset) uses a fixed 30s ceiling and the same unknown-state error. A connection reset or other socket error after a HID POST was sent is also `PIKVM_HID_STATE_UNKNOWN` and is not retried. A failure before the request is sent, such as connection refused, stays `PIKVM_UNREACHABLE` and is not retried either.
 
@@ -152,14 +153,30 @@ PIKVM_MCP_NO_DOTENV=0
   to loopback, unspecified (`0.0.0.0/8`, `::`), RFC1918, other ULA (`fc00::/7`
   outside the Tailscale range), multicast, or broadcast. It does not allow
   Tailscale/CGNAT (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`); those need a CIDR
-  opt-in. Link-local and metadata (`169.254.0.0/16`, `fe80::/10`, and the
-  IPv4-mapped forms of every denied range) stay denied even when this is `1`
-  and even when the host is allowlisted. Default `0`.
-- **Redirect and DNS rebinding.** kvmd's downloader follows redirects and
-  resolves DNS itself. This server does not send a `redirect: 'manual'` HEAD
-  before the download. Allowlist only operator-controlled hosts that do not
-  redirect. A name that changes address after the check can still be fetched
-  by kvmd.
+  opt-in. Link-local and metadata stay denied even when this is `1` and even
+  when the host is allowlisted: `169.254.0.0/16`, `fe80::/10`, the AWS IPv6
+  metadata address `fd00:ec2::254`, Tailscale's own service addresses
+  `100.100.100.100`, `100.100.100.200`, and `fd7a:115c:a1e0::53`, and the
+  IPv4-mapped forms of every denied range. An IPv4 address embedded in
+  `::/96`, `64:ff9b::/96`, `64:ff9b:1::/48`, or `2002::/16` is extracted and
+  checked with those same IPv4 rules, so a metadata embedding stays denied
+  and a private embedding follows this flag. Reserved and documentation
+  ranges stay denied too (`240.0.0.0/4`, `198.18.0.0/15`, `192.0.0.0/24`,
+  `192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`, `fec0::/10`,
+  `2001:db8::/32`). A literal allowlist host in an always-denied range is
+  rejected when the config loads. Default `0`.
+- **`PIKVM_MSD_URL_CONNECT_TIMEOUT_SEC`** — connect timeout sent to kvmd as
+  `write_remote` `timeout=` (aiohttp `sock_connect`). Digits only, default
+  30, clamped to 120. This is not the job wall clock. The job still uses
+  `PIKVM_MSD_JOB_TIMEOUT_MS`.
+- **Redirect and DNS.** The MCP host's DNS answers can differ from the
+  PiKVM's. kvmd (aiohttp) follows up to 10 redirects, including an https to
+  http downgrade, and resolves DNS itself. This server does not send a
+  `redirect: 'manual'` HEAD before the download. Allowlist only
+  operator-controlled hosts that do not redirect. A name that changes
+  address after the check can still be fetched by kvmd. kvmd logs the full
+  URL, including userinfo and the query string, in the PiKVM journal. Error
+  text from this server drops both.
 - **`PIKVM_MCP_NO_DOTENV`** — set `1` to skip `.env` loading entirely (for
   systemd/gateway units that export env directly; a stray `.env` on disk must
   not win). Only read from the real process environment, so a `.env` cannot
@@ -268,11 +285,11 @@ Or if using the .env file:
 - **`pikvm_msd_mount`** - Select an image and connect the virtual drive (required: image, mode `cdrom` or `flash`, confirmImage; optional: rw, connect, expectImage, device). `confirmImage` must equal `image`. When a drive is already connected, `expectImage` must equal that image or the mount is refused and the drive stays connected. An `expectImage` supplied while the drive is disconnected must equal the snapshot image too. The image must already be in storage and complete. A mount of an image that has an active upload or fetch is refused with `MsdImageTransferError` and no POST. Returns the drive re-read after the change. On failure the previous selection is restored. An NBD or URL snapshot image cannot be restored, because `set_params` refuses a name that contains `://`.
 - **`pikvm_msd_eject`** - Disconnect the virtual drive (required: expectImage; optional: device). `expectImage` must equal the current image name, or `""` when none is selected. A second eject returns `alreadyDisconnected`. Any other kvmd error is returned as an error.
 - **`pikvm_msd_upload`** - Upload a bare file name from `PIKVM_MSD_LOCAL_DIR` (required: file, confirmImage; optional: sha256, device). Returns `{jobId}` immediately after the file is confined. Hashing and the kvmd pre-check run in the job (`hashing`, then `running`). A sha256 mismatch fails the job and makes no upload POST. A second upload or fetch while one is running is refused. If a check after the stream fails, the stored image is removed. `PIKVM_MSD_STATE_UNKNOWN` from `msdWrite` or `msdWriteRemote` skips that cleanup by design: the server does not know whether kvmd kept the image. The transfer does not change the drive. Hidden while `PIKVM_MSD_LOCAL_DIR` is unset.
-- **`pikvm_msd_fetch_url`** - Download an allowlisted https URL with kvmd `write_remote` (required: url, confirmImage; optional: image, device). Returns `{jobId}` immediately after the URL and image name are accepted. `image` defaults to the URL's last path segment and uses the same bare-name rules as upload. `confirmImage` must equal that name. The job sends `remove_incomplete=1`, `verify=1` (`insecure` is never sent), and `timeout=` from `PIKVM_MSD_JOB_TIMEOUT_MS` in seconds. NDJSON progress becomes `bytes` and `total`. DNS, the address check, and the kvmd pre-check run in the job. Hidden while the allowlist has no https entry. Gated by `PIKVM_MCP_ARM_MSD`.
+- **`pikvm_msd_fetch_url`** - Download an allowlisted https URL with kvmd `write_remote` (required: url, confirmImage; optional: image, device). Returns `{jobId}` immediately after the URL and image name are accepted. `image` defaults to the URL's last path segment and uses the same bare-name rules as upload. `confirmImage` must equal that name. The job sends `remove_incomplete=1`, `verify=1` (`insecure` is never sent), and `timeout=` from `PIKVM_MSD_URL_CONNECT_TIMEOUT_SEC` (the downloader connect timeout, default 30 seconds). The job wall clock stays `PIKVM_MSD_JOB_TIMEOUT_MS`. NDJSON progress becomes `bytes` and `total`. DNS, the address check, and the kvmd pre-check run in the job. A fragment is not sent. Cleanup of an incomplete image runs only after an NDJSON progress line for this image. A short stream is `PIKVM_MSD_STATE_UNKNOWN` from `msdWriteRemote` and skips cleanup; `written != size` is not a separate cleanup signal. `MsdUnknownImageError` from remove means kvmd already deleted the file. Hidden while the allowlist has no https entry. Gated by `PIKVM_MCP_ARM_MSD`. https only.
 - **`pikvm_msd_job`** - Read that job: `{state, bytes, total, sha256?, error?, removed?, removeError?}`. `state` is `hashing`, `running`, `done`, or `failed`. Finished jobs are dropped after 24 hours. Read-only.
 - **`pikvm_msd_remove`** - Remove a stored image (required: image, confirmImage; optional: device). Refuses while the drive is connected and does not disconnect it.
 
-In HTTP mode, MSD changes stay disarmed until `PIKVM_MCP_ARM_MSD=1`. Status and job stay available. stdio is not gated. Mount and eject share one lock per device. A second upload or fetch fails immediately instead of queueing, and a transfer does not queue mount or eject. Logs for a fetch are one JSON line and do not include URL userinfo or the query string. Error text has URL userinfo removed.
+In HTTP mode, MSD changes stay disarmed until `PIKVM_MCP_ARM_MSD=1`. Status and job stay available. stdio is not gated. Mount and eject share one lock per device. A second upload or fetch fails immediately instead of queueing, and a transfer does not queue mount or eject. Logs for a fetch are one JSON line and do not include URL userinfo or the query string. Error text has URL userinfo and the query string removed. kvmd logs the full URL in the PiKVM journal.
 
 ## Skills (Prompts & Skill Tools)
 

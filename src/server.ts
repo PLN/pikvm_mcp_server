@@ -4,6 +4,7 @@
 // Modified 2026-10 by PLN: upload, job, and remove tools (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: hashing jobs and typed upload errors (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: URL fetch tool and transfer mount block (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: write_remote connect timeout (GPL-3.0; see NOTICE).
 
 /**
  * MCP server factory for PiKVM tools
@@ -28,7 +29,12 @@ import type { BusyLock } from './pikvm/lock.js';
 import { autoCalibrateWithRetries } from './pikvm/auto-calibrate.js';
 import { allPrompts, getPromptByName } from './prompts/index.js';
 import { skillTools, isSkillTool, handleSkillToolCall } from './prompts/skill-tools.js';
-import { MSD_EXTENSIONS_DEFAULT, MSD_MAX_BYTES_DEFAULT, type MsdConfig } from './config.js';
+import {
+  MSD_EXTENSIONS_DEFAULT,
+  MSD_MAX_BYTES_DEFAULT,
+  MSD_URL_CONNECT_TIMEOUT_DEFAULT_SEC,
+  type MsdConfig,
+} from './config.js';
 import {
   ejectMsd,
   mountMsd,
@@ -1170,7 +1176,7 @@ export function createMcpServer(deps: McpServerDeps): Server {
             extensions: deps.msd?.extensions ?? MSD_EXTENSIONS_DEFAULT,
             allow,
             allowPrivate: deps.msd?.allowPrivate === true,
-            remoteTimeoutSec: deps.msd?.remoteTimeoutSec ?? 21600,
+            connectTimeoutSec: deps.msd?.connectTimeoutSec ?? MSD_URL_CONNECT_TIMEOUT_DEFAULT_SEC,
             resolveUrl: deps.msd?.resolveUrl,
             beforeFetch: deps.msd?.beforeFetch,
             jobLimit: deps.msd?.jobLimit,

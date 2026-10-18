@@ -3,6 +3,7 @@
 // Modified 2026-10 by PLN: upload jobs, remove, and job lock (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: hashing jobs, bad-image cleanup, upload try-lock (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: URL fetch jobs and mount block during a transfer (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: fetch cleanup only after our progress line (GPL-3.0; see NOTICE).
 
 /**
  * Policy for MSD status, mount, eject, upload, and remove.
@@ -657,6 +658,9 @@ async function removeUploadedImage(
     await withMsdLock(device, () => client.msdRemove(image));
     return { removed: true };
   } catch (err) {
+    if (err instanceof KvmdError && err.type === 'MsdUnknownImageError') {
+      return { removed: true };
+    }
     return { removed: false, removeError: errorFields(err) };
   }
 }
@@ -831,8 +835,8 @@ export interface FetchRequest {
   extensions: readonly string[];
   allow: UrlAllowlist;
   allowPrivate: boolean;
-  /** kvmd write_remote timeout in seconds. */
-  remoteTimeoutSec: number;
+  /** kvmd downloader connect timeout in seconds. Not the job wall clock. */
+  connectTimeoutSec: number;
   resolveUrl?: (hostname: string) => Promise<string[]>;
   /** Awaited in the job before DNS. Unset in production. */
   beforeFetch?: () => Promise<void>;
@@ -860,31 +864,36 @@ async function runFetch(
   job: JobRecord,
 ): Promise<void> {
   const { device } = request;
-  let started = false;
+  let sawOurImage = false;
   try {
     if (request.beforeFetch) await request.beforeFetch();
     const addresses = await resolveFetchHost(inspected.hostname, request.resolveUrl);
     assertResolvedAddresses(addresses, request.allow, request.allowPrivate);
     await assertFetchAllowed(client, image);
-    started = true;
     let last: MsdWriteResult | undefined;
     for await (const row of client.msdWriteRemote(inspected.href, {
       image,
       removeIncomplete: true,
-      timeout: request.remoteTimeoutSec,
+      timeout: request.connectTimeoutSec,
     })) {
       last = row;
+      if (row.name === image) sawOurImage = true;
       job.bytes = row.written;
       job.total = row.size;
     }
-    if (!last || last.written !== last.size) throw new Error('written does not match size');
+    // msdWriteRemote throws PIKVM_MSD_STATE_UNKNOWN when the stream ends
+    // with written !== size. That happens before this line, and the catch
+    // below does not remove the image for that error.
+    if (!last || !sawOurImage) {
+      throw new Error('write_remote ended without progress for this image');
+    }
     job.bytes = last.written;
     job.total = last.size;
     job.state = 'done';
     job.finishedAt = Date.now();
     logMsd('msd_fetch', device, image, true, undefined, { bytes: last.written });
   } catch (err) {
-    if (started && !isStateUnknown(err)) {
+    if (sawOurImage && !isStateUnknown(err)) {
       const cleanup = await removeUploadedImage(client, image, device);
       job.removed = cleanup.removed;
       if (cleanup.removeError) job.removeError = cleanup.removeError;

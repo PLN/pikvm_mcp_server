@@ -4,6 +4,7 @@ Modified 2026-10 by PLN: mount expectImage, preflight, and MSD mutex (GPL-3.0; s
 Modified 2026-10 by PLN: MSD upload jobs and remove (GPL-3.0; see below).
 Modified 2026-10 by PLN: hashing jobs, bad-image cleanup, upload try-lock (GPL-3.0; see below).
 Modified 2026-10 by PLN: URL fetch allowlist and Tailscale opt-in (GPL-3.0; see below).
+Modified 2026-10 by PLN: metadata embeddings, connect timeout, and fetch cleanup (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -297,3 +298,21 @@ No code from another pikvm_mcp_server fork was added for these methods.
   a redirect manual HEAD. kvmd's downloader (v4.227, already cited)
   follows redirects and resolves DNS itself, so an allowlisted host can
   still redirect. No code from another pikvm_mcp_server fork was added.
+
+2026-10, by PLN:
+  Always-deny now includes fd00:ec2::254, Tailscale service addresses
+  100.100.100.100, 100.100.100.200, and fd7a:115c:a1e0::53, checked
+  before the Tailscale opt-in and before ALLOW_PRIVATE. IPv4 embedded
+  in ::/96, 64:ff9b::/96, 64:ff9b:1::/48, and 2002::/16 is extracted
+  and classified with the IPv4 policy, so a metadata embedding stays
+  denied and a private embedding follows ALLOW_PRIVATE. Reserved and
+  documentation ranges are denied. A literal allowlist host in an
+  always-denied range is rejected at config load. write_remote
+  timeout= is the downloader connect timeout (default 30 seconds,
+  PIKVM_MSD_URL_CONNECT_TIMEOUT_SEC), not the 6 hour job wall clock.
+  Cleanup runs only after an NDJSON progress line for this image.
+  A short stream is PIKVM_MSD_STATE_UNKNOWN and still skips cleanup.
+  MsdUnknownImageError from remove means the image is already gone.
+  Error text drops URL userinfo and the query string. kvmd logs the
+  full URL in the PiKVM journal. No code from another pikvm_mcp_server
+  fork was added.
