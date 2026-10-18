@@ -3,6 +3,7 @@
 // Modified 2026-10 by PLN: deny 64:ff9b:1::/48 and non-global wrapped IPv4 (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: normalized fetch host, named allowlist errors (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: redact an error chain (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: redact a non-Error cause (GPL-3.0; see NOTICE).
 
 /**
  * https allowlist and address checks for pikvm_msd_fetch_url.
@@ -97,20 +98,39 @@ interface CodedError extends Error {
 
 /** Copy an error with userinfo and query removed, keeping code and cause. */
 export function redactError(err: unknown): Error {
-  return copyRedacted(err, new Set());
+  return copyRedacted(err, new Map());
 }
 
-function copyRedacted(err: unknown, seen: Set<unknown>): Error {
+function copyRedacted(err: unknown, seen: Map<object, unknown>): Error {
   if (!(err instanceof Error)) return new Error(redactUrl(String(err)));
-  if (seen.has(err)) return new Error(redactUrl(err.message));
-  seen.add(err);
+  const existing = seen.get(err);
+  if (existing instanceof Error) return existing;
   const copy = new Error(redactUrl(err.message));
+  seen.set(err, copy);
   copy.name = err.name;
   const coded = err as CodedError;
   if (typeof coded.code === 'string') (copy as CodedError).code = coded.code;
   if (typeof coded.type === 'string') (copy as CodedError).type = coded.type;
-  if (err.cause !== undefined) {
-    copy.cause = err.cause instanceof Error ? copyRedacted(err.cause, seen) : err.cause;
+  if (err.cause !== undefined) copy.cause = redactValue(err.cause, seen);
+  return copy;
+}
+
+function redactValue(value: unknown, seen: Map<object, unknown>): unknown {
+  if (typeof value === 'string') return redactUrl(value);
+  if (value instanceof Error) return copyRedacted(value, seen);
+  if (value === null || typeof value !== 'object') return value;
+  const existing = seen.get(value);
+  if (existing !== undefined) return existing;
+  if (Array.isArray(value)) {
+    const copy: unknown[] = [];
+    seen.set(value, copy);
+    for (const item of value) copy.push(redactValue(item, seen));
+    return copy;
+  }
+  const copy: Record<string, unknown> = {};
+  seen.set(value, copy);
+  for (const key of Object.keys(value)) {
+    copy[key] = redactValue((value as Record<string, unknown>)[key], seen);
   }
   return copy;
 }

@@ -2,6 +2,7 @@
 // Modified 2026-10 by PLN: metadata embeddings, Tailscale services, reserved ranges (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: local NAT64 and non-global wrapped IPv4 (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: redactUrl, named allowlist errors, trailing-dot href (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: redactError covers string, object, and cyclic causes (GPL-3.0; see NOTICE).
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -10,6 +11,7 @@ import {
   assertResolvedAddresses,
   inspectFetchUrl,
   parseUrlAllowlist,
+  redactError,
   redactUrl,
 } from '../dist/url-policy.js';
 
@@ -24,6 +26,45 @@ test('redactUrl drops userinfo at the last at and drops the query', () => {
   assert.equal(redacted.includes('keep'), false);
   assert.equal(redacted.includes('frag'), false);
   assert.equal(redacted, 'failed https://images.example/disk.img');
+});
+
+test('redactError redacts an Error cause, a string, an object url, and a cycle', () => {
+  const secret = 'https://admin:SECRETPW@127.0.0.1/kvm?token=TOK';
+  const inner = new Error(secret);
+  inner.code = 'E_INNER';
+  const withError = new Error('outer');
+  withError.cause = inner;
+  const copied = redactError(withError);
+  const innerCopy = copied.cause;
+  assert.equal(innerCopy.message, 'https://127.0.0.1/kvm');
+  assert.equal(innerCopy.code, 'E_INNER');
+  assert.equal(innerCopy.message.includes('SECRETPW'), false);
+  assert.equal(innerCopy.message.includes('TOK'), false);
+
+  const withString = new Error('outer');
+  withString.cause = secret;
+  assert.equal(redactError(withString).cause, 'https://127.0.0.1/kvm');
+
+  const withObject = new Error('outer');
+  withObject.cause = { url: secret, n: 1 };
+  const objectCopy = redactError(withObject).cause;
+  assert.equal(objectCopy.url, 'https://127.0.0.1/kvm');
+  assert.equal(objectCopy.n, 1);
+  assert.equal(JSON.stringify(objectCopy).includes('SECRETPW'), false);
+  assert.equal(JSON.stringify(objectCopy).includes('TOK'), false);
+
+  const loop = new Error(secret);
+  loop.cause = loop;
+  const loopCopy = redactError(loop);
+  assert.equal(loopCopy.message, 'https://127.0.0.1/kvm');
+  assert.equal(loopCopy.cause, loopCopy);
+  const box = { url: secret };
+  box.self = box;
+  const boxed = new Error('outer');
+  boxed.cause = box;
+  const boxCopy = redactError(boxed).cause;
+  assert.equal(boxCopy.url, 'https://127.0.0.1/kvm');
+  assert.equal(boxCopy.self, boxCopy);
 });
 
 test('allowlist parses https prefixes and tailscale CIDRs', () => {

@@ -27,6 +27,7 @@ Modified 2026-10 by PLN: device registry (GPL-3.0; see below).
 Modified 2026-10 by PLN: listed host is an origin (GPL-3.0; see below).
 Modified 2026-10 by PLN: duplicate devices, a shared origin, and a per-device job cap (GPL-3.0; see below).
 Modified 2026-10 by PLN: test certificate serials are minimal DER (GPL-3.0; see below).
+Modified 2026-10 by PLN: redact a non-Error cause, and one host across schemes (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -629,3 +630,10 @@ No code from another pikvm_mcp_server fork was added for these methods.
   with 0x00. A 0x00 0x12 serial used to be non-minimal DER, and
   OpenSSL rejected it as illegal padding. Leaf keyUsage 0xa0 declares
   five unused bits. No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  redactError redacts a string cause and the string fields of a plain
+  object cause, including a url. A cause that points at itself is
+  copied once. http://h and https://h are the same device, and so are
+  two schemes on the same explicit port. The error names both devices.
+  No code from another pikvm_mcp_server fork was copied.

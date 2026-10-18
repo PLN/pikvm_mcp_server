@@ -1,6 +1,7 @@
 // Modified 2026-10 by PLN: device registry tests (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: legacy listed host is an origin (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: duplicate devices, shared origin, and per-device job cap (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: http and https on one host are the same device (GPL-3.0; see NOTICE).
 
 /**
  * Registry parsing, per-device locks, and the hardware hwTest gate.
@@ -167,6 +168,14 @@ describe('device registry', { concurrency: false }, () => {
           lab1: device({ host: 'https://100.64.0.8/kvm', passwordFile, tls: { mode: 'insecure' } }),
           lab2: device({ host: 'https://100.64.0.8:443', passwordFile, tls: { mode: 'insecure' } }),
         }, 'lab1'), /registry devices "lab1" and "lab2" use the same origin/],
+        [registryJson({
+          lab1: device({ host: 'http://pikvm.example.ts.net', passwordFile, tls: { mode: 'insecure' } }),
+          lab2: device({ host: 'https://pikvm.example.ts.net', passwordFile, tls: { mode: 'insecure' } }),
+        }, 'lab1'), /registry devices "lab1" and "lab2" use the same host/],
+        [registryJson({
+          lab1: device({ host: 'http://100.64.0.8:8443', passwordFile, tls: { mode: 'insecure' } }),
+          lab2: device({ host: 'https://100.64.0.8:8443/kvm', passwordFile, tls: { mode: 'insecure' } }),
+        }, 'lab1'), /registry devices "lab1" and "lab2" use the same host/],
         ['{', /invalid JSON/],
       ];
       for (const [json, pattern] of cases) {

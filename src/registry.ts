@@ -1,5 +1,6 @@
 // Modified 2026-10 by PLN: device registry (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: reject a duplicate device key and a shared origin (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: http and https on one host are the same device (GPL-3.0; see NOTICE).
 // Host normalisation follows the idea of dtrukr/pikvm_mcp_server
 // normalizeHost at 097b529 (GPL-3.0, a fork of
 // KultivatorConsulting/pikvm_mcp_server). This file is written fresh.
@@ -288,17 +289,30 @@ export function parseDeviceRegistry(
   for (const name of names) {
     devices.set(name, parseDevice(name, value.devices[name], env, requirePinnedCert));
   }
-  const origins = new Map<string, string>();
+  const seen = new Map<string, { name: string; origin: string }>();
   for (const [name, device] of devices) {
-    const previous = origins.get(device.host);
+    const key = deviceEndpointKey(device.host);
+    const previous = seen.get(key);
     if (previous !== undefined) {
+      const why = previous.origin === device.host ? 'use the same origin' : 'use the same host';
       throw new Error(
-        `registry devices ${JSON.stringify(previous)} and ${JSON.stringify(name)} use the same origin`,
+        `registry devices ${JSON.stringify(previous.name)} and ${JSON.stringify(name)} ${why}`,
       );
     }
-    origins.set(device.host, name);
+    seen.set(key, { name, origin: device.host });
   }
   return { defaultName, devices };
+}
+
+/**
+ * Hostname plus an explicit port. A scheme-default port is omitted, so
+ * http://h and https://h share a key. The same explicit port shares a
+ * key across schemes.
+ */
+function deviceEndpointKey(origin: string): string {
+  const url = new URL(origin);
+  if (url.port === '') return url.hostname;
+  return `${url.hostname}:${url.port}`;
 }
 
 /** Repeated device name in the raw devices object, if there is one. */
