@@ -14,6 +14,7 @@
 <!-- Modified 2026-10 by PLN: opt-in hardware suite (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: password and bearer secret files (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: empty secret vars are unset (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: bearer whitespace is HTTP-only (GPL-3.0; see NOTICE) -->
 
 # PiKVM MCP Server
 
@@ -108,7 +109,7 @@ PIKVM_MSD_IDLE_TIMEOUT_MS=60000
 | `PIKVM_MCP_BEARER_FILE` | Path of a regular file holding the bearer. An empty value is unset. |
 | `CREDENTIALS_DIRECTORY` | systemd `LoadCredential` directory. Consulted only when it is set, and only for a secret that was not set above. A missing credential file means that secret is unset. |
 
-A direct value is used verbatim, including a trailing newline. Only file bytes lose exactly one trailing newline (`\n` or `\r\n`) and a leading UTF-8 BOM. Other whitespace, including a trailing space or a second newline, stays. Empty file content is a startup error. A NUL byte in a file is an error that names the variable and the path. An empty direct value and an empty `*_FILE` are unset and fall through. Symlinks are followed. The file is opened non-blocking and the opened target must be a regular file: a directory, FIFO, socket, or device is rejected, and a FIFO open does not wait. A mode with any group or other bits (looser than `0600`) is warned on stderr, with the variable name, the path, and the mode, never the value. That mode check is skipped on Windows. A file larger than 64 KiB is rejected before the body is read. A missing or unreadable `*_FILE` is a startup error that names the variable and the path. If the direct variable and `*_FILE` are both non-empty, the direct variable wins and one stderr line says the file variable was ignored. A bearer with leading or trailing whitespace is rejected at startup; the error names `PIKVM_MCP_BEARER` and not the value. None of these messages include the secret.
+A direct value is used verbatim, including a trailing newline. Only file bytes lose exactly one trailing newline (`\n` or `\r\n`) and a leading UTF-8 BOM. Other whitespace, including a trailing space or a second newline, stays. Empty file content is a startup error. A NUL byte in a file is an error that names the variable and the path. An empty direct value and an empty `*_FILE` are unset and fall through. Symlinks are followed. The file is opened non-blocking and the opened target must be a regular file: a directory, FIFO, socket, or device is rejected, and a FIFO open does not wait. A mode with any group or other bits (looser than `0600`) is warned on stderr, with the variable name, the path, and the mode, never the value. That mode check is skipped on Windows. A file larger than 64 KiB is rejected before the body is read. A missing or unreadable `*_FILE` is a startup error that names the variable and the path. If the direct variable and `*_FILE` are both non-empty, the direct variable wins and one stderr line says the file variable was ignored. In HTTP mode, a bearer with leading or trailing whitespace is rejected at startup. stdio does not use the bearer, so the same value still starts. The error names `PIKVM_MCP_BEARER` and not the value. None of these messages include the secret.
 
 ```ini
 # /etc/systemd/system/pikvm-mcp.service.d/credentials.conf

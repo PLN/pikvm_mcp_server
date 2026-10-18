@@ -1,4 +1,5 @@
 // Modified 2026-10 by PLN: empty bearer is unset (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: bearer whitespace is HTTP-only (GPL-3.0; see NOTICE).
 /**
  * Startup-mode tests — real `node dist/index.js` spawns covering the
  * process-level behaviors the in-process tests can't reach.
@@ -110,4 +111,51 @@ test('an empty bearer in stdio mode starts', { timeout: 15000 }, async () => {
   await new Promise((resolve) => started.child.once('exit', resolve));
   assert.equal(started.text().includes('is empty'), false);
   assert.equal(started.text().includes('PIKVM_MCP_BEARER must be set'), false);
+});
+
+test('stdio starts when the bearer contains a trailing newline', { timeout: 15000 }, async () => {
+  const env = baseEnv({ PIKVM_MCP_BEARER: 'tok\n' });
+  delete env.PIKVM_MCP_PORT;
+  const started = spawnIndex(env);
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      started.child.kill('SIGKILL');
+      reject(new Error(`stdio did not start. stderr so far: ${started.text()}`));
+    }, 12000);
+    started.child.stderr.on('data', () => {
+      if (started.text().includes('PiKVM MCP Server running')) {
+        clearTimeout(timer);
+        resolve();
+      }
+    });
+    started.child.once('exit', () => {
+      clearTimeout(timer);
+      reject(new Error(`stdio exited early: ${started.text()}`));
+    });
+  });
+  started.child.kill('SIGTERM');
+  await new Promise((resolve) => started.child.once('exit', resolve));
+  assert.equal(started.text().includes('whitespace'), false);
+  assert.equal(started.text().includes('tok'), false);
+});
+
+test('HTTP mode refuses a bearer with a trailing newline', { timeout: 15000 }, async () => {
+  const started = spawnIndex(baseEnv({
+    PIKVM_MCP_PORT: '8974',
+    PIKVM_MCP_BEARER: 'tok\n',
+  }));
+  const exit = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      started.child.kill('SIGKILL');
+      reject(new Error(`whitespace bearer did not exit. stderr so far: ${started.text()}`));
+    }, 12000);
+    started.child.on('exit', (code) => {
+      clearTimeout(timer);
+      resolve(code);
+    });
+  });
+  assert.notEqual(exit, 0);
+  assert.match(started.text(), /PIKVM_MCP_BEARER/);
+  assert.match(started.text(), /whitespace/);
+  assert.equal(started.text().includes('tok'), false);
 });

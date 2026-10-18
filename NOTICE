@@ -18,6 +18,7 @@ Modified 2026-10 by PLN: hardware ISO, net check, and cleanup names (GPL-3.0; se
 Modified 2026-10 by PLN: password and bearer secret files (GPL-3.0; see below).
 Modified 2026-10 by PLN: empty secret vars are unset (GPL-3.0; see below).
 Modified 2026-10 by PLN: restore leftover images and reject fetch bad ports (GPL-3.0; see below).
+Modified 2026-10 by PLN: bearer whitespace check is HTTP-only (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -489,6 +490,13 @@ No code from another pikvm_mcp_server fork was added for these methods.
   PIKVM_MCP_BEARER_FILE, and CREDENTIALS_DIRECTORY/pikvm-mcp-bearer.
   A bearer with leading or trailing whitespace is rejected at startup
   by name only. No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  The bearer whitespace check runs only when PIKVM_MCP_PORT selects HTTP
+  mode. stdio does not send that bearer, so a token with surrounding
+  whitespace does not stop a stdio process. The HTTP error still names
+  PIKVM_MCP_BEARER and not the value. No code from another
+  pikvm_mcp_server fork was copied.
 
 2026-10, by PLN:
   Hardware cleanup restores the snapshot image when this run did not
