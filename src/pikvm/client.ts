@@ -7,6 +7,7 @@
 // Modified 2026-10 by PLN: connect timeout and DNS map to unreachable (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: pikvm_type delay is milliseconds (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: header and body timeouts stay timeouts (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: TLS verify, pin, and insecure modes (GPL-3.0; see NOTICE).
 // AbortSignal.timeout and PIKVM_UNREACHABLE / PIKVM_AUTH_FAILED no-retry codes
 // adapted from dtrukr/pikvm_mcp_server src/pikvm/client.ts @ d120243 (GPL-3.0).
 // Snapshot HTTP 503 retry-once adapted from dvaerum/pikvm_mcp_server
@@ -55,8 +56,16 @@
  */
 
 import { Readable } from 'node:stream';
-import { Agent, fetch, request as undiciRequest } from 'undici';
-import type { Dispatcher } from 'undici';
+import { fetch, request as undiciRequest } from 'undici';
+import type { Agent, Dispatcher } from 'undici';
+import {
+  TLS_PIN_MISMATCH,
+  TLS_VERIFY_FAILED,
+  classifyTlsFailure,
+  createKvmdAgent,
+  deviceTlsFrom,
+  type DeviceTls,
+} from '../tls.js';
 import sharp from 'sharp';
 import {
   HID_OTHER_DEADLINE_MS,
@@ -80,6 +89,11 @@ export interface PiKVMConfig {
   username: string;
   password: string;
   verifySsl?: boolean;
+  /**
+   * Per-device TLS. Only "default" is used until the registry.
+   * TODO(registry): Phase B item 10 selects this by device name.
+   */
+  tls?: { default: DeviceTls };
   defaultKeymap?: string;
   /** Abort deadline for one ordinary kvmd call. Default 5000. */
   requestTimeoutMs?: number;
@@ -375,7 +389,11 @@ function isPreSendFailure(err: unknown): boolean {
   return errorCodes(err).some((code) => PRE_SEND_CODES.has(code));
 }
 
-function transportError(err: unknown, endpoint: string, hid: boolean): KvmdError {
+function transportError(err: unknown, endpoint: string, hid: boolean, device = 'default'): KvmdError {
+  const tlsFailure = classifyTlsFailure(err, device);
+  if (tlsFailure) {
+    return new KvmdError(0, tlsFailure.type, tlsFailure.message, endpoint);
+  }
   // A connect timeout or DNS failure can sit under a TimeoutError.
   // Nothing was sent, so this stays unreachable rather than a timeout.
   if (isPreSendFailure(err)) {
@@ -395,6 +413,7 @@ function transportError(err: unknown, endpoint: string, hid: boolean): KvmdError
 
 function isRetryableGetError(err: KvmdError): boolean {
   if (err.type === 'PIKVM_HID_STATE_UNKNOWN') return false;
+  if (err.type === TLS_PIN_MISMATCH || err.type === TLS_VERIFY_FAILED) return false;
   if (err.type === 'PIKVM_UNREACHABLE' || err.type === 'PIKVM_TIMEOUT') return true;
   return err.status === 502 || err.status === 503;
 }
@@ -690,8 +709,17 @@ export function redactionPassword(client: PiKVMClient): string {
   return redactionPasswords.get(client) ?? '';
 }
 
+interface ResolvedPiKVMConfig extends PiKVMConfig {
+  verifySsl: boolean;
+  defaultKeymap: string;
+  requestTimeoutMs: number;
+  msdJobTimeoutMs: number;
+  msdIdleTimeoutMs: number;
+  tls: { default: DeviceTls };
+}
+
 export class PiKVMClient {
-  private config: Required<PiKVMConfig>;
+  private config: ResolvedPiKVMConfig;
   private dispatcher: Agent;
   private cachedResolution: ScreenResolution | null = null;
   private screenshotScale: {
@@ -701,7 +729,7 @@ export class PiKVMClient {
   private calibration: CalibrationState | null = null;
 
   constructor(config: PiKVMConfig) {
-    this.config = {
+    const base = {
       verifySsl: false,
       defaultKeymap: 'en-us',
       requestTimeoutMs: 5000,
@@ -709,35 +737,41 @@ export class PiKVMClient {
       msdIdleTimeoutMs: MSD_IDLE_TIMEOUT_DEFAULT_MS,
       ...config,
     };
-    this.config.requestTimeoutMs = clampRequestTimeoutMs(this.config.requestTimeoutMs);
-    this.config.msdJobTimeoutMs = normalizeMsdTimeoutMs(
-      this.config.msdJobTimeoutMs,
+    base.requestTimeoutMs = clampRequestTimeoutMs(base.requestTimeoutMs);
+    base.msdJobTimeoutMs = normalizeMsdTimeoutMs(
+      base.msdJobTimeoutMs,
       MSD_JOB_TIMEOUT_DEFAULT_MS,
       MSD_JOB_TIMEOUT_MAX_MS,
     );
-    this.config.msdIdleTimeoutMs = normalizeMsdTimeoutMs(
-      this.config.msdIdleTimeoutMs,
+    base.msdIdleTimeoutMs = normalizeMsdTimeoutMs(
+      base.msdIdleTimeoutMs,
       MSD_IDLE_TIMEOUT_DEFAULT_MS,
       MSD_IDLE_TIMEOUT_MAX_MS,
     );
+    const resolved: ResolvedPiKVMConfig = {
+      ...base,
+      tls: {
+        default: deviceTlsFrom({
+          host: base.host,
+          verifySsl: base.verifySsl,
+          tls: config.tls,
+        }),
+      },
+    };
+    this.config = resolved;
     redactionPasswords.set(this, this.config.password);
 
     // headersTimeout and bodyTimeout 0 turn off undici's 300s defaults.
     // Each call sets its own AbortSignal, including HID ceilings.
-    this.dispatcher = new Agent({
-      connect: {
-        rejectUnauthorized: this.config.verifySsl,
-      },
-      headersTimeout: 0,
-      bodyTimeout: 0,
-    });
+    // The same agent is used for GET, POST, HID, and both MSD upload paths.
+    this.dispatcher = createKvmdAgent(this.config, { headersTimeout: 0, bodyTimeout: 0 });
   }
 
   /**
-   * Close any resources (no-op for REST-only client, kept for API compatibility)
+   * Close the kvmd dispatcher.
    */
-  close(): void {
-    // No resources to close when using REST API only
+  async close(): Promise<void> {
+    await this.dispatcher.close();
   }
 
   /**
@@ -829,7 +863,7 @@ export class PiKVMClient {
         signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (err) {
-      throw transportError(err, endpoint, hidPost);
+      throw transportError(err, endpoint, hidPost, this.config.tls.default.device);
     }
 
     if (!response.ok) {
@@ -946,7 +980,7 @@ export class PiKVMClient {
     try {
       return await read();
     } catch (err) {
-      throw transportError(err, endpoint, hid);
+      throw transportError(err, endpoint, hid, this.config.tls.default.device);
     }
   }
 
@@ -1610,6 +1644,10 @@ export class PiKVMClient {
 
   private msdTransport(err: unknown, endpoint: string): KvmdError {
     if (err instanceof KvmdError) return err;
+    const tlsFailure = classifyTlsFailure(err, this.config.tls.default.device);
+    if (tlsFailure) {
+      return new KvmdError(0, tlsFailure.type, tlsFailure.message, endpoint);
+    }
     if (isContentLengthMismatch(err)) {
       return new KvmdError(
         0,

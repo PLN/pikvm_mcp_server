@@ -1,6 +1,7 @@
 // Modified 2026-10 by PLN: read-only hardware checks (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: closed-port probe uses 65000 (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: reject fetch bad ports (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: log the TLS mode (GPL-3.0; see NOTICE).
 
 /**
  * Read-only checks. Nothing here changes the drive.
@@ -86,7 +87,23 @@ describe('read-only hardware', { concurrency: false }, () => {
       for (const name of Object.keys(rawImages)) {
         assert.ok(Object.hasOwn(parsed.images, name), name);
       }
-      console.log(`hw: tls verifySsl=${session.config.pikvm.verifySsl}`);
+      console.log(`hw: tls mode=${session.config.pikvm.tls.default.mode}`);
+    } finally {
+      await session.close();
+    }
+  });
+
+  test('tls mode is logged and a pin matches', { skip }, async () => {
+    const session = await openHardwareSession();
+    try {
+      const tls = session.config.pikvm.tls.default;
+      console.log(`hw: tls mode=${tls.mode}`);
+      if (tls.mode === 'pin') {
+        await session.pikvm.getMsdState();
+        console.log(`hw: tls pin=match spki=${tls.spkiSha256}`);
+      }
+      assert.equal(tls.device, 'default');
+      assert.ok(tls.mode === 'verify' || tls.mode === 'pin' || tls.mode === 'insecure');
     } finally {
       await session.close();
     }
@@ -111,7 +128,7 @@ describe('read-only hardware', { concurrency: false }, () => {
           },
         );
       } finally {
-        wrong.close();
+        await wrong.close();
       }
     } finally {
       await session.close();
@@ -145,7 +162,7 @@ describe('read-only hardware', { concurrency: false }, () => {
           return true;
         });
       } finally {
-        probe.close();
+        await probe.close();
       }
     } finally {
       await session.close();

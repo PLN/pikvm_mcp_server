@@ -3,6 +3,7 @@
 <!-- Modified 2026-10 by PLN: password via resolveSecret (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: restore leftover images and reject fetch bad ports (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: empty secret vars are unset (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: TLS mode check (GPL-3.0; see NOTICE) -->
 
 # Hardware suite
 
@@ -46,11 +47,12 @@ The password is `loadConfig()`'s `resolveSecret` result, the same helper the ser
 | `PIKVM_MCP_BEARER_FILE` | Path of a regular file holding that bearer. |
 | `CREDENTIALS_DIRECTORY` | systemd directory. Credential names are `pikvm-password` and `pikvm-mcp-bearer`. |
 
-`PIKVM_VERIFY_SSL` is the TLS switch that exists today. It is verified only when the value is the string `true`. Any other value, including unset, leaves `verifySsl` false (`rejectUnauthorized: false`).
+TLS uses `PIKVM_TLS_MODE`. When that variable is unset, `PIKVM_VERIFY_SSL=true` means `verify` and any other value means `insecure`. `insecure` is the current default and the process warns once on stderr. A later major release may change the default.
 
-- Stock PiKVM image, self-signed certificate: leave `PIKVM_VERIFY_SSL` unset or set it to `false`.
-- Tailscale certificate (the MagicDNS name is on the cert, and this machine trusts the Tailscale CA): set `PIKVM_VERIFY_SSL=true`.
-- Separate `verify` / `pin` / `insecure` modes are not implemented yet. Pinning a certificate file is Phase B.
+- Stock PiKVM image, self-signed certificate: leave both unset, or set `PIKVM_TLS_MODE=insecure`.
+- Pin over Tailscale: `pikvm-mcp-server pin default` writes `PIKVM_TLS_CERT_FILE`, then set `PIKVM_TLS_MODE=pin`. The read-only check logs `hw: tls mode=pin` and `hw: tls pin=match` when a call succeeds with that pin.
+- Tailscale certificate (the MagicDNS name is on the cert, and this machine trusts the Tailscale CA): set `PIKVM_TLS_MODE=verify`. This is optional.
+- A pin mismatch fails the check. It does not fall back to `insecure`. Compare the fingerprints out of band and run `pikvm-mcp-server pin default` again.
 
 The read-only level does not need the HTTP arm flags. The MSD and HID levels do, because the suite calls the same tools an HTTP session would.
 
@@ -58,7 +60,7 @@ The read-only level does not need the HTTP arm flags. The MSD and HID levels do,
 
 | Level | Variables | What it touches |
 | --- | --- | --- |
-| Read-only (default) | `PIKVM_HW_TEST_DEVICE=default` plus the host and password | Auth check, `GET /api/info?fields=system,hw` (kvmd version and model are logged), one raw `GET /api/msd` (logged with the password redacted) and `pikvm_msd_status`, the TLS mode in use, one bad-password `GET` (a single 401, `PIKVM_AUTH_FAILED`, not retried), and a closed-port probe of the same host. The probe uses port 65000 unless `PIKVM_HW_TEST_UNREACHABLE_PORT` names another port. Set that variable to `0` or `skip` to skip the probe. Ports on the Fetch bad-port list (1, 7, 9, and the rest of that list) are rejected before a connection, with an error that names the variable. A connection refused is `PIKVM_UNREACHABLE`. A filtered port (the request times out) is skipped rather than failed. |
+| Read-only (default) | `PIKVM_HW_TEST_DEVICE=default` plus the host and password | Auth check, `GET /api/info?fields=system,hw` (kvmd version and model are logged), one raw `GET /api/msd` (logged with the password redacted) and `pikvm_msd_status`, the TLS mode (`hw: tls mode=verify|pin|insecure`; in pin mode a successful call logs `hw: tls pin=match`), one bad-password `GET` (a single 401, `PIKVM_AUTH_FAILED`, not retried), and a closed-port probe of the same host. The probe uses port 65000 unless `PIKVM_HW_TEST_UNREACHABLE_PORT` names another port. Set that variable to `0` or `skip` to skip the probe. Ports on the Fetch bad-port list (1, 7, 9, and the rest of that list) are rejected before a connection, with an error that names the variable. A connection refused is `PIKVM_UNREACHABLE`. A filtered port (the request times out) is skipped rather than failed. |
 | MSD | also `PIKVM_HW_TEST_ALLOW_MSD=1` and `PIKVM_MCP_ARM_MSD=1` | Uploads a 1 MiB `mcp-hwtest-<timestamp>-<rand>.iso`, mounts it as cdrom, ejects twice (the second result is `alreadyDisconnected`), mounts it as flash read-only, ejects, and removes it. If `PIKVM_HW_TEST_FETCH_URL` is an allowlisted `https` URL, `pikvm_msd_fetch_url` downloads it under another `mcp-hwtest-*` name and then removes that name. |
 | MSD force | `PIKVM_HW_TEST_ALLOW_MSD=force` instead of `1` | Dangerous. Confirm the target host is not using the virtual drive before running force. If the virtual drive is already connected, the cycle disconnects it, runs the writes above, and remounts the previous image afterwards. A busy drive is not skipped either; the cycle may fail. |
 | HID | also `PIKVM_HW_TEST_ALLOW_HID=1` and `PIKVM_MCP_ARM_HID=1` | `pikvm_type` sends the two characters `hw` with delay 0 and again with delay 50. Delay is milliseconds. kvmd reads seconds, so 50 is sent as `0.05`. This types into whatever has focus. Leave the target on a safe screen, such as an empty text editor, and do not leave a shell prompt focused. |
@@ -102,7 +104,7 @@ hw: kvmd version 4.x
 hw: model v4plus
 hw: info { ... }
 hw: raw /api/msd { ... }
-hw: tls verifySsl=false
+hw: tls mode=insecure
 ```
 
 The raw MSD JSON is passed through the same password redaction as tool errors. An MSD run also logs the snapshot, `hw: image <name> (<bytes> bytes)`, and at the end either `hw: no mcp-hwtest images left` or `hw: leftover mcp-hwtest images: ...`. A leftover line names images this run did not create. A HID run logs `hw: pikvm_type delay 0 accepted` and the same for 50.
@@ -141,7 +143,7 @@ The `hw: snapshot ...` line is the image to put back, with its `connected`, `cdr
 
 `npm test` expands `test/*.test.mjs` only. These files live in `test/hw/` and are named `*.hw.test.mjs`, so that glob does not see them. The workflow runs `npm ci`, `npm run typecheck`, and `npm test`. It does not run `npm run test:hw`.
 
-On Node 22.14, `node --test test/hw` from the repo root is a directory import (`"type": "module"`) and does not discover the files. Use `npm run test:hw`, which passes `test/hw/*.hw.test.mjs` and `--test-concurrency=1`. A normal test runs `node --import` of the network guard and `node --test --test-concurrency=1` with its working directory set to `test/hw` and the device variable unset. The TAP reporter does not print file names, so that test uses `test/hw-discovered-reporter.mjs`, which lists each discovered file. The test asserts that `readonly.hw.test.mjs`, `msd.hw.test.mjs`, and `hid.hw.test.mjs` were all discovered, that all 7 tests skipped, and that stdout and stderr together contain no socket or DNS marker. `node --test` copies a child file's stderr onto the runner's stdout, so the marker is not visible on stderr alone.
+On Node 22.14, `node --test test/hw` from the repo root is a directory import (`"type": "module"`) and does not discover the files. Use `npm run test:hw`, which passes `test/hw/*.hw.test.mjs` and `--test-concurrency=1`. A normal test runs `node --import` of the network guard and `node --test --test-concurrency=1` with its working directory set to `test/hw` and the device variable unset. The TAP reporter does not print file names, so that test uses `test/hw-discovered-reporter.mjs`, which lists each discovered file. The test asserts that `readonly.hw.test.mjs`, `msd.hw.test.mjs`, and `hid.hw.test.mjs` were all discovered, that all 8 tests skipped, and that stdout and stderr together contain no socket or DNS marker. `node --test` copies a child file's stderr onto the runner's stdout, so the marker is not visible on stderr alone.
 
 ## Manual checklist
 
@@ -150,3 +152,5 @@ Copy one row per PiKVM. The suite covers a tiny image, not a multi-gigabyte uplo
 | PiKVM | Model | kvmd | MSD | free shape | 4 GiB up / URL time | 413? | client timeout? | refusals OK? | cdrom / flash ro / rw | TLS verify / pin / insecure | pin after cert change |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | #1 | | | | | | | | | | | |
+
+Rows 6 and 7 are filled by hand. Run the read-only suite once each in `verify`, `pin`, and `insecure`, and record whether auth succeeded. For row 7, reinstall or replace the kvmd certificate, confirm the suite fails with `PIKVM_TLS_PIN_MISMATCH` and both SPKI values, then run `pikvm-mcp-server pin default` after checking the new certificate out of band and record that a later read-only run logs `hw: tls pin=match`.

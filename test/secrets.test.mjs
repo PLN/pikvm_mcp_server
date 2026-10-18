@@ -560,7 +560,7 @@ describe('loadConfig secrets', () => {
         body,
       });
       assert.equal(denied.status, 401);
-      pikvm.close();
+      await pikvm.close();
     } finally {
       if (httpServer) await new Promise((resolve) => httpServer.close(resolve));
       await mock.close();

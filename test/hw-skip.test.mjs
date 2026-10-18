@@ -1,5 +1,6 @@
 // Modified 2026-10 by PLN: hardware suite self-skip (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: the net marker is on TAP stdout (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: TLS mode check is skipped with the suite (GPL-3.0; see NOTICE).
 
 /**
  * The hardware files must not run during npm test, and with
@@ -36,7 +37,7 @@ test('npm test and CI do not run the hardware suite', () => {
   assert.doesNotMatch(ci, /test:hw/);
 });
 
-test('only the legacy default device is accepted', () => {
+test('only the legacy default device is accepted', async () => {
   const previous = process.env.PIKVM_HW_TEST_DEVICE;
   try {
     delete process.env.PIKVM_HW_TEST_DEVICE;
@@ -54,7 +55,7 @@ test('only the legacy default device is accepted', () => {
     const resolved = resolveDevice({ device: 'default' }, client);
     assert.equal(resolved.name, 'default');
     assert.equal(resolved.client, client);
-    client.close();
+    await client.close();
   } finally {
     if (previous === undefined) delete process.env.PIKVM_HW_TEST_DEVICE;
     else process.env.PIKVM_HW_TEST_DEVICE = previous;
@@ -103,8 +104,8 @@ describe('hardware suite process', () => {
     assert.equal(summaryCount(stdout, 'fail'), 0);
     assert.equal(summaryCount(stdout, 'cancelled'), 0);
     assert.equal(summaryCount(stdout, 'pass'), 0);
-    assert.equal(summaryCount(stdout, 'tests'), 7);
-    assert.equal(summaryCount(stdout, 'skipped'), 7);
+    assert.equal(summaryCount(stdout, 'tests'), 8);
+    assert.equal(summaryCount(stdout, 'skipped'), 8);
     for (const name of ['readonly.hw.test.mjs', 'msd.hw.test.mjs', 'hid.hw.test.mjs']) {
       assert.match(stdout, new RegExp(name));
     }

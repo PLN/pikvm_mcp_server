@@ -15,6 +15,7 @@
 <!-- Modified 2026-10 by PLN: password and bearer secret files (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: empty secret vars are unset (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: bearer whitespace is HTTP-only (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: TLS verify, pin, and insecure modes (GPL-3.0; see NOTICE) -->
 
 # PiKVM MCP Server
 
@@ -91,6 +92,7 @@ PIKVM_HOST=https://<your-pikvm-ip>
 PIKVM_USERNAME=admin
 PIKVM_PASSWORD=your_password
 PIKVM_VERIFY_SSL=false
+PIKVM_TLS_MODE=insecure
 PIKVM_DEFAULT_KEYMAP=en-us
 PIKVM_REQUEST_TIMEOUT_MS=5000
 PIKVM_MSD_JOB_TIMEOUT_MS=21600000
@@ -126,6 +128,40 @@ Environment=PIKVM_MCP_NO_DOTENV=1
 `PIKVM_MSD_JOB_TIMEOUT_MS` (default 21600000, six hours) is the wall-clock ceiling for an MSD image upload or URL download. `PIKVM_MSD_IDLE_TIMEOUT_MS` (default 60000) is how long the upload body or the progress stream may sit still. Those two calls do not use `PIKVM_REQUEST_TIMEOUT_MS`, because kvmd does not answer an upload until it has read the body. A value that is not a string of digits, or 0, uses the default. The job ceiling is clamped to 7 days (604800000) and the idle gap to 1 hour (3600000). They are not clamped to the ten-minute ordinary-call cap. `write_remote` `timeout=` is a separate connect timeout (`PIKVM_MSD_URL_CONNECT_TIMEOUT_SEC`, default 30 seconds). It is not this job ceiling.
 
 POST `/hid/*` uses its own ceiling, because kvmd answers only after the input has been applied and a client abort does not cancel that work. `/hid/print` waits `5s + 1.5 × (4·min(length,1024) + 2) × perEventSec + 5s`, and at least 10s. `perEventSec` is the `pikvm_type` `delay` in milliseconds divided by 1000 (50 is sent as 0.05, 200 as 0.2). kvmd reads that query value as seconds. When `delay` is omitted, slow uses 0.02s and otherwise the per-event wait is 0. When that ceiling expires the tool returns `PIKVM_HID_STATE_UNKNOWN` (`input may still be applying; do not resend`) and the call is not retried. A print whose estimate is above 50s is refused before any kvmd call, with a message to shorten the text or lower the delay. With `slow` and no `delay`, that line is 333 characters: 332 still fits under 50s, and 333 does not. kvmd itself accepts up to 1024 characters. PiKVM's nginx likely applies the default 60s `proxy_read_timeout` on `/api/`; that has not been confirmed on hardware. Every other HID POST (key, shortcut, mouse, wheel, reset) uses a fixed 30s ceiling and the same unknown-state error. A connection reset or other socket error after a HID POST was sent is also `PIKVM_HID_STATE_UNKNOWN` and is not retried. A failure before the request is sent, such as connection refused, a connect timeout, or DNS `ENOTFOUND` / `EAI_AGAIN`, stays `PIKVM_UNREACHABLE` and is not retried either. A GET retries those the same way it retries connection refused.
+
+## TLS
+
+kvmd ships a self-signed certificate. Three modes select how this process checks it. The device name is `default` until the registry exists.
+
+| Variable | Role |
+| --- | --- |
+| `PIKVM_TLS_MODE` | `verify`, `pin`, or `insecure`. Unset follows `PIKVM_VERIFY_SSL` (see below). |
+| `PIKVM_TLS_CERT_FILE` | PEM file for `pin`. Required in that mode. A regular file, at most 64 KiB. Opened the same non-blocking way as a secret file. It is not a secret: a loose mode is not warned. |
+| `PIKVM_VERIFY_SSL` | Legacy switch. Exactly `true` means `verify`. Any other value, including unset, means `insecure`. Ignored when `PIKVM_TLS_MODE` is set, with one stderr line when the two disagree. |
+
+`verify` uses the system CA store and checks the hostname. A stock self-signed certificate fails with `PIKVM_TLS_VERIFY_FAILED`. `pin` sends the pinned PEM as the only CA, keeps certificate checking on, and compares the leaf SPKI sha256. The hostname is not the identity, so an IP or a name that is not on the certificate still matches when the key matches. `insecure` turns certificate checks off.
+
+`insecure` is the current default: if `PIKVM_TLS_MODE` is unset and `PIKVM_VERIFY_SSL` is not exactly `true`, the process uses `insecure` and writes one stderr line naming that mode and `pikvm-mcp-server pin default`. That keeps existing self-signed setups working. Switching the default to `pin` or `verify` waits for a later major release. An explicit `PIKVM_TLS_MODE=insecure` logs the same kind of warning. A pin failure or a verify failure is terminal. It is not retried, it is not reported as `PIKVM_UNREACHABLE`, and it never falls back to `insecure`.
+
+Pin a host over Tailscale by reading the certificate once, out of band, and then checking it on every connection:
+
+```bash
+export PIKVM_HOST=https://pikvm.example.ts.net
+export PIKVM_TLS_CERT_FILE=/etc/pikvm-mcp/default.pem
+pikvm-mcp-server pin default
+export PIKVM_TLS_MODE=pin
+```
+
+`pin default` connects once, with verification disabled only for that handshake. It sends no request and no password. It prints the subject, issuer, validity, SHA-256 certificate fingerprint, and SPKI sha256. On a terminal it writes the file only after you type `yes`. Without a terminal it writes nothing unless you pass `--yes`. `--yes` is for a scripted re-pin after the new certificate was verified out of band. Replacing an existing file prints the old SPKI and the new SPKI first. The write is a temp file in the same directory, then a rename, mode `0644`. The command does not run by itself, and a pin failure does not run it.
+
+An optional alternative is `verify` with a Tailscale certificate. On the PiKVM, `tailscale cert pikvm.example.ts.net` creates a certificate for that MagicDNS name. Trust the Tailscale CA on the machine that runs this server, set `PIKVM_HOST=https://pikvm.example.ts.net` and `PIKVM_TLS_MODE=verify`, and leave `PIKVM_TLS_CERT_FILE` unset. That is a choice, not the default, and it still needs the name on the certificate to match the host.
+
+kvmd regenerates its self-signed certificate when the PiKVM is reinstalled. The next call then fails with `PIKVM_TLS_PIN_MISMATCH`. The message names device `default`, the expected SPKI sha256, and the presented SPKI sha256. The process does not retry the call, does not try `insecure`, and does not rewrite the pin file.
+
+1. Read both fingerprints in the error. They are public; the password is not logged.
+2. Compare the presented fingerprint out of band, on a channel you already trust.
+3. Run `pikvm-mcp-server pin default`. Confirm the old and new SPKI values and type `yes`, or pass `--yes` only after that out-of-band check.
+4. Restart the server so it reads the new `PIKVM_TLS_CERT_FILE`.
 
 ## HTTP Mode (remote / gateway deployments)
 

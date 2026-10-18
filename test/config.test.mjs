@@ -8,6 +8,7 @@
  * Modified 2026-10 by PLN: write_remote connect timeout (GPL-3.0; see NOTICE).
  * Modified 2026-10 by PLN: local NAT64 allowlist literals (GPL-3.0; see NOTICE).
  * Modified 2026-10 by PLN: junk connect timeout warning (GPL-3.0; see NOTICE).
+ * Modified 2026-10 by PLN: TLS insecure warning is separate from the timeout warning (GPL-3.0; see NOTICE).
  *
  * loadEnvFile unit tests — verify PIKVM_MCP_NO_DOTENV=1 makes .env lose to
  * explicitly-set process env (the gateway systemd landmine fix).
@@ -354,6 +355,8 @@ test('a non-numeric connect timeout uses the default and warns', () => {
     'PIKVM_HOST',
     'PIKVM_PASSWORD',
     'PIKVM_MSD_URL_CONNECT_TIMEOUT_SEC',
+    'PIKVM_TLS_MODE',
+    'PIKVM_VERIFY_SSL',
   ];
   const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
   const orig = console.error;
@@ -363,6 +366,8 @@ test('a non-numeric connect timeout uses the default and warns', () => {
   };
   process.env.PIKVM_HOST = 'http://mock.test';
   process.env.PIKVM_PASSWORD = 'testpw';
+  delete process.env.PIKVM_TLS_MODE;
+  delete process.env.PIKVM_VERIFY_SSL;
   try {
     process.env.PIKVM_MSD_URL_CONNECT_TIMEOUT_SEC = '30s';
     assert.equal(loadConfig().msd.connectTimeoutSec, 30);
@@ -375,7 +380,7 @@ test('a non-numeric connect timeout uses the default and warns', () => {
     assert.equal(loadConfig().msd.connectTimeoutSec, 30);
     process.env.PIKVM_MSD_URL_CONNECT_TIMEOUT_SEC = '9999';
     assert.equal(loadConfig().msd.connectTimeoutSec, 120);
-    assert.equal(logged.length, 0);
+    assert.equal(logged.filter((line) => !line.includes('PIKVM_TLS_MODE')).length, 0);
   } finally {
     console.error = orig;
     for (const [k, v] of Object.entries(saved)) {
