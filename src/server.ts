@@ -8,6 +8,7 @@
 // Modified 2026-10 by PLN: redactUrl on tool errors (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: pikvm_type delay is milliseconds (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: per-device client, lock, arm, and pikvm_devices (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: pikvm_devices lists an origin (GPL-3.0; see NOTICE).
 
 /**
  * MCP server factory for PiKVM tools
@@ -329,13 +330,18 @@ function jsonText(value: unknown) {
   };
 }
 
+/** Tool-output origin. A legacy host may still carry userinfo, a path, and a query. */
+function outputOrigin(host: string): string {
+  return new URL(host).origin;
+}
+
 function implicitFleet(deps: McpServerDeps): Fleet {
   const legacyClient = deps.pikvm;
   const legacyLock = deps.lock;
   const password = redactionPassword(legacyClient);
   const device: FleetDevice = {
     name: 'default',
-    host: legacyClient.configuredHost(),
+    host: outputOrigin(legacyClient.configuredHost()),
     client: legacyClient,
     lock: legacyLock,
     armHid: !deps.armGateEnforced,
@@ -362,7 +368,7 @@ function redactToolText(error: unknown, passwords: readonly string[]): string {
 function listFleetDevices(fleet: Fleet) {
   const devices = [...fleet.devices.values()].map((device) => ({
     name: device.name,
-    host: device.host,
+    host: outputOrigin(device.host),
     tls: device.tlsMode,
     armHid: device.armHid,
     armMsd: device.armMsd,

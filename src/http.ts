@@ -1,5 +1,6 @@
 // Modified 2026-10 by PLN: reject a bearer with surrounding whitespace (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: bearer whitespace is HTTP-only (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: transport errors go through redactUrl (GPL-3.0; see NOTICE).
 /**
  * Streamable HTTP transport for the MCP server
  *
@@ -25,6 +26,7 @@ import { createServer as createHttpServer, type IncomingMessage, type Server as 
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import type { Server as McpServer } from '@modelcontextprotocol/sdk/server/index.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
+import { redactUrl } from './url-policy.js';
 
 // Tool-call payloads are small JSON; reject anything bigger before parsing.
 const MAX_BODY_BYTES = 1024 * 1024;
@@ -233,7 +235,7 @@ export function startHttpServer(options: HttpTransportOptions): Promise<HttpServ
       // Token never logged: scrub the bearer token out of whatever the error
       // machinery produced before it reaches stderr.
       const raw = err instanceof Error ? (err.stack ?? err.message) : String(err);
-      console.error('HTTP transport error:', raw.split(bearerToken).join('[REDACTED]'));
+      console.error('HTTP transport error:', redactUrl(raw.split(bearerToken).join('[REDACTED]')));
       if (!res.headersSent) {
         jsonError(res, 500, -32603, 'Internal server error');
       } else {

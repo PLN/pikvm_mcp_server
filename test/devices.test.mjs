@@ -1,4 +1,5 @@
 // Modified 2026-10 by PLN: device registry tests (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: legacy listed host is an origin (GPL-3.0; see NOTICE).
 
 /**
  * Registry parsing, per-device locks, and the hardware hwTest gate.
@@ -383,6 +384,71 @@ describe('legacy tool output', { concurrency: false }, () => {
     } finally {
       await srv.close();
       await pikvm.close();
+      await mock.close();
+    }
+  });
+
+  test('a legacy host with userinfo and a query is listed as an origin', async () => {
+    const mock = await startKvmdMock();
+    const rawHost = `http://admin:SECRETPW@127.0.0.1:${new URL(mock.url).port}/kvm?token=TOK`;
+    const chunks = [];
+    const origOut = process.stdout.write;
+    const origErr = process.stderr.write;
+    function record(chunk) {
+      chunks.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString());
+    }
+    process.stdout.write = function (chunk, encoding, cb) {
+      record(chunk);
+      return origOut.call(process.stdout, chunk, encoding, cb);
+    };
+    process.stderr.write = function (chunk, encoding, cb) {
+      record(chunk);
+      return origErr.call(process.stderr, chunk, encoding, cb);
+    };
+    let pikvm;
+    let srv;
+    try {
+      const config = withEnv({
+        PIKVM_HOST: rawHost,
+        PIKVM_PASSWORD: 'testpw',
+        PIKVM_TLS_MODE: 'insecure',
+      }, () => loadConfig());
+      assert.equal(config.pikvm.host, rawHost);
+      const logged = JSON.stringify(redactConfig(config));
+      assert.equal(logged.includes('SECRETPW'), false);
+      assert.equal(logged.includes('TOK'), false);
+      assert.match(logged, new RegExp(mock.url.replaceAll('.', '\\.')));
+      pikvm = new PiKVMClient(config.pikvm);
+      srv = await listen(() => createMcpServer({
+        pikvm,
+        lock: new BusyLock(),
+        calibrationConfig,
+        armGateEnforced: false,
+        msdArmGateEnforced: false,
+      }));
+      const sessionId = await openSession(srv.base);
+      const listed = await callTool(srv.base, sessionId, 'pikvm_devices');
+      const failed = await callTool(srv.base, sessionId, 'pikvm_get_resolution');
+      const status = await callTool(srv.base, sessionId, 'pikvm_msd_status');
+      const calibration = await callTool(srv.base, sessionId, 'pikvm_get_calibration');
+      const body = JSON.parse(listed.content[0].text);
+      assert.equal(body.devices[0].host, mock.url);
+      assert.equal(failed.isError, true);
+      const blob = [
+        listed.content[0].text,
+        failed.content[0].text,
+        status.content[0].text,
+        calibration.content[0].text,
+        chunks.join(''),
+      ].join('\n');
+      assert.equal(blob.includes('SECRETPW'), false);
+      assert.equal(blob.includes('TOK'), false);
+      assert.equal(blob.includes('/kvm'), false);
+    } finally {
+      process.stdout.write = origOut;
+      process.stderr.write = origErr;
+      if (srv) await srv.close();
+      if (pikvm) await pikvm.close();
       await mock.close();
     }
   });

@@ -3,6 +3,7 @@
 // Modified 2026-10 by PLN: TLS dispatcher shared with the client (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: kvmd GET does not follow redirects (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: hardware session uses the registry device (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: hardware logs go through redactUrl (GPL-3.0; see NOTICE).
 
 /**
  * In-process MCP HTTP session aimed at one PiKVMClient.
@@ -20,6 +21,7 @@ import { startHttpServer } from '../../dist/http.js';
 import { BusyLock } from '../../dist/pikvm/lock.js';
 import { PiKVMClient, unexpectedRedirectMessage } from '../../dist/pikvm/client.js';
 import { redactSecrets } from '../../dist/redact.js';
+import { redactUrl } from '../../dist/url-policy.js';
 import { createMcpServer } from '../../dist/server.js';
 import { resolveDevice } from '../../dist/msd.js';
 import { hwDeviceRequest } from './gate.mjs';
@@ -97,7 +99,7 @@ export async function openToolSession({ pikvm, msd, armHid, armMsd, calibration,
       });
       const body = await res.json();
       if (res.status !== 200) {
-        throw new Error(`${name}: ${JSON.stringify(body)}`);
+        throw new Error(redactUrl(`${name}: ${JSON.stringify(body)}`));
       }
       return body.result;
     },
@@ -190,7 +192,7 @@ export async function openHardwareSession(overrides = {}) {
 
 export function redactForLog(value, secret) {
   const text = typeof value === 'string' ? value : JSON.stringify(value);
-  return redactSecrets(text, secret);
+  return redactUrl(redactSecrets(text, secret));
 }
 
 /** One GET. Does not use the client's retry loop. Uses the same TLS agent as PiKVMClient. */
@@ -201,16 +203,22 @@ export async function kvmdGet(pikvmConfig, pathAndQuery) {
   });
   try {
     const url = new URL(pathAndQuery, pikvmConfig.host);
-    const response = await undiciFetch(url, {
-      method: 'GET',
-      headers: {
-        'X-KVMD-User': pikvmConfig.username,
-        'X-KVMD-Passwd': pikvmConfig.password,
-      },
-      dispatcher: agent,
-      signal: AbortSignal.timeout(pikvmConfig.requestTimeoutMs),
-      redirect: 'manual',
-    });
+    let response;
+    try {
+      response = await undiciFetch(url, {
+        method: 'GET',
+        headers: {
+          'X-KVMD-User': pikvmConfig.username,
+          'X-KVMD-Passwd': pikvmConfig.password,
+        },
+        dispatcher: agent,
+        signal: AbortSignal.timeout(pikvmConfig.requestTimeoutMs),
+        redirect: 'manual',
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'kvmd GET failed';
+      throw new Error(redactUrl(message));
+    }
     if (response.status >= 300 && response.status < 400) {
       const location = response.headers.get('location');
       try {
@@ -218,7 +226,7 @@ export async function kvmdGet(pikvmConfig, pathAndQuery) {
       } catch {
         // The redirect body is already closed.
       }
-      throw new Error(unexpectedRedirectMessage(response.status, location, url.toString()));
+      throw new Error(redactUrl(unexpectedRedirectMessage(response.status, location, url.toString())));
     }
     const text = await response.text();
     return { status: response.status, text };

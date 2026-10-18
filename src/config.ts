@@ -11,6 +11,7 @@
 // Modified 2026-10 by PLN: bearer whitespace is HTTP-only (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: TLS verify, pin, and insecure modes (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: device registry (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: a logged host is an origin (GPL-3.0; see NOTICE).
 // Env read adapted from dtrukr/pikvm_mcp_server src/config.ts @ d120243 (GPL-3.0).
 
 /**
@@ -38,7 +39,7 @@ import {
   type DeviceTls,
   type TlsMode,
 } from './tls.js';
-import { parseUrlAllowlist, type UrlAllowlist } from './url-policy.js';
+import { parseUrlAllowlist, redactUrl, type UrlAllowlist } from './url-policy.js';
 
 // Load .env file from project root
 // - quiet: true prevents stdout output that would corrupt MCP protocol
@@ -362,12 +363,22 @@ export function loadConfig(): Config {
   return loadLegacyConfig();
 }
 
+/** Origin for a log. An unparseable host still loses userinfo and the query. */
+function loggedHost(host: string): string {
+  try {
+    return new URL(host).origin;
+  } catch {
+    return redactUrl(host);
+  }
+}
+
 /** A copy safe to log. Passwords, bearer, and pinned PEMs are replaced. */
 export function redactConfig(config: Config): Config {
   const copy: Config = {
     ...config,
     pikvm: {
       ...config.pikvm,
+      host: loggedHost(config.pikvm.host),
       password: '[REDACTED]',
       tls: { default: { ...config.pikvm.tls.default, certPem: undefined } },
     },
@@ -383,6 +394,7 @@ export function redactConfig(config: Config): Config {
     for (const [name, device] of config.registry.devices) {
       devices.set(name, {
         ...device,
+        host: loggedHost(device.host),
         password: '[REDACTED]',
         tls: { ...device.tls, certPem: undefined },
       });

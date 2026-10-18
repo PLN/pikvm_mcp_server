@@ -24,6 +24,7 @@ Modified 2026-10 by PLN: TLS failures follow the socket, and a pinned leaf may b
 Modified 2026-10 by PLN: kvmd redirects are not followed (GPL-3.0; see below).
 Modified 2026-10 by PLN: a reset after the certificate stays unreachable (GPL-3.0; see below).
 Modified 2026-10 by PLN: device registry (GPL-3.0; see below).
+Modified 2026-10 by PLN: listed host is an origin (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -600,3 +601,12 @@ No code from another pikvm_mcp_server fork was added for these methods.
   name. The hardware suite accepts a registry device only when hwTest
   is true, and HID or MSD still need the allow flag plus that device's
   arm. No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  pikvm_devices lists the legacy device as an origin. A legacy
+  PIKVM_HOST may still carry userinfo, a path, and a query, and that
+  string is what the client connects with. The listed host is
+  new URL(host).origin. Tool errors, a logged config, startup and
+  fatal text, the pin command, and the hardware logs pass a host
+  through that origin or through redactUrl. No code from another
+  pikvm_mcp_server fork was copied.

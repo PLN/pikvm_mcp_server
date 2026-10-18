@@ -1,6 +1,7 @@
 // Modified 2026-10 by PLN: pikvm-mcp-server pin (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a corrupt pin file does not stop a re-pin (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: pin a registry device (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: pin errors go through redactUrl (GPL-3.0; see NOTICE).
 
 /**
  * `pikvm-mcp-server pin <device>` prints the leaf certificate and, after
@@ -25,6 +26,7 @@
 
 import { existsSync } from 'node:fs';
 import { loadDeviceRegistry } from './registry.js';
+import { redactUrl } from './url-policy.js';
 import {
   probeLeafCertificate,
   readPinnedCert,
@@ -106,7 +108,13 @@ export async function pinCommand(args: string[]): Promise<void> {
     }
   }
 
-  const cert = await probeLeafCertificate(host);
+  let cert: ProbedCertificate;
+  try {
+    cert = await probeLeafCertificate(host);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'TLS handshake failed';
+    throw new Error(redactUrl(message));
+  }
   printCertificate(cert);
 
   if (existsSync(dest)) {

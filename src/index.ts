@@ -6,6 +6,7 @@
 // Modified 2026-10 by PLN: empty secret vars are unset (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: pikvm-mcp-server pin (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: device registry (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: fatal errors go through redactUrl (GPL-3.0; see NOTICE).
 /**
  * PiKVM MCP Server
  *
@@ -25,6 +26,7 @@ import { buildFleet } from './devices.js';
 import { createMcpServer, type McpServerDeps } from './server.js';
 import { startHttpServer } from './http.js';
 import { pinCommand } from './pin.js';
+import { redactUrl } from './url-policy.js';
 
 async function listen(config: Config, deps: McpServerDeps): Promise<void> {
   if (config.http) {
@@ -113,6 +115,7 @@ const started = process.argv[2] === 'pin'
   : main();
 
 started.catch((error) => {
-  console.error('Fatal error:', error);
+  const text = error instanceof Error ? (error.stack ?? error.message) : String(error);
+  console.error('Fatal error:', redactUrl(text));
   process.exit(1);
 });
