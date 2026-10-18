@@ -41,7 +41,7 @@ Scaling preserves aspect ratio. When you scale a screenshot, the server tracks t
 \`\`\`
 
 ## Tips
-- Omit nothing when you need the configured preview. The defaults are 960×600 at quality 70, not the native frame.
+- The default preview is 960×600 at quality 70, not the native frame.
 - Use lower quality (50-60) when you only need layout/position information to save bandwidth.
 - Always take a screenshot **after** performing an action to verify the result.
 - The response includes a text line describing dimensions and any scaling that was applied.`,
