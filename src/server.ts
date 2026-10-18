@@ -2,6 +2,7 @@
 // Modified 2026-10 by PLN: MSD status, mount, and eject (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: MSD read-only allowlist and expectImage (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: upload, job, and remove tools (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: hashing jobs and typed upload errors (GPL-3.0; see NOTICE).
 
 /**
  * MCP server factory for PiKVM tools
@@ -31,6 +32,8 @@ import {
   ejectMsd,
   mountMsd,
   MsdExpectImageError,
+  MsdPreflightError,
+  MsdUploadBusyError,
   publicMsdState,
   readMsdJob,
   removeMsd,
@@ -56,7 +59,19 @@ export interface McpServerDeps {
    */
   msdArmGateEnforced?: boolean;
   /** Local upload directory and caps. Upload is hidden while localDir is unset. */
-  msd?: MsdConfig;
+  msd?: MsdServerConfig;
+}
+
+/**
+ * MsdConfig plus optional knobs the production entrypoint leaves unset.
+ * Tests use them to pause a job, shorten the uploading poll, and cap jobs.
+ */
+export interface MsdServerConfig extends MsdConfig {
+  beforeHash?: () => Promise<void>;
+  beforeUploadStream?: () => Promise<void>;
+  uploadPollMs?: number;
+  jobLimit?: number;
+  jobTtlMs?: number;
 }
 
 // ============================================================================
@@ -212,8 +227,8 @@ export function msdToolRequiresArm(name: string): boolean {
 
 /**
  * Tool failure text. KvmdError keeps status, type, message, and endpoint.
- * MsdExpectImageError names the connected image. Other errors stay
- * `Error: <message>`.
+ * MsdExpectImageError names the connected image. MsdPreflightError and
+ * MsdUploadBusyError keep their type. Other errors stay `Error: <message>`.
  */
 export function formatToolError(error: unknown, password = ''): string {
   const redact = (value: string) => redactSecrets(value, password);
@@ -221,6 +236,11 @@ export function formatToolError(error: unknown, password = ''): string {
     const message = redact(error.message);
     const image = redact(error.image);
     const details = JSON.stringify({ type: error.type, image, message });
+    return `Error [${error.type}]: ${message}\n${details}`;
+  }
+  if (error instanceof MsdPreflightError || error instanceof MsdUploadBusyError) {
+    const message = redact(error.message);
+    const details = JSON.stringify({ type: error.type, message });
     return `Error [${error.type}]: ${message}\n${details}`;
   }
   if (error instanceof KvmdError) {
@@ -596,7 +616,7 @@ const tools: Tool[] = [
   },
   {
     name: 'pikvm_msd_upload',
-    description: 'Upload a local image into PiKVM storage and return a jobId immediately. file is a bare name under PIKVM_MSD_LOCAL_DIR. confirmImage must equal file. The drive is not changed: the upload is refused while it is connected. Poll pikvm_msd_job. Hidden while PIKVM_MSD_LOCAL_DIR is unset.',
+    description: 'Upload a local image into PiKVM storage and return a jobId immediately after the file is confined. Hashing and the kvmd pre-check run in the job, which is hashing and then running. A sha256 mismatch fails the job and uploads nothing. A second upload while one is running is refused. file is a bare name under PIKVM_MSD_LOCAL_DIR. confirmImage must equal file. The drive is not changed. Poll pikvm_msd_job. Hidden while PIKVM_MSD_LOCAL_DIR is unset.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -614,7 +634,7 @@ const tools: Tool[] = [
         },
         sha256: {
           type: 'string',
-          description: 'Optional expected sha256 hex digest of the file. A mismatch uploads nothing.',
+          description: 'Optional expected sha256 hex digest of the file. A mismatch fails the job before any upload POST.',
         },
       },
       required: ['file', 'confirmImage'],
@@ -622,7 +642,7 @@ const tools: Tool[] = [
   },
   {
     name: 'pikvm_msd_job',
-    description: 'Read an in-memory MSD upload job. Returns state running, done, or failed, plus bytes, total, and sha256 when known. Does not change the drive.',
+    description: 'Read an in-memory MSD upload job. Returns state hashing, running, done, or failed, plus bytes, total, and sha256 when known. A failed upload that stored the wrong bytes includes removed. Finished jobs are dropped after 24 hours. Does not change the drive.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1082,13 +1102,21 @@ export function createMcpServer(deps: McpServerDeps): Server {
             file,
             confirmImage,
             sha256,
+            beforeHash: deps.msd?.beforeHash,
+            beforeUploadStream: deps.msd?.beforeUploadStream,
+            uploadPollMs: deps.msd?.uploadPollMs,
+            jobLimit: deps.msd?.jobLimit,
+            jobTtlMs: deps.msd?.jobTtlMs,
           });
           return jsonText(outcome);
         }
 
         case 'pikvm_msd_job': {
           const jobId = requireString(args.jobId, 'jobId');
-          const job = readMsdJob(jobId);
+          const job = readMsdJob(jobId, {
+            jobLimit: deps.msd?.jobLimit,
+            jobTtlMs: deps.msd?.jobTtlMs,
+          });
           if (!job) throw new Error('unknown job');
           return jsonText(job);
         }

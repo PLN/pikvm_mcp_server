@@ -2,6 +2,7 @@ Modified 2026-10 by PLN: added this NOTICE (GPL-3.0; see below).
 Modified 2026-10 by PLN: MSD tools, ARM_MSD, and source-error flag (GPL-3.0; see below).
 Modified 2026-10 by PLN: mount expectImage, preflight, and MSD mutex (GPL-3.0; see below).
 Modified 2026-10 by PLN: MSD upload jobs and remove (GPL-3.0; see below).
+Modified 2026-10 by PLN: hashing jobs, bad-image cleanup, upload try-lock (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -256,4 +257,18 @@ No code from another pikvm_mcp_server fork was added for these methods.
   not match the snapshot is refused with no POST even when the
   drive is disconnected. Image name checks follow kvmd v4.227
   valid_printable_filename (0dd244f), limited here to a bare name.
+  No code from another pikvm_mcp_server fork was added.
+
+2026-10, by PLN:
+  pikvm_msd_upload returns the jobId after path confinement
+  (realpath, lstat, open, fstat). Hashing and the kvmd pre-check
+  run inside the job. The job state is hashing, then running.
+  A sha256 mismatch fails the job and makes no kvmd POST.
+  When a check after the stream fails, the stored image is removed
+  under withMsdLock and the job records removed and removeError.
+  A second upload while one is running fails immediately with
+  MsdUploadBusyError ("upload already running") and does not queue.
+  storage.uploading is polled every 1.5 seconds. Preflight refusals
+  carry a type field. open uses O_NONBLOCK as well as O_NOFOLLOW.
+  Finished jobs are dropped after 24 hours and the map is capped.
   No code from another pikvm_mcp_server fork was added.

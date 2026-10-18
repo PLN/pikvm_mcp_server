@@ -1,6 +1,7 @@
 // Modified 2026-10 by PLN: MSD status, mount, eject, and arm-gate tests (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: expectImage, preflight, and MSD mutex tests (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: upload jobs, remove, and disconnected expectImage (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: hashing jobs, bad-image cleanup, upload try-lock (GPL-3.0; see NOTICE).
 
 /**
  * MSD tools against the mock. The HTTP harness matches test/http.test.mjs.
@@ -10,19 +11,20 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
+import { promisify } from 'node:util';
 import { PiKVMClient } from '../dist/pikvm/client.js';
 import { BusyLock } from '../dist/pikvm/lock.js';
-import { setBeforeUploadStream } from '../dist/msd.js';
 import { createMcpServer, ARM_GATED_TOOLS, MSD_READ_ONLY_TOOLS, msdToolRequiresArm } from '../dist/server.js';
 import { startHttpServer } from '../dist/http.js';
 import { startKvmdMock } from './kvmd-mock.mjs';
 
+const execFileAsync = promisify(execFile);
 const TOKEN = 'test-bearer-token-0123456789abcdef';
 const REPO = join(fileURLToPath(import.meta.url), '..', '..');
 const calibrationConfig = { rounds: 2, verifyRounds: 1, moveDelayMs: 20 };
@@ -762,7 +764,7 @@ async function pollJob(base, sessionId, jobId) {
     const result = await callTool(base, sessionId, 'pikvm_msd_job', { jobId });
     assert.equal(result.isError, undefined, result.content[0].text);
     body = JSON.parse(result.content[0].text);
-    return body.state !== 'running';
+    return body.state !== 'running' && body.state !== 'hashing';
   }, 4000), true);
   return body;
 }
@@ -827,13 +829,15 @@ test('upload, remove, and job polling', { timeout: 30000 }, async (t) => {
       await symlink(join(dir, 'real.img'), join(dir, 'link.img'));
       await mkdir(join(dir, 'dir.img'));
       await writeFile(join(dir, 'big.img'), body);
+      await execFileAsync('mkfifo', [join(dir, 'pipe.img')]);
       const cases = [
         ['traversal', { file: '../real.img', confirmImage: '../real.img' }, /bare image name/],
         ['absolute', { file: '/tmp/real.img', confirmImage: '/tmp/real.img' }, /bare image name/],
         ['symlink', { file: 'link.img', confirmImage: 'link.img' }, /symlink/],
         ['directory', { file: 'dir.img', confirmImage: 'dir.img' }, /directory/],
+        ['fifo', { file: 'pipe.img', confirmImage: 'pipe.img' }, /not a regular file/],
         ['oversize', { file: 'big.img', confirmImage: 'big.img' }, /PIKVM_MSD_MAX_BYTES/],
-        ['sha256', { file: 'real.img', confirmImage: 'real.img', sha256: 'a'.repeat(64) }, /sha256 mismatch/],
+        ['sha256 format', { file: 'real.img', confirmImage: 'real.img', sha256: 'nope' }, /64 hex/],
       ];
       for (const [label, args, pattern] of cases) {
         const flags = label === 'oversize'
@@ -858,14 +862,24 @@ test('upload, remove, and job polling', { timeout: 30000 }, async (t) => {
         ['free', { images: [], free: 2 }, /free space/],
         ['busy', { images: [], busyFor: 1 }, /busy/],
       ];
+      const types = {
+        connected: 'MsdConnectedError',
+        exists: 'MsdImageExistsError',
+        free: 'MsdFreeSpaceError',
+        busy: 'MsdBusyError',
+      };
       for (const [label, mockOptions, pattern] of cases) {
         await withSession(mockOptions, uploadMsd(dir), async ({ mock, base, sessionId }) => {
           const result = await callTool(base, sessionId, 'pikvm_msd_upload', {
             file: 'disk.img',
             confirmImage: 'disk.img',
           });
-          assert.equal(result.isError, true, `${label}: ${result.content[0].text}`);
-          assert.match(result.content[0].text, pattern, label);
+          assert.equal(result.isError, undefined, `${label}: ${result.content[0].text}`);
+          const { jobId } = JSON.parse(result.content[0].text);
+          const failed = await pollJob(base, sessionId, jobId);
+          assert.equal(failed.state, 'failed', label);
+          assert.equal(failed.error.type, types[label], label);
+          assert.match(failed.error.message, pattern, label);
           assert.deepEqual(msdPosts(mock), [], label);
         });
       }
@@ -938,14 +952,106 @@ test('upload, remove, and job polling', { timeout: 30000 }, async (t) => {
     });
   });
 
-  await t.test('a file changed before the stream fails the job', async () => {
+  await t.test('a sha256 mismatch fails the job before any kvmd call', async () => {
+    await withDir(async (dir) => {
+      await writeFile(join(dir, 'disk.img'), body);
+      await withSession({ images: [] }, uploadMsd(dir), async ({ mock, base, sessionId }) => {
+        const started = await callTool(base, sessionId, 'pikvm_msd_upload', {
+          file: 'disk.img',
+          confirmImage: 'disk.img',
+          sha256: 'a'.repeat(64),
+        });
+        assert.equal(started.isError, undefined, started.content[0].text);
+        const { jobId } = JSON.parse(started.content[0].text);
+        const failed = await pollJob(base, sessionId, jobId);
+        assert.equal(failed.state, 'failed');
+        assert.match(failed.error.message, /sha256 mismatch/);
+        assert.deepEqual(mock.calls, []);
+        assert.equal(mock.state.images['disk.img'], undefined);
+      });
+    });
+  });
+
+  await t.test('the jobId returns before hashing finishes', async () => {
+    await withDir(async (dir) => {
+      await writeFile(join(dir, 'disk.img'), body);
+      let release;
+      const flags = uploadMsd(dir, {
+        beforeHash: () => new Promise((resolve) => { release = resolve; }),
+      });
+      try {
+        await withSession({ images: [] }, flags, async ({ mock, base, sessionId }) => {
+          const started = await callTool(base, sessionId, 'pikvm_msd_upload', {
+            file: 'disk.img',
+            confirmImage: 'disk.img',
+            sha256: sum,
+          });
+          assert.equal(started.isError, undefined, started.content[0].text);
+          const { jobId } = JSON.parse(started.content[0].text);
+          assert.equal(typeof release, 'function');
+          const mid = JSON.parse((await callTool(base, sessionId, 'pikvm_msd_job', { jobId })).content[0].text);
+          assert.equal(mid.state, 'hashing');
+          assert.equal(mid.sha256, undefined);
+          assert.equal(mid.total, body.length);
+          assert.deepEqual(mock.calls, []);
+          release();
+          const done = await pollJob(base, sessionId, jobId);
+          assert.equal(done.state, 'done');
+          assert.equal(done.sha256, sum);
+        });
+      } finally {
+        if (release) release();
+      }
+    });
+  });
+
+  await t.test('a second upload fails immediately while one is hashing', async () => {
+    await withDir(async (dir) => {
+      await writeFile(join(dir, 'disk.img'), body);
+      let release;
+      const flags = uploadMsd(dir, {
+        beforeHash: () => new Promise((resolve) => { release = resolve; }),
+      });
+      try {
+        await withSession({ images: [] }, flags, async ({ mock, base, sessionId }) => {
+          const started = await callTool(base, sessionId, 'pikvm_msd_upload', {
+            file: 'disk.img',
+            confirmImage: 'disk.img',
+          });
+          const { jobId } = JSON.parse(started.content[0].text);
+          assert.equal(await waitFor(() => typeof release === 'function'), true);
+          const other = await openSession(base);
+          const began = Date.now();
+          const refused = await callTool(base, other, 'pikvm_msd_upload', {
+            file: 'disk.img',
+            confirmImage: 'disk.img',
+          });
+          assert.ok(Date.now() - began < 700, 'second upload waited on the first');
+          assert.equal(refused.isError, true);
+          assert.match(refused.content[0].text, /MsdUploadBusyError/);
+          assert.match(refused.content[0].text, /upload already running/);
+          assert.deepEqual(mock.calls, []);
+          release();
+          release = undefined;
+          const done = await pollJob(base, sessionId, jobId);
+          assert.equal(done.state, 'done');
+        });
+      } finally {
+        if (release) release();
+      }
+    });
+  });
+
+  await t.test('a file changed before the stream fails the job and the image is removed', async () => {
     await withDir(async (dir) => {
       const file = join(dir, 'disk.img');
       await writeFile(file, body);
       let release;
-      setBeforeUploadStream(() => new Promise((resolve) => { release = resolve; }));
+      const flags = uploadMsd(dir, {
+        beforeUploadStream: () => new Promise((resolve) => { release = resolve; }),
+      });
       try {
-        await withSession({ images: [] }, uploadMsd(dir), async ({ base, sessionId }) => {
+        await withSession({ images: [] }, flags, async ({ mock, base, sessionId }) => {
           const started = await callTool(base, sessionId, 'pikvm_msd_upload', {
             file: 'disk.img',
             confirmImage: 'disk.img',
@@ -954,15 +1060,64 @@ test('upload, remove, and job polling', { timeout: 30000 }, async (t) => {
           assert.equal(await waitFor(() => typeof release === 'function'), true);
           await writeFile(file, Buffer.from('wxyz'));
           release();
+          release = undefined;
           const failed = await pollJob(base, sessionId, jobId);
           assert.equal(failed.state, 'failed');
           assert.match(failed.error.message, /sha256 changed/);
           assert.notEqual(failed.sha256, sum);
+          assert.equal(failed.removed, true);
+          assert.equal(failed.removeError, undefined);
+          assert.equal(mock.state.images['disk.img'], undefined);
         });
       } finally {
-        setBeforeUploadStream(undefined);
         if (release) release();
       }
+    });
+  });
+
+  await t.test('finished jobs past the cap are dropped', async () => {
+    await withDir(async (dir) => {
+      await writeFile(join(dir, 'disk.img'), body);
+      await withSession({ images: [] }, uploadMsd(dir, { jobLimit: 2 }), async ({ base, sessionId }) => {
+        const ids = [];
+        for (let i = 0; i < 3; i += 1) {
+          const started = await callTool(base, sessionId, 'pikvm_msd_upload', {
+            file: 'disk.img',
+            confirmImage: 'disk.img',
+            sha256: 'a'.repeat(64),
+          });
+          assert.equal(started.isError, undefined, started.content[0].text);
+          const { jobId } = JSON.parse(started.content[0].text);
+          ids.push(jobId);
+          const failed = await pollJob(base, sessionId, jobId);
+          assert.equal(failed.state, 'failed');
+        }
+        const gone = await callTool(base, sessionId, 'pikvm_msd_job', { jobId: ids[0] });
+        assert.equal(gone.isError, true);
+        assert.match(gone.content[0].text, /unknown job/);
+        const kept = JSON.parse((await callTool(base, sessionId, 'pikvm_msd_job', { jobId: ids[2] })).content[0].text);
+        assert.equal(kept.state, 'failed');
+      });
+    });
+  });
+
+  await t.test('a finished job is dropped after its ttl', async () => {
+    await withDir(async (dir) => {
+      await writeFile(join(dir, 'disk.img'), body);
+      await withSession({ images: [] }, uploadMsd(dir, { jobTtlMs: 400 }), async ({ base, sessionId }) => {
+        const started = await callTool(base, sessionId, 'pikvm_msd_upload', {
+          file: 'disk.img',
+          confirmImage: 'disk.img',
+          sha256: 'b'.repeat(64),
+        });
+        const { jobId } = JSON.parse(started.content[0].text);
+        const failed = await pollJob(base, sessionId, jobId);
+        assert.equal(failed.state, 'failed');
+        await new Promise((resolve) => setTimeout(resolve, 500));
+        const gone = await callTool(base, sessionId, 'pikvm_msd_job', { jobId });
+        assert.equal(gone.isError, true);
+        assert.match(gone.content[0].text, /unknown job/);
+      });
     });
   });
 

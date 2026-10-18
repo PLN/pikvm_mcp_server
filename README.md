@@ -4,6 +4,7 @@
 <!-- Modified 2026-10 by PLN: PIKVM_MCP_ARM_MSD and MSD status, mount, eject (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: mount expectImage and MSD preflight (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: MSD upload jobs and remove (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: hashing jobs, bad-image cleanup, upload try-lock (GPL-3.0; see NOTICE) -->
 
 # PiKVM MCP Server
 
@@ -246,11 +247,11 @@ Or if using the .env file:
 - **`pikvm_msd_status`** - Read mass-storage state (optional: device). Read-only.
 - **`pikvm_msd_mount`** - Select an image and connect the virtual drive (required: image, mode `cdrom` or `flash`, confirmImage; optional: rw, connect, expectImage, device). `confirmImage` must equal `image`. When a drive is already connected, `expectImage` must equal that image or the mount is refused and the drive stays connected. An `expectImage` supplied while the drive is disconnected must equal the snapshot image too. The image must already be in storage and complete. Returns the drive re-read after the change. On failure the previous selection is restored. An NBD or URL snapshot image cannot be restored, because `set_params` refuses a name that contains `://`.
 - **`pikvm_msd_eject`** - Disconnect the virtual drive (required: expectImage; optional: device). `expectImage` must equal the current image name, or `""` when none is selected. A second eject returns `alreadyDisconnected`. Any other kvmd error is returned as an error.
-- **`pikvm_msd_upload`** - Upload a bare file name from `PIKVM_MSD_LOCAL_DIR` (required: file, confirmImage; optional: sha256, device). Returns `{jobId}` after the local hash and pre-check. The transfer does not change the drive. Hidden while `PIKVM_MSD_LOCAL_DIR` is unset.
-- **`pikvm_msd_job`** - Read that job: `{state, bytes, total, sha256?, error?}`. Read-only.
+- **`pikvm_msd_upload`** - Upload a bare file name from `PIKVM_MSD_LOCAL_DIR` (required: file, confirmImage; optional: sha256, device). Returns `{jobId}` immediately after the file is confined. Hashing and the kvmd pre-check run in the job (`hashing`, then `running`). A sha256 mismatch fails the job and makes no upload POST. A second upload while one is running is refused. If a check after the stream fails, the stored image is removed. The transfer does not change the drive. Hidden while `PIKVM_MSD_LOCAL_DIR` is unset.
+- **`pikvm_msd_job`** - Read that job: `{state, bytes, total, sha256?, error?, removed?, removeError?}`. `state` is `hashing`, `running`, `done`, or `failed`. Finished jobs are dropped after 24 hours. Read-only.
 - **`pikvm_msd_remove`** - Remove a stored image (required: image, confirmImage; optional: device). Refuses while the drive is connected and does not disconnect it.
 
-In HTTP mode, MSD changes stay disarmed until `PIKVM_MCP_ARM_MSD=1`. Status and job stay available. stdio is not gated. Mount and eject share one lock per device. Uploads use a separate job lock, so a transfer does not queue mount or eject.
+In HTTP mode, MSD changes stay disarmed until `PIKVM_MCP_ARM_MSD=1`. Status and job stay available. stdio is not gated. Mount and eject share one lock per device. A second upload fails immediately instead of queueing, and a transfer does not queue mount or eject.
 
 ## Skills (Prompts & Skill Tools)
 
