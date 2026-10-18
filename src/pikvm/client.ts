@@ -4,6 +4,7 @@
 // Modified 2026-10 by PLN: source-error flag and partial-image message (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: remove_incomplete defaults on (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: write_remote timeout is the connect timeout (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: connect timeout and DNS map to unreachable (GPL-3.0; see NOTICE).
 // AbortSignal.timeout and PIKVM_UNREACHABLE / PIKVM_AUTH_FAILED no-retry codes
 // adapted from dtrukr/pikvm_mcp_server src/pikvm/client.ts @ d120243 (GPL-3.0).
 // Snapshot HTTP 503 retry-once adapted from dvaerum/pikvm_mcp_server
@@ -35,7 +36,9 @@
 // shorter complete image. MSD POSTs are not retried.
 // After POST /msd/write or /msd/write_remote has started, a timeout, a
 // socket reset, or HTTP 504 is PIKVM_MSD_STATE_UNKNOWN. Connection refused
-// before the request is sent stays PIKVM_UNREACHABLE. An error reading
+// before the request is sent stays PIKVM_UNREACHABLE. A connect timeout
+// (UND_ERR_CONNECT_TIMEOUT) and DNS ENOTFOUND / EAI_AGAIN are the same,
+// whether the code is on the error or on a cause. An error reading
 // the local source is PIKVM_SOURCE_READ_ERROR ("image may be partial;
 // re-read /api/msd"). That flag is the source stream's own error event.
 // On undici 7.24.1 an abort or reset while kvmd is not reading destroys
@@ -51,6 +54,7 @@
 
 import { Readable } from 'node:stream';
 import { Agent, fetch, request as undiciRequest } from 'undici';
+import type { Dispatcher } from 'undici';
 import sharp from 'sharp';
 import {
   HID_OTHER_DEADLINE_MS,
@@ -298,11 +302,7 @@ function isTimeoutError(err: unknown): boolean {
     const name = (current as { name?: unknown }).name;
     const code = (current as { code?: unknown }).code;
     if (name === 'TimeoutError') return true;
-    if (
-      code === 'UND_ERR_CONNECT_TIMEOUT' ||
-      code === 'UND_ERR_HEADERS_TIMEOUT' ||
-      code === 'UND_ERR_BODY_TIMEOUT'
-    ) {
+    if (code === 'UND_ERR_HEADERS_TIMEOUT' || code === 'UND_ERR_BODY_TIMEOUT') {
       return true;
     }
     current = (current as { cause?: unknown }).cause;
@@ -326,13 +326,14 @@ function parseKvmdFailure(text: string): { error: string; error_msg: string } | 
   return null;
 }
 
-/** Nothing was written. Connection refused and DNS failures stay unreachable. */
+/** Nothing was written. Same retry class as connection refused. */
 const PRE_SEND_CODES = new Set([
   'ECONNREFUSED',
   'ENOTFOUND',
   'EAI_AGAIN',
   'EHOSTUNREACH',
   'ENETUNREACH',
+  'UND_ERR_CONNECT_TIMEOUT',
 ]);
 
 /**
@@ -366,7 +367,16 @@ function failedAfterSend(err: unknown): boolean {
   return codes.some((code) => POST_SEND_SOCKET_CODES.has(code));
 }
 
+function isPreSendFailure(err: unknown): boolean {
+  return errorCodes(err).some((code) => PRE_SEND_CODES.has(code));
+}
+
 function transportError(err: unknown, endpoint: string, hid: boolean): KvmdError {
+  // A connect timeout or DNS failure can sit under a TimeoutError.
+  // Nothing was sent, so this stays unreachable rather than a timeout.
+  if (isPreSendFailure(err)) {
+    return new KvmdError(0, 'PIKVM_UNREACHABLE', 'kvmd network error', endpoint);
+  }
   if (isTimeoutError(err)) {
     if (hid) {
       return new KvmdError(0, 'PIKVM_HID_STATE_UNKNOWN', HID_STATE_UNKNOWN_MESSAGE, endpoint);
@@ -659,6 +669,7 @@ function startMsdDeadline(jobMs: number, idleMs: number): MsdDeadline {
  * Refusal still uses the unscaled estimate.
  */
 const hidDeadlineScales = new WeakMap<PiKVMClient, number>();
+const testDispatchers = new WeakMap<PiKVMClient, Dispatcher>();
 
 /** Configured password for tool-error redaction. Not a client method. */
 const redactionPasswords = new WeakMap<PiKVMClient, string>();
@@ -667,6 +678,11 @@ const redactionPasswords = new WeakMap<PiKVMClient, string>();
 export function setHidDeadlineScaleForTests(client: PiKVMClient, scale: number): void {
   if (!Number.isFinite(scale) || scale <= 0) return;
   hidDeadlineScales.set(client, scale);
+}
+
+/** Test-only. Sends ordinary calls and MSD posts through this dispatcher. */
+export function setDispatcherForTests(client: PiKVMClient, dispatcher: Dispatcher): void {
+  testDispatchers.set(client, dispatcher);
 }
 
 /** Package-internal. The tool error path redacts with this password. */
@@ -735,8 +751,10 @@ export class PiKVMClient {
    * snapshot can make at most four calls. HID POSTs use a per-call
    * ceiling and are never retried. /hid/print above 50s is refused
    * before the request is sent. A socket reset after a HID POST was
-   * sent is PIKVM_HID_STATE_UNKNOWN. A connect refusal stays
-   * PIKVM_UNREACHABLE.
+   * sent is PIKVM_HID_STATE_UNKNOWN. A connect refusal, a connect
+   * timeout, or DNS ENOTFOUND / EAI_AGAIN stays PIKVM_UNREACHABLE.
+   * GET retries those the same way it retries connection refused.
+   * POST, including HID, does not.
    */
   private async request<T = unknown>(
     method: string,
@@ -807,7 +825,7 @@ export class PiKVMClient {
         method,
         headers,
         body: body ? (typeof body === 'object' ? JSON.stringify(body) : body) : undefined,
-        dispatcher: this.dispatcher,
+        dispatcher: testDispatchers.get(this) ?? this.dispatcher,
         signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (err) {
@@ -1569,7 +1587,7 @@ export class PiKVMClient {
         method: 'POST',
         headers,
         body: upload,
-        dispatcher: this.dispatcher,
+        dispatcher: testDispatchers.get(this) ?? this.dispatcher,
         headersTimeout: this.config.msdJobTimeoutMs,
         bodyTimeout: this.config.msdIdleTimeoutMs,
         signal: deadline.signal,
@@ -1603,8 +1621,7 @@ export class PiKVMClient {
     if (isSourceReadError(err)) {
       return new KvmdError(0, 'PIKVM_SOURCE_READ_ERROR', SOURCE_READ_MESSAGE, endpoint);
     }
-    const codes = errorCodes(err);
-    const beforeSend = codes.some((code) => PRE_SEND_CODES.has(code)) || isConnectTimeout(err);
+    const beforeSend = isPreSendFailure(err) || isConnectTimeout(err);
     if (!beforeSend && (isTimeoutError(err) || failedAfterSend(err))) {
       return msdStateUnknown(0, endpoint);
     }

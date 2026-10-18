@@ -1,4 +1,5 @@
 // Modified 2026-10 by PLN: KvmdError, timeout, and GET retry tests (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: connect timeout and DNS unreachable tests (GPL-3.0; see NOTICE).
 
 /**
  * KvmdError, request timeout, and bounded GET retry.
@@ -8,7 +9,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { KvmdError, PiKVMClient, setHidDeadlineScaleForTests } from '../dist/pikvm/client.js';
+import { Readable } from 'node:stream';
+import { MockAgent } from 'undici';
+import { KvmdError, PiKVMClient, setDispatcherForTests, setHidDeadlineScaleForTests } from '../dist/pikvm/client.js';
 import { BusyLock } from '../dist/pikvm/lock.js';
 import { createMcpServer } from '../dist/server.js';
 import { startHttpServer } from '../dist/http.js';
@@ -653,5 +656,94 @@ test('a print whose ceiling is above 50s is refused with zero kvmd calls', async
     assert.match(text, /Shorten the text/);
     assert.match(text, /lower the delay/);
     assert.equal(mock.calls.length, 0);
+  });
+});
+
+function coded(message, code) {
+  return Object.assign(new Error(message), { code });
+}
+
+/**
+ * undici fetch rejects with TypeError 'fetch failed' and the code on
+ * `cause`. undici request() rejects the dispatcher error itself, so the
+ * code is on that error. Both shapes are covered below.
+ */
+async function withCodedDispatch(code, method, run) {
+  const agent = new MockAgent();
+  agent.disableNetConnect();
+  const origin = 'http://127.0.0.1:40123';
+  const pool = agent.get(origin);
+  let hits = 0;
+  const error = code === 'UND_ERR_CONNECT_TIMEOUT'
+    ? Object.assign(new Error('wrapped'), { cause: coded('Connect Timeout Error', code) })
+    : coded(code, code);
+  pool.intercept({
+    path: () => {
+      hits += 1;
+      return true;
+    },
+    method,
+  }).replyWithError(error).persist();
+  const pikvm = new PiKVMClient({
+    host: origin,
+    username: 'admin',
+    password: 'testpw',
+    verifySsl: false,
+    requestTimeoutMs: 1000,
+  });
+  setDispatcherForTests(pikvm, agent);
+  try {
+    await run(pikvm, () => hits);
+  } finally {
+    await agent.close();
+  }
+}
+
+function assertUnreachable(err) {
+  assert.ok(err instanceof KvmdError);
+  assert.equal(err.type, 'PIKVM_UNREACHABLE');
+  assert.notEqual(err.type, 'PIKVM_TIMEOUT');
+  assert.equal(err.message, 'kvmd network error');
+  return true;
+}
+
+test('UND_ERR_CONNECT_TIMEOUT is unreachable and a GET is tried 3 times', async () => {
+  await withCodedDispatch('UND_ERR_CONNECT_TIMEOUT', 'GET', async (pikvm, hits) => {
+    await assert.rejects(() => pikvm.getResolution(true), assertUnreachable);
+    assert.equal(hits(), 3);
+  });
+  await withCodedDispatch('UND_ERR_CONNECT_TIMEOUT', 'POST', async (pikvm, hits) => {
+    await assert.rejects(() => pikvm.sendKey('KeyA'), (err) => {
+      assert.ok(err instanceof KvmdError);
+      assert.equal(err.type, 'PIKVM_UNREACHABLE');
+      assert.notEqual(err.type, 'PIKVM_HID_STATE_UNKNOWN');
+      return true;
+    });
+    assert.equal(hits(), 1);
+  });
+});
+
+test('ENOTFOUND is unreachable and a GET is tried 3 times', async () => {
+  await withCodedDispatch('ENOTFOUND', 'GET', async (pikvm, hits) => {
+    await assert.rejects(() => pikvm.getResolution(true), assertUnreachable);
+    assert.equal(hits(), 3);
+  });
+  await withCodedDispatch('ENOTFOUND', 'POST', async (pikvm, hits) => {
+    await assert.rejects(
+      () => pikvm.msdWrite('disk.img', Readable.from(Buffer.from('abcd')), 4),
+      assertUnreachable,
+    );
+    assert.equal(hits(), 1);
+  });
+});
+
+test('EAI_AGAIN is unreachable, a GET is tried 3 times, and a HID POST is not', async () => {
+  await withCodedDispatch('EAI_AGAIN', 'GET', async (pikvm, hits) => {
+    await assert.rejects(() => pikvm.getResolution(true), assertUnreachable);
+    assert.equal(hits(), 3);
+  });
+  await withCodedDispatch('EAI_AGAIN', 'POST', async (pikvm, hits) => {
+    await assert.rejects(() => pikvm.sendKey('KeyA'), assertUnreachable);
+    assert.equal(hits(), 1);
   });
 });

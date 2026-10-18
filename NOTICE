@@ -10,6 +10,7 @@ Modified 2026-10 by PLN: normalized fetch host and named allowlist errors (GPL-3
 Modified 2026-10 by PLN: close the upload file handle once (GPL-3.0; see below).
 Modified 2026-10 by PLN: the upload double close was the EBADF (GPL-3.0; see below).
 Modified 2026-10 by PLN: abort tests reject a raw-fd upload read (GPL-3.0; see below).
+Modified 2026-10 by PLN: connect timeout and DNS map to unreachable (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -381,3 +382,13 @@ No code from another pikvm_mcp_server fork was added for these methods.
   run on a descriptor fs.read had seen. A numeric fd passed to
   fs.createReadStream calls fs.read. FileHandle.createReadStream does
   not. No code from another pikvm_mcp_server fork was added.
+
+2026-10, by PLN:
+  UND_ERR_CONNECT_TIMEOUT, ENOTFOUND, and EAI_AGAIN map to
+  PIKVM_UNREACHABLE. The code is read from the error and from each
+  cause. undici fetch puts it on cause. undici request() puts it on
+  the error. A header or body timeout stays PIKVM_TIMEOUT. A GET
+  retries these the same way it retries connection refused. A POST,
+  including HID and an MSD upload, does not, and a HID connect
+  failure is not PIKVM_HID_STATE_UNKNOWN. No code from another
+  pikvm_mcp_server fork was added.
