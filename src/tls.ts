@@ -1,5 +1,7 @@
 // Modified 2026-10 by PLN: TLS verify, pin, and insecure modes (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: classify TLS from the socket, and trust a pinned leaf (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: a reset after the certificate stays a transport error (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: one TLS spec per registry device (GPL-3.0; see NOTICE).
 // The pin options follow the design's undici check: ca is the pinned PEM,
 // rejectUnauthorized stays true, and checkServerIdentity compares SPKI
 // sha256. This file is written fresh.
@@ -17,9 +19,7 @@
  * the result is a pin mismatch. insecure leaves certificate checks off.
  *
  * A pin or verify failure is terminal. Nothing retries it as insecure.
- *
- * TODO(registry): Phase B item 10 copies this per device. The only key
- * today is "default".
+ * The registry builds one of these specs per device. `device` is that name.
  */
 
 import crypto from 'node:crypto';
@@ -138,7 +138,7 @@ const TLS_VERIFY_CODES = new Set([
 export type TlsMode = 'verify' | 'pin' | 'insecure';
 
 export interface DeviceTls {
-  /** Registry key. Only "default" until Phase B item 10. */
+  /** Registry device name. The legacy device is "default". */
   device: string;
   mode: TlsMode;
   certFile?: string;
@@ -249,30 +249,32 @@ function certificateExpired(raw: Buffer, code: string): boolean {
  * The handshake reached a certificate and the socket is not authorized.
  * Pin mode compares the leaf SPKI first. A different key is a pin
  * mismatch, including when the chain error is not in the X509 backstop.
- * The same key, and every verify-mode failure, is a verify failure.
+ * The same key is a verify failure only when OpenSSL reported one.
+ * A reset after the certificate, with no verify error, stays a transport error.
  */
 export function classifyUnauthorizedPeer(
   spec: DeviceTls,
   peerRaw: Buffer,
   code: string,
-): NodeJS.ErrnoException {
+  authorizationError?: string | null,
+): NodeJS.ErrnoException | undefined {
   if (spec.mode === 'pin' && spec.spkiSha256) {
     try {
       const presented = spkiSha256Of(new crypto.X509Certificate(peerRaw));
       if (presented !== spec.spkiSha256) {
         return pinMismatchError(spec.device, spec.spkiSha256, presented);
       }
-      if (certificateExpired(peerRaw, code)) {
-        return verifyFailedError(spec.device, 'CERT_HAS_EXPIRED', expiredVerifyDetail(spec.device));
-      }
     } catch {
       return pinMismatchError(spec.device, spec.spkiSha256, 'unreadable');
     }
   }
-  if (code === 'CERT_HAS_EXPIRED') {
-    return verifyFailedError(spec.device, code, expiredVerifyDetail(spec.device));
+  const auth = typeof authorizationError === 'string' ? authorizationError.trim() : '';
+  const known = isTlsVerifyCode(code);
+  if (!known && auth === '') return undefined;
+  if (code === 'CERT_HAS_EXPIRED' || (spec.mode === 'pin' && certificateExpired(peerRaw, code))) {
+    return verifyFailedError(spec.device, 'CERT_HAS_EXPIRED', expiredVerifyDetail(spec.device));
   }
-  const shown = code || 'unknown';
+  const shown = known ? code : 'authorizationError';
   return verifyFailedError(spec.device, shown, genericVerifyDetail(spec.device));
 }
 
@@ -446,7 +448,14 @@ function armTlsFailure(socket: tls.TLSSocket, spec: DeviceTls): void {
         }
         if (peer?.raw && socket.authorized === false) {
           const code = typeof coded.code === 'string' ? coded.code : 'unknown';
-          err = classifyUnauthorizedPeer(spec, peer.raw, code);
+          const auth = socket.authorizationError as string | Error | null | undefined;
+          const authText = typeof auth === 'string'
+            ? auth
+            : auth instanceof Error
+              ? auth.message
+              : '';
+          const replaced = classifyUnauthorizedPeer(spec, peer.raw, code, authText);
+          if (replaced) err = replaced;
         } else if (isTlsVerifyCode(coded.code)) {
           const code = coded.code as string;
           const detail = code === 'CERT_HAS_EXPIRED' ? expiredVerifyDetail(spec.device) : genericVerifyDetail(spec.device);

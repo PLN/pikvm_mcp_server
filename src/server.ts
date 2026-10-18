@@ -7,6 +7,8 @@
 // Modified 2026-10 by PLN: write_remote connect timeout (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: redactUrl on tool errors (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: pikvm_type delay is milliseconds (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: per-device client, lock, arm, and pikvm_devices (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: pikvm_devices lists an origin (GPL-3.0; see NOTICE).
 
 /**
  * MCP server factory for PiKVM tools
@@ -28,6 +30,7 @@ import {
 import { type PiKVMClient, KvmdError, redactionPassword } from './pikvm/client.js';
 import { redactSecrets } from './redact.js';
 import type { BusyLock } from './pikvm/lock.js';
+import { type Fleet, type FleetDevice, resolveFleetDevice } from './devices.js';
 import { autoCalibrateWithRetries } from './pikvm/auto-calibrate.js';
 import { allPrompts, getPromptByName } from './prompts/index.js';
 import { skillTools, isSkillTool, handleSkillToolCall } from './prompts/skill-tools.js';
@@ -47,7 +50,6 @@ import {
   publicMsdState,
   readMsdJob,
   removeMsd,
-  resolveDevice,
   startMsdFetch,
   startMsdUpload,
 } from './msd.js';
@@ -72,6 +74,11 @@ export interface McpServerDeps {
   msdArmGateEnforced?: boolean;
   /** Local upload directory and caps. Upload is hidden while localDir is unset. */
   msd?: MsdServerConfig;
+  /**
+   * Per-device clients and locks. Omitted means one implicit device named
+   * default, using pikvm and lock, with registryActive false.
+   */
+  fleet?: Fleet;
 }
 
 /**
@@ -320,6 +327,88 @@ function msdDisarmedResult(tool: string) {
 function jsonText(value: unknown) {
   return {
     content: [{ type: 'text' as const, text: JSON.stringify(value) }],
+  };
+}
+
+/** Tool-output origin. A legacy host may still carry userinfo, a path, and a query. */
+function outputOrigin(host: string): string {
+  return new URL(host).origin;
+}
+
+function implicitFleet(deps: McpServerDeps): Fleet {
+  const legacyClient = deps.pikvm;
+  const legacyLock = deps.lock;
+  const password = redactionPassword(legacyClient);
+  const device: FleetDevice = {
+    name: 'default',
+    host: outputOrigin(legacyClient.configuredHost()),
+    client: legacyClient,
+    lock: legacyLock,
+    armHid: !deps.armGateEnforced,
+    armMsd: deps.msdArmGateEnforced !== true,
+    hwTest: false,
+    tlsMode: legacyClient.tlsMode(),
+  };
+  return {
+    registryActive: false,
+    defaultName: 'default',
+    devices: new Map([['default', device]]),
+    passwords: password ? [password] : [],
+  };
+}
+
+function redactToolText(error: unknown, passwords: readonly string[]): string {
+  let text = formatToolError(error, passwords[0] ?? '');
+  for (const password of passwords.slice(1)) {
+    text = redactSecrets(text, password);
+  }
+  return text;
+}
+
+function listFleetDevices(fleet: Fleet) {
+  const devices = [...fleet.devices.values()].map((device) => ({
+    name: device.name,
+    host: outputOrigin(device.host),
+    tls: device.tlsMode,
+    armHid: device.armHid,
+    armMsd: device.armMsd,
+    hwTest: device.hwTest,
+  }));
+  devices.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+  return { default: fleet.defaultName, devices };
+}
+
+function tagFleetResult<T extends { content?: Array<{ type?: string; text?: string }> }>(
+  result: T,
+  ctx: FleetDevice | undefined,
+  registryActive: boolean,
+): T {
+  if (!registryActive || !ctx) return result;
+  const content = result.content;
+  if (!content || content.length === 0) return result;
+  const first = content[0];
+  if (!first || first.type !== 'text' || typeof first.text !== 'string') {
+    return {
+      ...result,
+      content: [{ type: 'text', text: `Device: ${ctx.name}.` }, ...content],
+    };
+  }
+  let text = first.text;
+  const trimmed = text.trim();
+  if (trimmed.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(text) as unknown;
+      if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        text = JSON.stringify({ ...(parsed as Record<string, unknown>), device: ctx.name });
+        return { ...result, content: [{ ...first, text }, ...content.slice(1)] };
+      }
+    } catch {
+      // The text is not a JSON object.
+    }
+  }
+  return {
+    ...result,
+    content: [{ ...first, text: `${text}\nDevice: ${ctx.name}.` }, ...content.slice(1)],
   };
 }
 
@@ -723,8 +812,26 @@ const tools: Tool[] = [
       required: ['image', 'confirmImage'],
     },
   },
+  {
+    name: 'pikvm_devices',
+    description: 'List devices: name, normalised origin, TLS mode, and arm state. Passwords and secret file paths are not included.',
+    inputSchema: {
+      type: 'object',
+      properties: {},
+    },
+  },
   ...skillTools,
 ];
+
+for (const tool of tools) {
+  if (!tool.name.startsWith('pikvm_') || tool.name === 'pikvm_devices') continue;
+  if (tool.inputSchema.type !== 'object') continue;
+  tool.inputSchema.properties ??= {};
+  tool.inputSchema.properties.device = {
+    type: 'string',
+    description: 'Registry device name. Omitted means the default device.',
+  };
+}
 
 /**
  * Build a fresh MCP Server with all handlers registered.
@@ -734,6 +841,7 @@ const tools: Tool[] = [
  * model, which requires one transport (and therefore one Server) per session.
  */
 export function createMcpServer(deps: McpServerDeps): Server {
+  const fleet = deps.fleet ?? implicitFleet(deps);
   const server = new Server(
     {
       name: 'pikvm-mcp-server',
@@ -778,8 +886,10 @@ export function createMcpServer(deps: McpServerDeps): Server {
   // Handle list tools request
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     const fetchReady = (deps.msd?.urlAllow?.entries.length ?? 0) > 0;
+    const uploadReady = Boolean(deps.msd?.localDir)
+      || [...fleet.devices.values()].some((device) => Boolean(device.msdLocalDir));
     const visible = tools.filter((tool) => {
-      if (tool.name === 'pikvm_msd_upload' && !deps.msd?.localDir) return false;
+      if (tool.name === 'pikvm_msd_upload' && !uploadReady) return false;
       if (tool.name === 'pikvm_msd_fetch_url' && !fetchReady) return false;
       return true;
     });
@@ -789,33 +899,52 @@ export function createMcpServer(deps: McpServerDeps): Server {
   // Handle tool calls
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args = {} } = request.params;
+    let ctx: FleetDevice | undefined;
+    if (name !== 'pikvm_devices' && !isSkillTool(name)) {
+      try {
+        ctx = resolveFleetDevice(args, fleet);
+      } catch (error) {
+        return {
+          content: [{ type: 'text', text: redactToolText(error, fleet.passwords) }],
+          isError: true,
+        };
+      }
+    }
+    const deviceClient = ctx?.client ?? fleet.devices.get(fleet.defaultName)!.client;
+    const deviceLock = ctx?.lock ?? fleet.devices.get(fleet.defaultName)!.lock;
 
-    // Block other tools while auto-calibration is in progress
-    if (deps.lock.isBusy && name !== 'pikvm_auto_calibrate') {
-      return {
-        content: [{ type: 'text', text: `Error: ${deps.lock.holder} in progress, please wait.` }],
+    // Block other tools on this device while its auto-calibration is in progress.
+    if (deviceLock.isBusy && name !== 'pikvm_auto_calibrate') {
+      return tagFleetResult({
+        content: [{ type: 'text', text: `Error: ${deviceLock.holder} in progress, please wait.` }],
         isError: true,
-      };
+      }, ctx, fleet.registryActive);
     }
 
-    // HID arm-gate: refuse physical-input tools when disarmed (HTTP mode).
-    if (deps.armGateEnforced && ARM_GATED_TOOLS.has(name)) {
-      return disarmedResult(name);
+    // HID arm-gate: the device arm already includes the process ceiling.
+    if (ctx && !ctx.armHid && ARM_GATED_TOOLS.has(name)) {
+      return tagFleetResult(disarmedResult(name), ctx, fleet.registryActive);
     }
 
     // MSD arm-gate: every pikvm_msd_* tool except the read-only allowlist.
-    if (deps.msdArmGateEnforced && msdToolRequiresArm(name)) {
-      return msdDisarmedResult(name);
+    if (ctx && !ctx.armMsd && msdToolRequiresArm(name)) {
+      return tagFleetResult(msdDisarmedResult(name), ctx, fleet.registryActive);
     }
 
     try {
       if (isSkillTool(name)) {
         return handleSkillToolCall(name, args);
       }
+      if (name === 'pikvm_devices') {
+        return jsonText(listFleetDevices(fleet));
+      }
+      if (!ctx) throw new Error(`Unknown tool: ${name}`);
+      const active = ctx;
 
+      const produced = await (async () => {
       switch (name) {
         case 'pikvm_screenshot': {
-          const result = await deps.pikvm.screenshot({
+          const result = await deviceClient.screenshot({
             maxWidth: validateNumber(args.maxWidth, 1, 10000),
             maxHeight: validateNumber(args.maxHeight, 1, 10000),
             quality: validateNumber(args.quality, 1, 100),
@@ -845,7 +974,7 @@ export function createMcpServer(deps: McpServerDeps): Server {
         }
 
         case 'pikvm_get_resolution': {
-          const resolution = await deps.pikvm.getResolution(true); // force refresh
+          const resolution = await deviceClient.getResolution(true); // force refresh
           return {
             content: [
               {
@@ -858,7 +987,7 @@ export function createMcpServer(deps: McpServerDeps): Server {
 
         case 'pikvm_type': {
           const text = requireString(args.text, 'text');
-          await deps.pikvm.type(text, {
+          await deviceClient.type(text, {
             keymap: validateString(args.keymap),
             slow: validateBoolean(args.slow),
             delay: validateNumber(args.delay, 0, 200),
@@ -877,21 +1006,21 @@ export function createMcpServer(deps: McpServerDeps): Server {
 
           // Press modifiers
           for (const mod of modifiers) {
-            await deps.pikvm.sendKey(mod, { state: true });
+            await deviceClient.sendKey(mod, { state: true });
           }
 
           // Send main key
           if (state === 'press') {
-            await deps.pikvm.sendKey(key, { state: true });
+            await deviceClient.sendKey(key, { state: true });
           } else if (state === 'release') {
-            await deps.pikvm.sendKey(key, { state: false });
+            await deviceClient.sendKey(key, { state: false });
           } else {
-            await deps.pikvm.sendKey(key); // click
+            await deviceClient.sendKey(key); // click
           }
 
           // Release modifiers (in reverse order)
           for (const mod of [...modifiers].reverse()) {
-            await deps.pikvm.sendKey(mod, { state: false });
+            await deviceClient.sendKey(mod, { state: false });
           }
 
           return {
@@ -911,7 +1040,7 @@ export function createMcpServer(deps: McpServerDeps): Server {
           if (keys.length > 10) {
             throw new Error('keys array must have at most 10 elements');
           }
-          await deps.pikvm.sendShortcut(keys);
+          await deviceClient.sendShortcut(keys);
           return {
             content: [{ type: 'text', text: `Sent shortcut: ${keys.join('+')}` }],
           };
@@ -924,12 +1053,12 @@ export function createMcpServer(deps: McpServerDeps): Server {
           let calibrationWarning = '';
           if (relative) {
             // Relative moves are clamped to -127 to 127 in the client
-            await deps.pikvm.mouseMoveRelative(x, y);
+            await deviceClient.mouseMoveRelative(x, y);
           } else {
             // Absolute moves should be positive pixel coordinates
             const clampedX = Math.max(0, Math.round(x));
             const clampedY = Math.max(0, Math.round(y));
-            const result = await deps.pikvm.mouseMove(clampedX, clampedY);
+            const result = await deviceClient.mouseMove(clampedX, clampedY);
             if (result.calibrationInvalidated) {
               calibrationWarning = '\n⚠️ Resolution changed - calibration has been cleared. Recalibrate with pikvm_auto_calibrate (preferred) or pikvm_calibrate.';
             }
@@ -953,16 +1082,16 @@ export function createMcpServer(deps: McpServerDeps): Server {
 
           // Move to position first if specified
           if (clickX !== undefined && clickY !== undefined) {
-            await deps.pikvm.mouseMove(Math.round(clickX), Math.round(clickY));
+            await deviceClient.mouseMove(Math.round(clickX), Math.round(clickY));
           }
 
           const state = validateEnum(args.state, VALID_KEY_STATES, 'click');
           if (state === 'press') {
-            await deps.pikvm.mouseClick(button, { state: true });
+            await deviceClient.mouseClick(button, { state: true });
           } else if (state === 'release') {
-            await deps.pikvm.mouseClick(button, { state: false });
+            await deviceClient.mouseClick(button, { state: false });
           } else {
-            await deps.pikvm.mouseClick(button);
+            await deviceClient.mouseClick(button);
           }
 
           return {
@@ -973,7 +1102,7 @@ export function createMcpServer(deps: McpServerDeps): Server {
         case 'pikvm_mouse_scroll': {
           const deltaY = requireNumber(args.deltaY, 'deltaY');
           const deltaX = validateNumber(args.deltaX) ?? 0;
-          await deps.pikvm.mouseScroll(deltaX, deltaY);
+          await deviceClient.mouseScroll(deltaX, deltaY);
           return {
             content: [
               {
@@ -985,7 +1114,7 @@ export function createMcpServer(deps: McpServerDeps): Server {
         }
 
         case 'pikvm_calibrate': {
-          const result = await deps.pikvm.calibrate();
+          const result = await deviceClient.calibrate();
           return {
             content: [
               {
@@ -1003,8 +1132,8 @@ export function createMcpServer(deps: McpServerDeps): Server {
         case 'pikvm_set_calibration': {
           const factorX = requireNumber(args.factorX, 'factorX');
           const factorY = requireNumber(args.factorY, 'factorY');
-          deps.pikvm.setCalibrationFactors(factorX, factorY);
-          const calibration = deps.pikvm.getCalibration();
+          deviceClient.setCalibrationFactors(factorX, factorY);
+          const calibration = deviceClient.getCalibration();
           return {
             content: [
               {
@@ -1018,7 +1147,7 @@ export function createMcpServer(deps: McpServerDeps): Server {
         }
 
         case 'pikvm_get_calibration': {
-          const calibration = deps.pikvm.getCalibration();
+          const calibration = deviceClient.getCalibration();
           if (calibration) {
             return {
               content: [
@@ -1044,7 +1173,7 @@ export function createMcpServer(deps: McpServerDeps): Server {
         }
 
         case 'pikvm_clear_calibration': {
-          deps.pikvm.clearCalibration();
+          deviceClient.clearCalibration();
           return {
             content: [
               {
@@ -1056,16 +1185,16 @@ export function createMcpServer(deps: McpServerDeps): Server {
         }
 
         case 'pikvm_auto_calibrate': {
-          if (deps.lock.isBusy) {
+          if (deviceLock.isBusy) {
             return {
               content: [{ type: 'text', text: 'Auto-calibration is already in progress.' }],
               isError: true,
             };
           }
 
-          deps.lock.acquire('Auto-calibration');
+          deviceLock.acquire('Auto-calibration');
           try {
-            const result = await autoCalibrateWithRetries(deps.pikvm, {
+            const result = await autoCalibrateWithRetries(deviceClient, {
               rounds: validateNumber(args.rounds, 2, 20) ?? deps.calibrationConfig.rounds,
               verifyRounds: validateNumber(args.verifyRounds, 1, 20) ?? deps.calibrationConfig.verifyRounds,
               moveDelayMs: validateNumber(args.moveDelayMs, 50, 2000) ?? deps.calibrationConfig.moveDelayMs,
@@ -1090,18 +1219,16 @@ export function createMcpServer(deps: McpServerDeps): Server {
               ],
             };
           } finally {
-            deps.lock.release();
+            deviceLock.release();
           }
         }
 
         case 'pikvm_msd_status': {
-          const { client } = resolveDevice(args, deps.pikvm);
-          const state = await client.getMsdState();
+          const state = await active.client.getMsdState();
           return jsonText(publicMsdState(state));
         }
 
         case 'pikvm_msd_mount': {
-          const resolved = resolveDevice(args, deps.pikvm);
           const image = requireString(args.image, 'image');
           const confirmImage = requireString(args.confirmImage, 'confirmImage');
           const mode = requireEnum(args.mode, ['cdrom', 'flash'] as const, 'mode');
@@ -1110,8 +1237,8 @@ export function createMcpServer(deps: McpServerDeps): Server {
           const expectImage = args.expectImage === undefined
             ? undefined
             : requireText(args.expectImage, 'expectImage');
-          const outcome = await mountMsd(resolved.client, {
-            device: resolved.name,
+          const outcome = await mountMsd(active.client, {
+            device: active.name,
             image,
             confirmImage,
             mode,
@@ -1129,23 +1256,21 @@ export function createMcpServer(deps: McpServerDeps): Server {
         }
 
         case 'pikvm_msd_eject': {
-          const resolved = resolveDevice(args, deps.pikvm);
           const expectImage = requireText(args.expectImage, 'expectImage');
-          const outcome = await ejectMsd(resolved.client, expectImage, resolved.name);
+          const outcome = await ejectMsd(active.client, expectImage, active.name);
           return jsonText(outcome);
         }
 
         case 'pikvm_msd_upload': {
-          const localDir = deps.msd?.localDir;
+          const localDir = active.msdLocalDir ?? deps.msd?.localDir;
           if (!localDir) {
             throw new Error('pikvm_msd_upload is unavailable until PIKVM_MSD_LOCAL_DIR is set');
           }
-          const resolved = resolveDevice(args, deps.pikvm);
           const file = requireString(args.file, 'file');
           const confirmImage = requireString(args.confirmImage, 'confirmImage');
           const sha256 = args.sha256 === undefined ? undefined : requireString(args.sha256, 'sha256');
-          const outcome = await startMsdUpload(resolved.client, {
-            device: resolved.name,
+          const outcome = await startMsdUpload(active.client, {
+            device: active.name,
             localDir,
             maxBytes: deps.msd?.maxBytes ?? MSD_MAX_BYTES_DEFAULT,
             extensions: deps.msd?.extensions ?? MSD_EXTENSIONS_DEFAULT,
@@ -1166,12 +1291,11 @@ export function createMcpServer(deps: McpServerDeps): Server {
           if (!allow || allow.entries.length === 0) {
             throw new Error('pikvm_msd_fetch_url is unavailable until PIKVM_MSD_URL_ALLOWLIST is set');
           }
-          const resolved = resolveDevice(args, deps.pikvm);
           const url = requireString(args.url, 'url');
           const confirmImage = requireString(args.confirmImage, 'confirmImage');
           const image = args.image === undefined ? undefined : requireString(args.image, 'image');
-          const outcome = await startMsdFetch(resolved.client, {
-            device: resolved.name,
+          const outcome = await startMsdFetch(active.client, {
+            device: active.name,
             url,
             image,
             confirmImage,
@@ -1190,6 +1314,7 @@ export function createMcpServer(deps: McpServerDeps): Server {
         case 'pikvm_msd_job': {
           const jobId = requireString(args.jobId, 'jobId');
           const job = readMsdJob(jobId, {
+            device: active.name,
             jobLimit: deps.msd?.jobLimit,
             jobTtlMs: deps.msd?.jobTtlMs,
           });
@@ -1198,21 +1323,22 @@ export function createMcpServer(deps: McpServerDeps): Server {
         }
 
         case 'pikvm_msd_remove': {
-          const resolved = resolveDevice(args, deps.pikvm);
           const image = requireString(args.image, 'image');
           const confirmImage = requireString(args.confirmImage, 'confirmImage');
-          const outcome = await removeMsd(resolved.client, image, confirmImage, resolved.name);
+          const outcome = await removeMsd(active.client, image, confirmImage, active.name);
           return jsonText(outcome);
         }
 
         default:
           throw new Error(`Unknown tool: ${name}`);
       }
+      })();
+      return tagFleetResult(produced, active, fleet.registryActive);
     } catch (error) {
-      return {
-        content: [{ type: 'text', text: formatToolError(error, redactionPassword(deps.pikvm)) }],
-        isError: true,
-      };
+      return tagFleetResult({
+        content: [{ type: 'text' as const, text: redactToolText(error, fleet.passwords) }],
+        isError: true as const,
+      }, ctx, fleet.registryActive);
     }
   });
 

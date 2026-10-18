@@ -9,6 +9,8 @@
 // Modified 2026-10 by PLN: header and body timeouts stay timeouts (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: TLS verify, pin, and insecure modes (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: kvmd redirects are not followed (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: configured host and TLS mode for the device list (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: redactUrl on kvmd error text (GPL-3.0; see NOTICE).
 // AbortSignal.timeout and PIKVM_UNREACHABLE / PIKVM_AUTH_FAILED no-retry codes
 // adapted from dtrukr/pikvm_mcp_server src/pikvm/client.ts @ d120243 (GPL-3.0).
 // Snapshot HTTP 503 retry-once adapted from dvaerum/pikvm_mcp_server
@@ -76,6 +78,7 @@ import {
   hidDelayQueryValue,
 } from '../hid-deadline.js';
 import { capKvmdField, redactSecrets } from '../redact.js';
+import { redactUrl } from '../url-policy.js';
 import {
   MSD_IDLE_TIMEOUT_DEFAULT_MS,
   MSD_IDLE_TIMEOUT_MAX_MS,
@@ -91,8 +94,8 @@ export interface PiKVMConfig {
   password: string;
   verifySsl?: boolean;
   /**
-   * Per-device TLS. Only "default" is used until the registry.
-   * TODO(registry): Phase B item 10 selects this by device name.
+   * TLS for this client. A registry builds one client per device and
+   * puts that device's spec in `default`.
    */
   tls?: { default: DeviceTls };
   defaultKeymap?: string;
@@ -803,6 +806,15 @@ export class PiKVMClient {
     await this.dispatcher.close();
   }
 
+  /** Host string this client was given. The registry stores a normalised origin. */
+  configuredHost(): string {
+    return this.config.host;
+  }
+
+  tlsMode(): DeviceTls['mode'] {
+    return this.config.tls.default.mode;
+  }
+
   /**
    * Make an authenticated request to the PiKVM API.
    *
@@ -986,7 +998,7 @@ export class PiKVMClient {
   }
 
   private redact(value: string): string {
-    return redactSecrets(value, this.config.password);
+    return redactUrl(redactSecrets(value, this.config.password));
   }
 
   /**

@@ -7,6 +7,8 @@
 // Modified 2026-10 by PLN: redactUrl on MSD errors (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: close the upload file handle once (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: fh.close waits for the in-flight read (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: job reads stay on the device that created them (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: the retained-job cap is per device (GPL-3.0; see NOTICE).
 
 /**
  * Policy for MSD status, mount, eject, upload, and remove.
@@ -47,8 +49,9 @@ export interface ResolvedDevice {
 }
 
 /**
- * Until the fleet registry exists, every MSD tool uses the one device.
- * `device` is accepted and ignored so later wiring stays mechanical.
+ * Single-client helper. The server resolves a fleet device instead.
+ * The hardware skip test still checks that `{ device: 'default' }`
+ * returns this client unchanged.
  */
 export function resolveDevice(
   _args: { device?: unknown },
@@ -489,30 +492,43 @@ function jobTtlOf(value: number | undefined): number {
   return value !== undefined && Number.isSafeInteger(value) && value >= 0 ? value : JOB_TTL_MS;
 }
 
-/** Drop finished jobs older than the TTL, then the oldest finished jobs past the cap. */
+/** Drop finished jobs older than the TTL, then each device's oldest finished jobs past the cap. */
 function pruneJobs(limit: number, ttlMs: number): void {
   const now = Date.now();
   for (const [id, job] of jobs) {
     if (job.finishedAt !== undefined && now - job.finishedAt > ttlMs) jobs.delete(id);
   }
-  if (jobs.size <= limit) return;
-  const finished = [...jobs.entries()].filter(([, job]) => job.finishedAt !== undefined);
-  finished.sort((a, b) => (a[1].finishedAt ?? 0) - (b[1].finishedAt ?? 0));
-  for (const [id] of finished) {
-    if (jobs.size <= limit) break;
-    jobs.delete(id);
+  const names = new Set<string>();
+  for (const job of jobs.values()) names.add(job.device);
+  for (const device of names) {
+    const owned = [...jobs.entries()].filter(([, job]) => job.device === device);
+    if (owned.length <= limit) continue;
+    const finished = owned.filter(([, job]) => job.finishedAt !== undefined);
+    finished.sort((a, b) => (a[1].finishedAt ?? 0) - (b[1].finishedAt ?? 0));
+    let extra = owned.length - limit;
+    for (const [id] of finished) {
+      if (extra <= 0) break;
+      jobs.delete(id);
+      extra -= 1;
+    }
   }
 }
 
 export interface JobReadOptions {
   jobLimit?: number;
   jobTtlMs?: number;
+  /**
+   * When set, a job stored for another device is not found.
+   * The id stays a random 16-byte hex value. The miss matches an unknown id.
+   */
+  device?: string;
 }
 
 export function readMsdJob(jobId: string, options: JobReadOptions = {}): MsdJobView | undefined {
   pruneJobs(jobLimitOf(options.jobLimit), jobTtlOf(options.jobTtlMs));
   const job = jobs.get(jobId);
   if (!job) return undefined;
+  if (options.device !== undefined && job.device !== options.device) return undefined;
   const view: MsdJobView = {
     state: job.state,
     bytes: job.bytes,
@@ -539,7 +555,7 @@ export interface UploadRequest {
   beforeUploadStream?: () => Promise<void>;
   /** Overrides the 1.5s storage.uploading poll. Unset in production. */
   uploadPollMs?: number;
-  /** Retained-job cap. Default 64. Unset in production. */
+  /** Retained-job cap for one device. Default 64. Unset in production. */
   jobLimit?: number;
   /** Finished-job TTL in ms. Default 24h. Unset in production. */
   jobTtlMs?: number;

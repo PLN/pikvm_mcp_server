@@ -1,6 +1,7 @@
 // Modified 2026-10 by PLN: hardware suite MSD cycle and cleanup (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: cleanup deletes only this run's image names (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: restore a leftover image this run did not create (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: cleanup logs go through redactUrl (GPL-3.0; see NOTICE).
 
 /**
  * Upload, mount, eject, and remove one mcp-hwtest image through the tools.
@@ -11,7 +12,7 @@
  * and left in place. A forced failure still runs the finally block.
  */
 
-import { inspectFetchUrl } from '../../dist/url-policy.js';
+import { inspectFetchUrl, redactUrl } from '../../dist/url-policy.js';
 import { isHwTestImageName } from './media.mjs';
 
 function toolText(result) {
@@ -134,7 +135,7 @@ async function cleanup(call, snap, created, client, log) {
   );
   if (leftovers.length === 0) log('hw: no mcp-hwtest images left');
   else log(`hw: leftover mcp-hwtest images: ${leftovers.join(', ')}`);
-  for (const err of errors) log(`hw: cleanup error: ${err.message}`);
+  for (const err of errors) log(`hw: cleanup error: ${redactUrl(err.message)}`);
   return { errors, leftovers, finalStatus };
 }
 
@@ -235,7 +236,7 @@ export async function runMsdWriteCycle(call, options) {
     cleaned = await cleanup(call, snap, created, options.client, log);
   }
   if (cleaned.errors.length > 0) {
-    const summary = cleaned.errors.map((err) => err.message).join('; ');
+    const summary = cleaned.errors.map((err) => redactUrl(err.message)).join('; ');
     if (failure) failure.message += `; cleanup failed: ${summary}`;
     else failure = new Error(`cleanup failed: ${summary}`);
   }

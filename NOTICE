@@ -22,6 +22,12 @@ Modified 2026-10 by PLN: bearer whitespace check is HTTP-only (GPL-3.0; see belo
 Modified 2026-10 by PLN: TLS verify, pin, and insecure modes (GPL-3.0; see below).
 Modified 2026-10 by PLN: TLS failures follow the socket, and a pinned leaf may be CA-signed (GPL-3.0; see below).
 Modified 2026-10 by PLN: kvmd redirects are not followed (GPL-3.0; see below).
+Modified 2026-10 by PLN: a reset after the certificate stays unreachable (GPL-3.0; see below).
+Modified 2026-10 by PLN: device registry (GPL-3.0; see below).
+Modified 2026-10 by PLN: listed host is an origin (GPL-3.0; see below).
+Modified 2026-10 by PLN: duplicate devices, a shared origin, and a per-device job cap (GPL-3.0; see below).
+Modified 2026-10 by PLN: test certificate serials are minimal DER (GPL-3.0; see below).
+Modified 2026-10 by PLN: redact a non-Error cause, and one host across schemes (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -551,7 +557,7 @@ No code from another pikvm_mcp_server fork was added for these methods.
   certificate, then pin the new one. pin writes the leaf only. A CA or
   intermediate pin does not match that leaf. A destination that is not
   a certificate is shown as unreadable and does not block a re-pin.
-  rename replaces a   symlink at --out and does not write through it, and
+  rename replaces a symlink at --out and does not write through it, and
   the directory fsync after the rename is best-effort. An IPv6 literal
   is connected without the URL brackets and without an SNI name. No
   code from another pikvm_mcp_server fork was copied.
@@ -566,3 +572,68 @@ No code from another pikvm_mcp_server fork was added for these methods.
   refused. The message includes the status and the Location origin
   only, with no userinfo, path, query, or password. The error is not
   retried. No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  A pin mismatch is still PIKVM_TLS_PIN_MISMATCH when the socket error is
+  not a verify code. Any other unauthorized socket is
+  PIKVM_TLS_VERIFY_FAILED only when authorizationError is set or the code
+  is a known X509 verify code. A reset after the Certificate flight, with
+  neither, stays on the transport path and follows the usual unreachable
+  retry rules. verify mode does not set allowPartialTrustChain. No code
+  from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  PIKVM_DEVICES_FILE or PIKVM_DEVICES names a fleet. The file is read
+  with the same non-blocking regular-file open and 64 KiB cap as a
+  secret, and it is not a secret, so the mode is not warned. Setting
+  both is a startup error. With neither set, PIKVM_HOST and the legacy
+  password and TLS variables are still device default and the tool
+  results are unchanged. If PIKVM_HOST is also set, it is ignored and
+  one stderr line says so. The two sources are not merged.
+  Hosts are normalised to an http(s) origin. That idea is
+  dtrukr/pikvm_mcp_server normalizeHost at 097b529 (GPL-3.0, a fork of
+  KultivatorConsulting/pikvm_mcp_server). The function here is written
+  fresh. There is no IP-range restriction. A password key is rejected.
+  passwordFile uses the secret-file reader. passwordCredential is one
+  path segment under CREDENTIALS_DIRECTORY. Each device has its own
+  client, busy lock, MSD jobs, calibration, and arm flags. The
+  environment arm flags are a ceiling. Job ids stay random 16-byte hex
+  and a read must name the device that created the job. pikvm_devices
+  lists names, origins, TLS mode, and arm state, and does not return
+  passwords or secret paths. pikvm-mcp-server pin accepts a registry
+  name. The hardware suite accepts a registry device only when hwTest
+  is true, and HID or MSD still need the allow flag plus that device's
+  arm. No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  pikvm_devices lists the legacy device as an origin. A legacy
+  PIKVM_HOST may still carry userinfo, a path, and a query, and that
+  string is what the client connects with. The listed host is
+  new URL(host).origin. Tool errors, a logged config, startup and
+  fatal text, the pin command, and the hardware logs pass a host
+  through that origin or through redactUrl. A copied error keeps its
+  code and its cause, so a pin mismatch stays visible after the URL
+  is redacted. No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  A repeated key in the registry devices object is a startup error
+  that names the device. Two devices that normalise to the same origin
+  are a startup error that names both, so they cannot take separate
+  MSD locks on one kvmd. The retained-job cap counts each device on
+  its own. Calibration and the screenshot scale stay on the device
+  and are shared by every HTTP session for that device. Per-session
+  state is deferred. No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  Test certificates use one serial helper. The first byte is
+  (byte & 0x7f) | 0x40, so the INTEGER is positive and does not start
+  with 0x00. A 0x00 0x12 serial used to be non-minimal DER, and
+  OpenSSL rejected it as illegal padding. Leaf keyUsage 0xa0 declares
+  five unused bits. No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  redactError redacts a string cause and the string fields of a plain
+  object cause, including a url. A cause that points at itself is
+  copied once. http://h and https://h are the same device, and so are
+  two schemes on the same explicit port. The error names both devices.
+  No code from another pikvm_mcp_server fork was copied.

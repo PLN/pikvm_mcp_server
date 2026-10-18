@@ -18,6 +18,7 @@
 <!-- Modified 2026-10 by PLN: TLS verify, pin, and insecure modes (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: pin the leaf, expiry wording, and Node >=22.9.0 (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: kvmd redirects are not followed (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: calibration and scale are shared across HTTP sessions (GPL-3.0; see NOTICE) -->
 
 # PiKVM MCP Server
 
@@ -103,7 +104,7 @@ PIKVM_MSD_IDLE_TIMEOUT_MS=60000
 
 ## Secrets
 
-`PIKVM_PASSWORD` and `PIKVM_MCP_BEARER` are resolved in this order: the direct environment variable, then `<NAME>_FILE`, then `$CREDENTIALS_DIRECTORY/<credential>` when `CREDENTIALS_DIRECTORY` is set. The credential names are `pikvm-password` and `pikvm-mcp-bearer`. A device registry `passwordFile` is not implemented yet (Phase B item 10); the same helper is what that will call.
+`PIKVM_PASSWORD` and `PIKVM_MCP_BEARER` are resolved in this order: the direct environment variable, then `<NAME>_FILE`, then `$CREDENTIALS_DIRECTORY/<credential>` when `CREDENTIALS_DIRECTORY` is set. The credential names are `pikvm-password` and `pikvm-mcp-bearer`. A registry device does not use those two variables. Its password is `passwordFile` or `passwordCredential` in the registry JSON.
 
 | Variable | Role |
 | --- | --- |
@@ -113,7 +114,7 @@ PIKVM_MSD_IDLE_TIMEOUT_MS=60000
 | `PIKVM_MCP_BEARER_FILE` | Path of a regular file holding the bearer. An empty value is unset. |
 | `CREDENTIALS_DIRECTORY` | systemd `LoadCredential` directory. Consulted only when it is set, and only for a secret that was not set above. A missing credential file means that secret is unset. |
 
-A direct value is used verbatim, including a trailing newline. Only file bytes lose exactly one trailing newline (`\n` or `\r\n`) and a leading UTF-8 BOM. Other whitespace, including a trailing space or a second newline, stays. Empty file content is a startup error. A NUL byte in a file is an error that names the variable and the path. An empty direct value and an empty `*_FILE` are unset and fall through. Symlinks are followed. The file is opened non-blocking and the opened target must be a regular file: a directory, FIFO, socket, or device is rejected, and a FIFO open does not wait. A mode with any group or other bits (looser than `0600`) is warned on stderr, with the variable name, the path, and the mode, never the value. That mode check is skipped on Windows. A file larger than 64 KiB is rejected before the body is read. A missing or unreadable `*_FILE` is a startup error that names the variable and the path. If the direct variable and `*_FILE` are both non-empty, the direct variable wins and one stderr line says the file variable was ignored. In HTTP mode, a bearer with leading or trailing whitespace is rejected at startup. stdio does not use the bearer, so the same value still starts. The error names `PIKVM_MCP_BEARER` and not the value. None of these messages include the secret.
+A direct value is used verbatim, including a trailing newline. Only file bytes lose exactly one trailing newline (`\n` or `\r\n`) and a leading UTF-8 BOM. Other whitespace, including a trailing space or a second newline, stays. Empty file content is a startup error. A NUL byte in a file is an error that names the variable and the path. An empty direct value and an empty `*_FILE` are unset and fall through. Symlinks are followed. The file is opened non-blocking and the opened target must be a regular file: a directory, FIFO, socket, or device is rejected, and a FIFO open does not wait. A mode with any group or other bits (looser than `0600`) is warned on stderr, with the variable name, the path, and the mode, never the value. That mode check is skipped on Windows. A file larger than 64 KiB is rejected before the body is read. A missing or unreadable `*_FILE` is a startup error that names the variable and the path. If the direct variable and `*_FILE` are both non-empty, the direct variable wins and one stderr line says the file variable was ignored. In HTTP mode, a bearer with leading or trailing whitespace is rejected at startup. stdio does not use the bearer, so the same value still starts. The error names `PIKVM_MCP_BEARER` and not the value. None of these messages include the secret. A registry `passwordFile` uses this same file reader. `passwordCredential` is one path segment under `CREDENTIALS_DIRECTORY`.
 
 ```ini
 # /etc/systemd/system/pikvm-mcp.service.d/credentials.conf
@@ -133,7 +134,7 @@ POST `/hid/*` uses its own ceiling, because kvmd answers only after the input ha
 
 ## TLS
 
-kvmd ships a self-signed certificate. Three modes select how this process checks it. The device name is `default` until the registry exists.
+kvmd ships a self-signed certificate. Three modes select how this process checks it. With no registry the device name is `default`. A registry device sets its own `tls.mode`.
 
 | Variable | Role |
 | --- | --- |
@@ -157,6 +158,75 @@ export PIKVM_TLS_MODE=pin
 `pin default` connects once, with verification disabled only for that handshake. It sends no request and no password. It prints the subject, issuer, validity, SHA-256 certificate fingerprint, and SPKI sha256. On a terminal it writes the file only after you type `yes`. Without a terminal it writes nothing unless you pass `--yes`. `--yes` is for a scripted re-pin after the new certificate was verified out of band. Replacing an existing file prints the old SPKI and the new SPKI first. A file that is already there but is corrupt or not a certificate is shown as `old SPKI sha256: unreadable`, and the command still asks before it writes. The write is a temp file in the same directory, then a rename, mode `0644`. The rename replaces a symlink at `--out` and does not write through it. On POSIX the directory is fsynced after the rename, best-effort. The command writes the leaf only, and it does not run by itself. A pin failure does not run it. An `https://[::1]/` host is connected as `::1` with no SNI name.
 
 An optional alternative is `verify` with a Tailscale certificate. On the PiKVM, `tailscale cert pikvm.example.ts.net` creates a certificate for that MagicDNS name. Trust the Tailscale CA on the machine that runs this server, set `PIKVM_HOST=https://pikvm.example.ts.net` and `PIKVM_TLS_MODE=verify`, and leave `PIKVM_TLS_CERT_FILE` unset. That is a choice, not the default, and it still needs the name on the certificate to match the host.
+
+## Device registry
+
+With `PIKVM_DEVICES_FILE` and `PIKVM_DEVICES` both unset, the server is the single legacy device `default`: `PIKVM_HOST`, `PIKVM_USERNAME`, `PIKVM_PASSWORD` (or `PIKVM_PASSWORD_FILE` or `CREDENTIALS_DIRECTORY/pikvm-password`), `PIKVM_TLS_MODE`, `PIKVM_VERIFY_SSL`, and the arm flags. Nothing in that setup has to change.
+
+Set one of the registry variables to name more than one device. Setting both is a startup error. `PIKVM_DEVICES_FILE` is a JSON file, opened the same non-blocking way as a secret file and capped at 64 KiB. It is not a secret, so a loose mode is not warned. `PIKVM_DEVICES` is the same JSON inline, also capped at 64 KiB. An empty value is unset.
+
+If `PIKVM_HOST` is also set, the registry is used and one stderr line says `PIKVM_HOST` was ignored. The legacy host, password, and TLS mode are not merged into the registry.
+
+`default` must name a device. If it is omitted and there is exactly one device, that device is the default. With several devices, `default` is required. A device name matches `/^[a-z0-9][a-z0-9_-]{0,31}$/`. Unknown fields are a startup error that names the device and the field. A `password` field is rejected; use `passwordFile` or `passwordCredential`. Exactly one of those is required. `passwordFile` is read like any other secret file, including the mode warning. `passwordCredential` is a single path segment in `$CREDENTIALS_DIRECTORY`.
+
+A host is normalised to an http(s) origin. A path, query, or fragment is dropped. Userinfo is an error. There is no IP-range restriction, so a Tailscale `100.64.0.0/10` address or a MagicDNS name is a normal host. `tls.mode` is `verify`, `pin`, or `insecure`. If it is omitted, the device uses `insecure` and stderr names that device and `pikvm-mcp-server pin <device>`. `pin` requires `tls.certFile` and an https origin. `verify` requires https. `PIKVM_TLS_MODE` does not apply to registry devices.
+
+`armHid` and `armMsd` on a device can only narrow the process ceiling. In stdio the ceiling is armed. In HTTP the ceiling is `PIKVM_MCP_ARM_HID` and `PIKVM_MCP_ARM_MSD` (default disarmed). An omitted device flag leaves the ceiling. `true` cannot arm a device the ceiling has disarmed. `msdLocalDir` overrides `PIKVM_MSD_LOCAL_DIR` for that device. `hwTest` must be true before the hardware suite will use the device.
+
+Each device has its own client, busy lock, MSD job lock, calibration, and arm state. Calibration and the screenshot scale are stored on the device and shared by every HTTP session that uses that device. Per-session state is deferred. Every `pikvm_*` tool except `pikvm_devices` takes an optional `device` argument. Omitted means the registry default. An unknown name is an error that lists the known names and does not open a connection. While a registry is active, tool output names the device that was used. `pikvm_devices` lists names, origins, TLS mode, and arm state. It does not return passwords or secret file paths.
+
+Job ids are random 16-byte hex strings. A job is visible only to the device that created it. Asking for it on another device is the same `unknown job` result as an id that does not exist.
+
+Two Tailscale devices, one pinned and one checked with a Tailscale certificate:
+
+```json
+{
+  "default": "lab1",
+  "devices": {
+    "lab1": {
+      "host": "https://100.64.0.8",
+      "username": "admin",
+      "passwordCredential": "pikvm-lab1",
+      "tls": { "mode": "pin", "certFile": "/etc/pikvm-mcp/lab1.pem" },
+      "armHid": false,
+      "armMsd": true,
+      "msdLocalDir": "/srv/iso",
+      "hwTest": false
+    },
+    "lab2": {
+      "host": "https://pikvm.example.ts.net",
+      "username": "admin",
+      "passwordCredential": "pikvm-lab2",
+      "tls": { "mode": "verify" },
+      "armHid": false,
+      "armMsd": false,
+      "hwTest": true
+    }
+  }
+}
+```
+
+`lab2` is `verify` against the MagicDNS name on a Tailscale certificate. Trust that CA on the machine that runs this server. `lab1` is pinned. Create or replace the pin with `pikvm-mcp-server pin lab1`, which connects to `lab1`'s host and writes `tls.certFile` unless `--out` is set. The first pin can run before that file exists. The command still sends no password.
+
+```ini
+# /etc/systemd/system/pikvm-mcp.service.d/devices.conf
+[Service]
+LoadCredential=pikvm-lab1:/etc/pikvm/lab1-password
+LoadCredential=pikvm-lab2:/etc/pikvm/lab2-password
+Environment=PIKVM_DEVICES_FILE=/etc/pikvm-mcp/devices.json
+Environment=PIKVM_MCP_PORT=8675
+Environment=PIKVM_MCP_NO_DOTENV=1
+```
+
+systemd sets `CREDENTIALS_DIRECTORY` for those credential names. Do not also set `PIKVM_HOST` or `PIKVM_PASSWORD` for these devices.
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `PIKVM_DEVICES_FILE` | unset | Path of the registry JSON. A regular file, at most 64 KiB. Not a secret. |
+| `PIKVM_DEVICES` | unset | The same JSON inline. Ignored when empty. An error when the file is also set. |
+| `PIKVM_HW_TEST_DEVICE` | unset | Hardware suite device. `default` in legacy mode. In registry mode the device must set `hwTest` true. |
+
+`pikvm-mcp-server pin <device>` accepts a registry name. With no registry, a name other than `default` is still an error.
 
 kvmd regenerates its self-signed certificate when the PiKVM is reinstalled. The next call then fails with `PIKVM_TLS_PIN_MISMATCH`. The message names device `default`, the expected SPKI sha256, and the presented SPKI sha256. The process does not retry the call, does not try `insecure`, and does not rewrite the pin file. A chain failure whose OpenSSL code is outside the usual set, including an invalid CA or a path-length failure, is still `PIKVM_TLS_VERIFY_FAILED` or `PIKVM_TLS_PIN_MISMATCH`. It is not `PIKVM_UNREACHABLE` and it is not retried.
 
