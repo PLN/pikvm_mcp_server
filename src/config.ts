@@ -1,4 +1,6 @@
 // Modified 2026-10 by PLN: PIKVM_REQUEST_TIMEOUT_MS (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: MSD upload deadlines (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: cap MSD job at 7 days and idle at 1 hour (GPL-3.0; see NOTICE).
 // Env read adapted from dtrukr/pikvm_mcp_server src/config.ts @ d120243 (GPL-3.0).
 
 /**
@@ -11,7 +13,14 @@
 import { config as loadEnv } from 'dotenv';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { parseRequestTimeoutMs } from './request-timeout.js';
+import {
+  MSD_IDLE_TIMEOUT_DEFAULT_MS,
+  MSD_IDLE_TIMEOUT_MAX_MS,
+  MSD_JOB_TIMEOUT_DEFAULT_MS,
+  MSD_JOB_TIMEOUT_MAX_MS,
+  parseMsdTimeoutMs,
+  parseRequestTimeoutMs,
+} from './request-timeout.js';
 
 // Load .env file from project root
 // - quiet: true prevents stdout output that would corrupt MCP protocol
@@ -59,6 +68,10 @@ export interface Config {
     defaultKeymap: string;
     /** Abort deadline for one ordinary kvmd call, from PIKVM_REQUEST_TIMEOUT_MS. */
     requestTimeoutMs: number;
+    /** Wall clock for one MSD upload, from PIKVM_MSD_JOB_TIMEOUT_MS. Default 6 hours, max 7 days. */
+    msdJobTimeoutMs: number;
+    /** Idle gap for an MSD upload, from PIKVM_MSD_IDLE_TIMEOUT_MS. Default 60 seconds, max 1 hour. */
+    msdIdleTimeoutMs: number;
   };
   calibration: {
     rounds: number;
@@ -81,6 +94,16 @@ export function loadConfig(): Config {
   }
 
   const requestTimeoutMs = parseRequestTimeoutMs(process.env.PIKVM_REQUEST_TIMEOUT_MS);
+  const msdJobTimeoutMs = parseMsdTimeoutMs(
+    process.env.PIKVM_MSD_JOB_TIMEOUT_MS,
+    MSD_JOB_TIMEOUT_DEFAULT_MS,
+    MSD_JOB_TIMEOUT_MAX_MS,
+  );
+  const msdIdleTimeoutMs = parseMsdTimeoutMs(
+    process.env.PIKVM_MSD_IDLE_TIMEOUT_MS,
+    MSD_IDLE_TIMEOUT_DEFAULT_MS,
+    MSD_IDLE_TIMEOUT_MAX_MS,
+  );
 
   const port = parseInt(process.env.PIKVM_MCP_PORT || '', 10);
   const http: HttpConfig | undefined = Number.isFinite(port) && port > 0
@@ -100,6 +123,8 @@ export function loadConfig(): Config {
       verifySsl: process.env.PIKVM_VERIFY_SSL === 'true',
       defaultKeymap: process.env.PIKVM_DEFAULT_KEYMAP || 'en-us',
       requestTimeoutMs,
+      msdJobTimeoutMs,
+      msdIdleTimeoutMs,
     },
     calibration: {
       rounds: parseInt(process.env.PIKVM_CALIBRATION_ROUNDS || '5', 10),

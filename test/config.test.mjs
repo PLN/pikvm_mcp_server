@@ -1,5 +1,7 @@
 /**
  * Modified 2026-10 by PLN: PIKVM_REQUEST_TIMEOUT_MS (GPL-3.0; see NOTICE).
+ * Modified 2026-10 by PLN: MSD upload deadlines (GPL-3.0; see NOTICE).
+ * Modified 2026-10 by PLN: cap MSD job at 7 days and idle at 1 hour (GPL-3.0; see NOTICE).
  *
  * loadEnvFile unit tests — verify PIKVM_MCP_NO_DOTENV=1 makes .env lose to
  * explicitly-set process env (the gateway systemd landmine fix).
@@ -15,7 +17,14 @@ import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadEnvFile, loadConfig } from '../dist/config.js';
-import { clampRequestTimeoutMs, parseRequestTimeoutMs } from '../dist/request-timeout.js';
+import {
+  MSD_IDLE_TIMEOUT_DEFAULT_MS,
+  MSD_IDLE_TIMEOUT_MAX_MS,
+  MSD_JOB_TIMEOUT_DEFAULT_MS,
+  MSD_JOB_TIMEOUT_MAX_MS,
+  clampRequestTimeoutMs,
+  parseRequestTimeoutMs,
+} from '../dist/request-timeout.js';
 
 async function withEnvFile(contents, fn) {
   const dir = await mkdtemp(join(tmpdir(), 'pikvm-env-'));
@@ -166,6 +175,46 @@ test('PIKVM_REQUEST_TIMEOUT_MS is digits only, else 5000, and clamps above 60000
     assert.equal(loadConfig().pikvm.requestTimeoutMs, 600000);
     process.env.PIKVM_REQUEST_TIMEOUT_MS = 'nope';
     assert.equal(loadConfig().pikvm.requestTimeoutMs, 5000);
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+});
+
+test('MSD upload deadlines default to 6 hours and 60 seconds', () => {
+  const saved = {
+    PIKVM_HOST: process.env.PIKVM_HOST,
+    PIKVM_PASSWORD: process.env.PIKVM_PASSWORD,
+    PIKVM_MSD_JOB_TIMEOUT_MS: process.env.PIKVM_MSD_JOB_TIMEOUT_MS,
+    PIKVM_MSD_IDLE_TIMEOUT_MS: process.env.PIKVM_MSD_IDLE_TIMEOUT_MS,
+  };
+  process.env.PIKVM_HOST = 'http://mock.test';
+  process.env.PIKVM_PASSWORD = 'testpw';
+  try {
+    delete process.env.PIKVM_MSD_JOB_TIMEOUT_MS;
+    delete process.env.PIKVM_MSD_IDLE_TIMEOUT_MS;
+    assert.equal(loadConfig().pikvm.msdJobTimeoutMs, MSD_JOB_TIMEOUT_DEFAULT_MS);
+    assert.equal(loadConfig().pikvm.msdIdleTimeoutMs, MSD_IDLE_TIMEOUT_DEFAULT_MS);
+    assert.equal(MSD_JOB_TIMEOUT_DEFAULT_MS, 6 * 60 * 60 * 1000);
+    assert.equal(MSD_IDLE_TIMEOUT_DEFAULT_MS, 60 * 1000);
+    process.env.PIKVM_MSD_JOB_TIMEOUT_MS = '90000';
+    process.env.PIKVM_MSD_IDLE_TIMEOUT_MS = '1500';
+    assert.equal(loadConfig().pikvm.msdJobTimeoutMs, 90000);
+    assert.equal(loadConfig().pikvm.msdIdleTimeoutMs, 1500);
+    process.env.PIKVM_MSD_JOB_TIMEOUT_MS = '0';
+    process.env.PIKVM_MSD_IDLE_TIMEOUT_MS = 'nope';
+    assert.equal(loadConfig().pikvm.msdJobTimeoutMs, MSD_JOB_TIMEOUT_DEFAULT_MS);
+    assert.equal(loadConfig().pikvm.msdIdleTimeoutMs, MSD_IDLE_TIMEOUT_DEFAULT_MS);
+    process.env.PIKVM_MSD_JOB_TIMEOUT_MS = '21600001';
+    assert.equal(loadConfig().pikvm.msdJobTimeoutMs, 21600001);
+    process.env.PIKVM_MSD_JOB_TIMEOUT_MS = '99999999999';
+    process.env.PIKVM_MSD_IDLE_TIMEOUT_MS = '99999999999';
+    assert.equal(loadConfig().pikvm.msdJobTimeoutMs, MSD_JOB_TIMEOUT_MAX_MS);
+    assert.equal(loadConfig().pikvm.msdIdleTimeoutMs, MSD_IDLE_TIMEOUT_MAX_MS);
+    assert.equal(MSD_JOB_TIMEOUT_MAX_MS, 604800000);
+    assert.equal(MSD_IDLE_TIMEOUT_MAX_MS, 3600000);
   } finally {
     for (const [k, v] of Object.entries(saved)) {
       if (v === undefined) delete process.env[k];

@@ -1,4 +1,6 @@
 // Modified 2026-10 by PLN: typed KvmdError, timeouts, GET retry (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: client MSD methods (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: MSD deadline caps and upload error codes (GPL-3.0; see NOTICE).
 // AbortSignal.timeout and PIKVM_UNREACHABLE / PIKVM_AUTH_FAILED no-retry codes
 // adapted from dtrukr/pikvm_mcp_server src/pikvm/client.ts @ d120243 (GPL-3.0).
 // Snapshot HTTP 503 retry-once adapted from dvaerum/pikvm_mcp_server
@@ -7,6 +9,32 @@
 // HID ceilings: /hid/print is 5s + 1.5 × (4·min(len,1024) + 2) × perEventSec + 5s,
 // at least 10s, and is refused above 50s. Other HID POSTs use 30s. When a
 // ceiling expires the error is PIKVM_HID_STATE_UNKNOWN and the call is not retried.
+//
+// MSD upload ceiling: msdWrite and msdWriteRemote do not use
+// PIKVM_REQUEST_TIMEOUT_MS. kvmd answers POST /msd/write only after it has
+// read the body, so the 5s ordinary abort would kill a real image.
+// PIKVM_MSD_JOB_TIMEOUT_MS (default 6 hours, max 7 days) is a cleared
+// setTimeout plus AbortController, and undici headersTimeout.
+// PIKVM_MSD_IDLE_TIMEOUT_MS (default 60 seconds, max 1 hour) aborts when
+// the request body or the response body stops moving, and is also undici
+// bodyTimeout. AbortSignal.timeout is not used: above 2^32-1 it throws
+// RangeError, and a delay of 2^31 or more makes the timer fire after 1 ms.
+// Checked on undici 7.24.1: headersTimeout does not abort a request body
+// that is still being written without socket backpressure. Once the body
+// has ended it is only the wait for response headers. bodyTimeout starts
+// after response headers and resets on each response chunk, so it does not
+// cap a multi-GB stream that keeps sending. Delays above 1s use undici's
+// about-1s fast timer. The job AbortSignal is the hard ceiling.
+// A stream that ends short of Content-Length, or a chunk that runs past
+// it, is UND_ERR_REQ_CONTENT_LENGTH_MISMATCH and is reported as
+// PIKVM_CONTENT_LENGTH_MISMATCH. A chunk that ends exactly on
+// Content-Length, with more bytes not yet buffered, can upload as a
+// shorter complete image. MSD POSTs are not retried.
+// After POST /msd/write or /msd/write_remote has started, a timeout, a
+// socket reset, or HTTP 504 is PIKVM_MSD_STATE_UNKNOWN. Connection refused
+// before the request is sent stays PIKVM_UNREACHABLE. An error reading
+// the local source is PIKVM_SOURCE_READ_ERROR.
+// MSD facts are from pikvm/kvmd v4.227 (0dd244f) and docs.pikvm.org.
 
 /**
  * PiKVM API Client
@@ -15,7 +43,8 @@
  * All mouse operations use the REST API which is more reliable than WebSocket.
  */
 
-import { Agent, fetch } from 'undici';
+import { Readable } from 'node:stream';
+import { Agent, fetch, request as undiciRequest } from 'undici';
 import sharp from 'sharp';
 import {
   HID_OTHER_DEADLINE_MS,
@@ -24,7 +53,14 @@ import {
   hidPrintCeilingMs,
 } from '../hid-deadline.js';
 import { capKvmdField, redactSecrets } from '../redact.js';
-import { clampRequestTimeoutMs } from '../request-timeout.js';
+import {
+  MSD_IDLE_TIMEOUT_DEFAULT_MS,
+  MSD_IDLE_TIMEOUT_MAX_MS,
+  MSD_JOB_TIMEOUT_DEFAULT_MS,
+  MSD_JOB_TIMEOUT_MAX_MS,
+  clampRequestTimeoutMs,
+  normalizeMsdTimeoutMs,
+} from '../request-timeout.js';
 
 export interface PiKVMConfig {
   host: string;
@@ -34,6 +70,16 @@ export interface PiKVMConfig {
   defaultKeymap?: string;
   /** Abort deadline for one ordinary kvmd call. Default 5000. */
   requestTimeoutMs?: number;
+  /**
+   * Wall clock for msdWrite and msdWriteRemote. Default 6 hours.
+   * These calls do not use requestTimeoutMs.
+   */
+  msdJobTimeoutMs?: number;
+  /**
+   * Idle gap while an MSD upload body or progress stream is moving.
+   * Default 60 seconds. The wait for response headers uses the job ceiling.
+   */
+  msdIdleTimeoutMs?: number;
 }
 
 export interface TypeOptions {
@@ -119,6 +165,86 @@ export class KvmdError extends Error {
     this.type = type;
     this.endpoint = endpoint;
   }
+}
+
+export interface MsdPart {
+  size: number;
+  free: number;
+  writable: boolean;
+}
+
+export interface MsdImageRecord {
+  size: number;
+  complete: boolean;
+  removable: boolean;
+}
+
+export interface MsdDriveImage {
+  name: string;
+  size: number | null;
+  complete: boolean | null;
+  removable: boolean | null;
+}
+
+export interface MsdDriveState {
+  image: MsdDriveImage | null;
+  connected: boolean;
+  cdrom: boolean;
+  rw: boolean;
+}
+
+export interface MsdTransfer {
+  name: string;
+  size: number;
+  written: number;
+}
+
+export interface MsdDownload {
+  name: string;
+  size: number;
+  readed: number;
+}
+
+/**
+ * Normalized GET /msd. `free` is the root part when `parts` has `""`,
+ * otherwise the sum of part free space, otherwise legacy `storage.free`.
+ */
+export interface MsdState {
+  enabled: boolean;
+  online: boolean;
+  busy: boolean;
+  drive: MsdDriveState | null;
+  images: Record<string, MsdImageRecord>;
+  parts: Record<string, MsdPart> | null;
+  free: number | null;
+  uploading: MsdTransfer | null;
+  downloading: MsdDownload | null;
+}
+
+export interface MsdWriteOptions {
+  /** kvmd remove_incomplete. Default false, matching kvmd. */
+  removeIncomplete?: boolean;
+}
+
+export interface MsdWriteResult {
+  name: string;
+  size: number;
+  written: number;
+}
+
+export interface MsdSetParams {
+  /** Storage image name. A URL is refused and is not sent. */
+  image?: string;
+  cdrom?: boolean;
+  rw?: boolean;
+}
+
+export interface MsdWriteRemoteOptions {
+  /** Storage name. Omitted lets kvmd take the name from the URL. */
+  image?: string;
+  /** kvmd downloader timeout in seconds. Omitted sends kvmd's own default. */
+  timeout?: number;
+  removeIncomplete?: boolean;
 }
 
 /** Idempotent GET attempts, including the first. */
@@ -272,6 +398,248 @@ function jitterMs(): number {
   return Math.floor(Math.random() * GET_RETRY_JITTER_MS);
 }
 
+function isContentLengthMismatch(err: unknown): boolean {
+  return errorCodes(err).includes('UND_ERR_REQ_CONTENT_LENGTH_MISMATCH');
+}
+
+/** Image may already exist, complete or not. Do not upload it again. */
+const MSD_STATE_UNKNOWN_MESSAGE =
+  'image may be partial or complete; re-read /api/msd; do not resend';
+
+const SOURCE_READ_MESSAGE = 'failed to read the upload source';
+
+function isSourceReadError(err: unknown): boolean {
+  return errorCodes(err).includes('EIO') || errorCodes(err).includes('PIKVM_SOURCE_READ_ERROR');
+}
+
+function isConnectTimeout(err: unknown): boolean {
+  return errorCodes(err).includes('UND_ERR_CONNECT_TIMEOUT');
+}
+
+function msdStateUnknown(status: number, endpoint: string): KvmdError {
+  return new KvmdError(status, 'PIKVM_MSD_STATE_UNKNOWN', MSD_STATE_UNKNOWN_MESSAGE, endpoint);
+}
+
+function finiteNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function kvmdBool(value: boolean): string {
+  return value ? '1' : '0';
+}
+
+interface KvmdEnvelope {
+  ok?: boolean;
+  result?: {
+    error?: unknown;
+    error_msg?: unknown;
+    image?: { name?: unknown; size?: unknown; written?: unknown };
+    [key: string]: unknown;
+  };
+}
+
+function readImages(storage: Record<string, unknown> | null): Record<string, MsdImageRecord> {
+  const images = storage?.images;
+  if (!images || typeof images !== 'object' || Array.isArray(images)) return {};
+  const out: Record<string, MsdImageRecord> = {};
+  for (const [name, info] of Object.entries(images as Record<string, unknown>)) {
+    if (!info || typeof info !== 'object') continue;
+    const row = info as Record<string, unknown>;
+    out[name] = {
+      size: finiteNumber(row.size) ?? 0,
+      complete: row.complete === true,
+      removable: row.removable === true,
+    };
+  }
+  return out;
+}
+
+function readParts(storage: Record<string, unknown> | null): {
+  parts: Record<string, MsdPart> | null;
+  free: number | null;
+} {
+  const raw = storage?.parts;
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    const parts: Record<string, MsdPart> = {};
+    let saw = false;
+    for (const [name, info] of Object.entries(raw as Record<string, unknown>)) {
+      if (!info || typeof info !== 'object') continue;
+      const row = info as Record<string, unknown>;
+      const free = finiteNumber(row.free);
+      const size = finiteNumber(row.size);
+      if (free === null || size === null) continue;
+      parts[name] = { size, free, writable: row.writable === true };
+      saw = true;
+    }
+    if (saw) {
+      let writableFree = 0;
+      for (const part of Object.values(parts)) {
+        if (part.writable) writableFree += part.free;
+      }
+      return { parts, free: writableFree };
+    }
+  }
+  return { parts: null, free: finiteNumber(storage?.free) };
+}
+
+function readTransfer(value: unknown): MsdTransfer | null {
+  if (!value || typeof value !== 'object') return null;
+  const row = value as Record<string, unknown>;
+  if (typeof row.name !== 'string') return null;
+  return {
+    name: row.name,
+    size: finiteNumber(row.size) ?? 0,
+    written: finiteNumber(row.written) ?? 0,
+  };
+}
+
+function readDownload(value: unknown): MsdDownload | null {
+  if (!value || typeof value !== 'object') return null;
+  const row = value as Record<string, unknown>;
+  if (typeof row.name !== 'string') return null;
+  return {
+    name: row.name,
+    size: finiteNumber(row.size) ?? 0,
+    readed: finiteNumber(row.readed) ?? 0,
+  };
+}
+
+function readDrive(value: unknown): MsdDriveState | null {
+  if (!value || typeof value !== 'object') return null;
+  const row = value as Record<string, unknown>;
+  let image: MsdDriveImage | null = null;
+  if (row.image && typeof row.image === 'object') {
+    const img = row.image as Record<string, unknown>;
+    image = {
+      name: typeof img.name === 'string' ? img.name : '',
+      size: finiteNumber(img.size),
+      complete: typeof img.complete === 'boolean' ? img.complete : null,
+      removable: typeof img.removable === 'boolean' ? img.removable : null,
+    };
+  }
+  return {
+    image,
+    connected: row.connected === true,
+    cdrom: row.cdrom === true,
+    rw: row.rw === true,
+  };
+}
+
+function normalizeMsdState(result: unknown): MsdState {
+  const row = result && typeof result === 'object' ? result as Record<string, unknown> : {};
+  const storage = row.storage && typeof row.storage === 'object'
+    ? row.storage as Record<string, unknown>
+    : null;
+  const space = readParts(storage);
+  return {
+    enabled: row.enabled === true,
+    online: row.online === true,
+    busy: row.busy === true,
+    drive: readDrive(row.drive),
+    images: readImages(storage),
+    parts: space.parts,
+    free: space.free,
+    uploading: readTransfer(storage?.uploading),
+    downloading: readDownload(storage?.downloading),
+  };
+}
+
+function readWriteImage(result: unknown): MsdWriteResult | null {
+  if (!result || typeof result !== 'object') return null;
+  const image = (result as { image?: unknown }).image;
+  if (!image || typeof image !== 'object') return null;
+  const row = image as Record<string, unknown>;
+  if (typeof row.name !== 'string') return null;
+  const size = finiteNumber(row.size);
+  const written = finiteNumber(row.written);
+  if (size === null || written === null) return null;
+  return { name: row.name, size, written };
+}
+
+/**
+ * Pulls `source` for undici. Each chunk refreshes the idle timer.
+ * When the source ends, idle is disarmed: kvmd has not sent headers yet,
+ * and that wait is the job ceiling, not the idle gap.
+ */
+interface MsdWatch {
+  sourceError: boolean;
+}
+
+function trackUpload(
+  source: Readable,
+  bump: () => void,
+  disarm: () => void,
+  watch: MsdWatch,
+): Readable {
+  return Readable.from(async function* () {
+    try {
+      for await (const chunk of source) {
+        bump();
+        yield chunk;
+      }
+    } catch (err) {
+      watch.sourceError = true;
+      const wrapped = new Error(SOURCE_READ_MESSAGE);
+      (wrapped as { code?: string; cause?: unknown }).code = 'PIKVM_SOURCE_READ_ERROR';
+      (wrapped as { cause?: unknown }).cause = err;
+      throw wrapped;
+    } finally {
+      disarm();
+    }
+  }());
+}
+
+interface MsdDeadline {
+  signal: AbortSignal;
+  /** Arm or refresh the idle gap. */
+  arm: () => void;
+  /** Stop the idle gap without aborting. Header wait uses the job signal. */
+  disarm: () => void;
+  done: () => void;
+}
+
+function startMsdDeadline(jobMs: number, idleMs: number): MsdDeadline {
+  const jobCtrl = new AbortController();
+  const idleCtrl = new AbortController();
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
+  let jobTimer: ReturnType<typeof setTimeout> | undefined;
+  const timeoutError = () => new DOMException(
+    'The operation was aborted due to timeout',
+    'TimeoutError',
+  );
+  const arm = () => {
+    if (idleCtrl.signal.aborted || jobCtrl.signal.aborted) return;
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      idleCtrl.abort(timeoutError());
+    }, idleMs);
+  };
+  const disarm = () => {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = undefined;
+  };
+  const onJob = () => {
+    disarm();
+  };
+  const done = () => {
+    disarm();
+    if (jobTimer) clearTimeout(jobTimer);
+    jobTimer = undefined;
+    jobCtrl.signal.removeEventListener('abort', onJob);
+  };
+  jobTimer = setTimeout(() => {
+    jobCtrl.abort(timeoutError());
+  }, jobMs);
+  jobCtrl.signal.addEventListener('abort', onJob, { once: true });
+  arm();
+  return {
+    signal: AbortSignal.any([jobCtrl.signal, idleCtrl.signal]),
+    arm,
+    disarm,
+    done,
+  };
+}
+
 /**
  * HID abort timers are multiplied by this in tests. Not a config field.
  * Refusal still uses the unscaled estimate.
@@ -307,9 +675,21 @@ export class PiKVMClient {
       verifySsl: false,
       defaultKeymap: 'en-us',
       requestTimeoutMs: 5000,
+      msdJobTimeoutMs: MSD_JOB_TIMEOUT_DEFAULT_MS,
+      msdIdleTimeoutMs: MSD_IDLE_TIMEOUT_DEFAULT_MS,
       ...config,
     };
     this.config.requestTimeoutMs = clampRequestTimeoutMs(this.config.requestTimeoutMs);
+    this.config.msdJobTimeoutMs = normalizeMsdTimeoutMs(
+      this.config.msdJobTimeoutMs,
+      MSD_JOB_TIMEOUT_DEFAULT_MS,
+      MSD_JOB_TIMEOUT_MAX_MS,
+    );
+    this.config.msdIdleTimeoutMs = normalizeMsdTimeoutMs(
+      this.config.msdIdleTimeoutMs,
+      MSD_IDLE_TIMEOUT_DEFAULT_MS,
+      MSD_IDLE_TIMEOUT_MAX_MS,
+    );
     redactionPasswords.set(this, this.config.password);
 
     // headersTimeout and bodyTimeout 0 turn off undici's 300s defaults.
@@ -422,30 +802,7 @@ export class PiKVMClient {
 
     if (!response.ok) {
       const errorText = await this.readBody(() => response.text(), endpoint, hidPost);
-      const parsed = parseKvmdFailure(errorText);
-      if (response.status === 401 || response.status === 403) {
-        throw new KvmdError(
-          response.status,
-          'PIKVM_AUTH_FAILED',
-          this.kvmdField(parsed?.error_msg ?? 'authentication failed'),
-          endpoint,
-        );
-      }
-      if (parsed) {
-        throw new KvmdError(
-          response.status,
-          this.kvmdField(parsed.error),
-          this.kvmdField(parsed.error_msg),
-          endpoint,
-        );
-      }
-      const fallback = this.redact(errorText).substring(0, 200);
-      throw new KvmdError(
-        response.status,
-        'PIKVM_HTTP_ERROR',
-        fallback || `HTTP ${response.status}`,
-        endpoint,
-      );
+      throw this.httpFailure(response.status, errorText, endpoint);
     }
 
     // Check content type for response handling
@@ -470,6 +827,50 @@ export class PiKVMClient {
       // If not JSON, return as-is wrapped in an object
       return { result: text } as T;
     }
+  }
+
+  /**
+   * kvmd `{ok:false,result:{error,error_msg}}` on a non-2xx response.
+   * 401 and 403 stay PIKVM_AUTH_FAILED. The body is redacted.
+   */
+  private httpFailure(status: number, text: string, endpoint: string): KvmdError {
+    const parsed = parseKvmdFailure(text);
+    if (status === 401 || status === 403) {
+      return new KvmdError(
+        status,
+        'PIKVM_AUTH_FAILED',
+        this.kvmdField(parsed?.error_msg ?? 'authentication failed'),
+        endpoint,
+      );
+    }
+    if (parsed) {
+      return new KvmdError(
+        status,
+        this.kvmdField(parsed.error),
+        this.kvmdField(parsed.error_msg),
+        endpoint,
+      );
+    }
+    const fallback = this.redact(text).substring(0, 200);
+    return new KvmdError(
+      status,
+      'PIKVM_HTTP_ERROR',
+      fallback || `HTTP ${status}`,
+      endpoint,
+    );
+  }
+
+  /** HTTP 200 can still carry `{ok:false}`. Surface that as KvmdError. */
+  private assertKvmdOk(body: KvmdEnvelope | null | undefined, endpoint: string): void {
+    if (!body || body.ok !== false) return;
+    const error = body.result?.error;
+    const errorMsg = body.result?.error_msg;
+    throw new KvmdError(
+      200,
+      this.kvmdField(typeof error === 'string' ? error : 'PIKVM_HTTP_ERROR'),
+      this.kvmdField(typeof errorMsg === 'string' ? errorMsg : 'kvmd reported failure'),
+      endpoint,
+    );
   }
 
   /** Redact secrets, then cap a kvmd error type or error_msg at about 1 KB. */
@@ -878,6 +1279,342 @@ export class PiKVMClient {
       return true;
     } catch {
       return false;
+    }
+  }
+
+  /**
+   * GET /api/msd. Idempotent, so the ordinary GET retry applies.
+   * `free` accepts the parts map and legacy top-level `storage.free`.
+   */
+  async getMsdState(): Promise<MsdState> {
+    const body = await this.request<KvmdEnvelope>('GET', '/msd');
+    this.assertKvmdOk(body, 'GET /api/msd');
+    return normalizeMsdState(body?.result);
+  }
+
+  /**
+   * POST /api/msd/set_params. Query only: image, cdrom, rw.
+   * A URL is not a storage name. kvmd would treat it as a remote drive,
+   * so this method refuses it before any request. Not retried.
+   */
+  async msdSetParams(params: MsdSetParams = {}): Promise<void> {
+    if (params.image !== undefined && params.image.includes('://')) {
+      throw new Error('msdSetParams does not accept a URL');
+    }
+    const query = new URLSearchParams();
+    if (params.image !== undefined) query.set('image', params.image);
+    if (params.cdrom !== undefined) query.set('cdrom', kvmdBool(params.cdrom));
+    if (params.rw !== undefined) query.set('rw', kvmdBool(params.rw));
+    const qs = query.toString();
+    const body = await this.request<KvmdEnvelope>(
+      'POST',
+      `/msd/set_params${qs ? `?${qs}` : ''}`,
+    );
+    this.assertKvmdOk(body, 'POST /api/msd/set_params');
+  }
+
+  /**
+   * POST /api/msd/set_connected?connected=0|1. Not retried.
+   */
+  async msdSetConnected(connected: boolean): Promise<void> {
+    const body = await this.request<KvmdEnvelope>(
+      'POST',
+      `/msd/set_connected?connected=${kvmdBool(connected)}`,
+    );
+    this.assertKvmdOk(body, 'POST /api/msd/set_connected');
+  }
+
+  /**
+   * POST /api/msd/remove?image=. Not retried.
+   */
+  async msdRemove(image: string): Promise<void> {
+    const query = new URLSearchParams();
+    query.set('image', image);
+    const body = await this.request<KvmdEnvelope>('POST', `/msd/remove?${query}`);
+    this.assertKvmdOk(body, 'POST /api/msd/remove');
+  }
+
+  /**
+   * POST /api/msd/write. Streams `body` with an exact Content-Length of
+   * `size` bytes. Never chunked, never retried, and not limited by the
+   * ordinary 5s deadline. `removeIncomplete` maps to remove_incomplete.
+   */
+  async msdWrite(
+    image: string,
+    body: Readable,
+    size: number,
+    options: MsdWriteOptions = {},
+  ): Promise<MsdWriteResult> {
+    if (!Number.isInteger(size) || size < 0) {
+      throw new Error('msdWrite size must be a non-negative integer');
+    }
+    const query = new URLSearchParams();
+    query.set('image', image);
+    query.set('remove_incomplete', kvmdBool(options.removeIncomplete === true));
+    const outcome = await this.msdPost(
+      `/msd/write?${query}`,
+      'POST /api/msd/write',
+      body,
+      size,
+    );
+    const imageInfo = readWriteImage(outcome.result);
+    if (!imageInfo) {
+      throw new KvmdError(
+        outcome.statusCode,
+        'PIKVM_HTTP_ERROR',
+        'msd write response has no image',
+        'POST /api/msd/write',
+      );
+    }
+    return imageInfo;
+  }
+
+  /**
+   * POST /api/msd/write_remote. Yields NDJSON `{image:{name,size,written}}`
+   * progress. An `{ok:false}` line throws KvmdError. verify=1 is always
+   * sent. `insecure` is never sent. Not retried.
+   */
+  async *msdWriteRemote(
+    url: string,
+    options: MsdWriteRemoteOptions = {},
+  ): AsyncGenerator<MsdWriteResult> {
+    const query = new URLSearchParams();
+    query.set('url', url);
+    query.set('verify', '1');
+    query.set('remove_incomplete', kvmdBool(options.removeIncomplete === true));
+    if (options.image !== undefined) query.set('image', options.image);
+    if (options.timeout !== undefined) query.set('timeout', String(options.timeout));
+    const endpoint = 'POST /api/msd/write_remote';
+    let deadline: MsdDeadline | undefined;
+    let responseBody: AsyncIterable<Uint8Array> | undefined;
+    try {
+      deadline = startMsdDeadline(this.config.msdJobTimeoutMs, this.config.msdIdleTimeoutMs);
+      const response = await this.msdDispatch(
+        `/msd/write_remote?${query}`,
+        endpoint,
+        undefined,
+        undefined,
+        deadline,
+        undefined,
+      );
+      responseBody = response.body;
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        const text = await this.readUploadText(response.body, deadline);
+        throw this.msdHttpFailure(response.statusCode, text, endpoint);
+      }
+      deadline.arm();
+      const decoder = new TextDecoder();
+      let pending = '';
+      let last: MsdWriteResult | undefined;
+      const take = (line: string) => {
+        let image: MsdWriteResult | undefined;
+        for (const row of this.ndjsonLine(line, response.statusCode, endpoint)) image = row;
+        return image;
+      };
+      for await (const chunk of response.body) {
+        deadline.arm();
+        pending += decoder.decode(chunk, { stream: true });
+        let nl = pending.indexOf('\n');
+        while (nl !== -1) {
+          const line = pending.slice(0, nl).replace(/\r$/, '');
+          pending = pending.slice(nl + 1);
+          if (line) {
+            const image = take(line);
+            if (image) {
+              last = image;
+              yield image;
+            }
+          }
+          nl = pending.indexOf('\n');
+        }
+      }
+      pending += decoder.decode();
+      const tail = pending.replace(/\r$/, '').trim();
+      if (tail) {
+        const image = take(tail);
+        if (image) {
+          last = image;
+          yield image;
+        }
+      }
+      if (!last || last.written !== last.size) {
+        throw msdStateUnknown(response.statusCode, endpoint);
+      }
+    } catch (err) {
+      if (err instanceof KvmdError) throw err;
+      throw this.msdTransport(err, endpoint);
+    } finally {
+      deadline?.done();
+      await this.dumpBody(responseBody);
+    }
+  }
+
+  private *ndjsonLine(line: string, status: number, endpoint: string): Generator<MsdWriteResult> {
+    let parsed: KvmdEnvelope;
+    try {
+      parsed = JSON.parse(line) as KvmdEnvelope;
+    } catch {
+      throw new KvmdError(
+        status,
+        'PIKVM_HTTP_ERROR',
+        this.kvmdField(line.slice(0, 200)) || 'invalid msd progress line',
+        endpoint,
+      );
+    }
+    if (parsed.ok === false) {
+      const failure = parseKvmdFailure(line);
+      if (failure) {
+        throw new KvmdError(
+          status,
+          this.kvmdField(failure.error),
+          this.kvmdField(failure.error_msg),
+          endpoint,
+        );
+      }
+      throw new KvmdError(status, 'PIKVM_HTTP_ERROR', 'kvmd reported failure', endpoint);
+    }
+    const image = readWriteImage(parsed.result);
+    if (image) yield image;
+  }
+
+  /**
+   * One long MSD POST. No retry. Content-Length is `size` when a body
+   * is present, so undici does not fall back to chunked encoding.
+   */
+  private async msdPost(
+    path: string,
+    endpoint: string,
+    body: Readable | undefined,
+    size: number | undefined,
+  ): Promise<{ statusCode: number; result: unknown }> {
+    let deadline: MsdDeadline | undefined;
+    let responseBody: AsyncIterable<Uint8Array> | undefined;
+    const watch: MsdWatch = { sourceError: false };
+    try {
+      deadline = startMsdDeadline(this.config.msdJobTimeoutMs, this.config.msdIdleTimeoutMs);
+      const response = await this.msdDispatch(path, endpoint, body, size, deadline, watch);
+      responseBody = response.body;
+      deadline.arm();
+      const text = await this.readUploadText(response.body, deadline);
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw this.msdHttpFailure(response.statusCode, text, endpoint);
+      }
+      if (!text) return { statusCode: response.statusCode, result: {} };
+      let parsed: KvmdEnvelope;
+      try {
+        parsed = JSON.parse(text) as KvmdEnvelope;
+      } catch {
+        throw new KvmdError(
+          response.statusCode,
+          'PIKVM_HTTP_ERROR',
+          this.kvmdField(text.slice(0, 200)) || 'invalid msd response',
+          endpoint,
+        );
+      }
+      this.assertKvmdOk(parsed, endpoint);
+      return { statusCode: response.statusCode, result: parsed.result };
+    } catch (err) {
+      if (err instanceof KvmdError) throw err;
+      if (watch.sourceError && !isContentLengthMismatch(err)) {
+        throw new KvmdError(0, 'PIKVM_SOURCE_READ_ERROR', SOURCE_READ_MESSAGE, endpoint);
+      }
+      throw this.msdTransport(err, endpoint);
+    } finally {
+      deadline?.done();
+      await this.dumpBody(responseBody);
+    }
+  }
+
+  private async msdDispatch(
+    path: string,
+    endpoint: string,
+    body: Readable | undefined,
+    size: number | undefined,
+    deadline: MsdDeadline,
+    watch: MsdWatch | undefined,
+  ): Promise<{ statusCode: number; body: AsyncIterable<Uint8Array> & { destroy?: () => void; text?: () => Promise<string> } }> {
+    const url = new URL(`/api${path}`, this.config.host);
+    const headers: Record<string, string> = {
+      'X-KVMD-User': this.config.username,
+      'X-KVMD-Passwd': this.config.password,
+    };
+    let upload: Readable | undefined;
+    if (body !== undefined && size !== undefined) {
+      headers['content-length'] = String(size);
+      headers['content-type'] = 'application/octet-stream';
+      upload = trackUpload(body, deadline.arm, deadline.disarm, watch ?? { sourceError: false });
+    } else {
+      // No request body. The wait for response headers is the job ceiling.
+      // Idle starts again once those headers arrive.
+      deadline.disarm();
+    }
+    try {
+      const response = await undiciRequest(url, {
+        method: 'POST',
+        headers,
+        body: upload,
+        dispatcher: this.dispatcher,
+        headersTimeout: this.config.msdJobTimeoutMs,
+        bodyTimeout: this.config.msdIdleTimeoutMs,
+        signal: deadline.signal,
+        idempotent: false,
+      });
+      return response;
+    } catch (err) {
+      if (!isContentLengthMismatch(err) && (watch?.sourceError || isSourceReadError(err))) {
+        throw new KvmdError(0, 'PIKVM_SOURCE_READ_ERROR', SOURCE_READ_MESSAGE, endpoint);
+      }
+      throw this.msdTransport(err, endpoint);
+    }
+  }
+
+  /** HTTP 504 on an upload means nginx gave up while kvmd may still be writing. */
+  private msdHttpFailure(status: number, text: string, endpoint: string): KvmdError {
+    if (status === 504) return msdStateUnknown(status, endpoint);
+    return this.httpFailure(status, text, endpoint);
+  }
+
+  private msdTransport(err: unknown, endpoint: string): KvmdError {
+    if (err instanceof KvmdError) return err;
+    if (isContentLengthMismatch(err)) {
+      return new KvmdError(
+        0,
+        'PIKVM_CONTENT_LENGTH_MISMATCH',
+        'request body length does not match Content-Length',
+        endpoint,
+      );
+    }
+    if (isSourceReadError(err)) {
+      return new KvmdError(0, 'PIKVM_SOURCE_READ_ERROR', SOURCE_READ_MESSAGE, endpoint);
+    }
+    const codes = errorCodes(err);
+    const beforeSend = codes.some((code) => PRE_SEND_CODES.has(code)) || isConnectTimeout(err);
+    if (!beforeSend && (isTimeoutError(err) || failedAfterSend(err))) {
+      return msdStateUnknown(0, endpoint);
+    }
+    return new KvmdError(0, 'PIKVM_UNREACHABLE', 'kvmd network error', endpoint);
+  }
+
+  private async readUploadText(
+    body: AsyncIterable<Uint8Array>,
+    deadline: MsdDeadline,
+  ): Promise<string> {
+    const chunks: Buffer[] = [];
+    for await (const chunk of body) {
+      deadline.arm();
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+    return Buffer.concat(chunks).toString('utf8');
+  }
+
+  private async dumpBody(body: unknown): Promise<void> {
+    if (!body || typeof body !== 'object' || !('destroy' in body)) return;
+    const destroy = (body as { destroy?: unknown }).destroy;
+    if (typeof destroy !== 'function') return;
+    try {
+      destroy.call(body);
+    } catch {
+      // The response is already finished or already destroyed.
     }
   }
 }
