@@ -1,6 +1,7 @@
 // Modified 2026-10 by PLN: hardware suite tool session (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: password via resolveSecret (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: TLS dispatcher shared with the client (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: kvmd GET does not follow redirects (GPL-3.0; see NOTICE).
 
 /**
  * In-process MCP HTTP session aimed at one PiKVMClient.
@@ -15,7 +16,7 @@ import { loadConfig } from '../../dist/config.js';
 import { createKvmdAgent } from '../../dist/tls.js';
 import { startHttpServer } from '../../dist/http.js';
 import { BusyLock } from '../../dist/pikvm/lock.js';
-import { PiKVMClient } from '../../dist/pikvm/client.js';
+import { PiKVMClient, unexpectedRedirectMessage } from '../../dist/pikvm/client.js';
 import { redactSecrets } from '../../dist/redact.js';
 import { createMcpServer } from '../../dist/server.js';
 import { resolveDevice } from '../../dist/msd.js';
@@ -149,7 +150,17 @@ export async function kvmdGet(pikvmConfig, pathAndQuery) {
       },
       dispatcher: agent,
       signal: AbortSignal.timeout(pikvmConfig.requestTimeoutMs),
+      redirect: 'manual',
     });
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get('location');
+      try {
+        await response.body?.cancel();
+      } catch {
+        // The redirect body is already closed.
+      }
+      throw new Error(unexpectedRedirectMessage(response.status, location, url.toString()));
+    }
     const text = await response.text();
     return { status: response.status, text };
   } finally {

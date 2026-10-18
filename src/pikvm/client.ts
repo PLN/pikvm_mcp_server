@@ -8,6 +8,7 @@
 // Modified 2026-10 by PLN: pikvm_type delay is milliseconds (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: header and body timeouts stay timeouts (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: TLS verify, pin, and insecure modes (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: kvmd redirects are not followed (GPL-3.0; see NOTICE).
 // AbortSignal.timeout and PIKVM_UNREACHABLE / PIKVM_AUTH_FAILED no-retry codes
 // adapted from dtrukr/pikvm_mcp_server src/pikvm/client.ts @ d120243 (GPL-3.0).
 // Snapshot HTTP 503 retry-once adapted from dvaerum/pikvm_mcp_server
@@ -411,9 +412,37 @@ function transportError(err: unknown, endpoint: string, hid: boolean, device = '
   return new KvmdError(0, 'PIKVM_UNREACHABLE', 'kvmd network error', endpoint);
 }
 
+/** No existing code fits: unreachable is retried, and an HTTP error hides the redirect. */
+export const UNEXPECTED_REDIRECT = 'PIKVM_UNEXPECTED_REDIRECT';
+
+/** `protocol//host` only. Userinfo, path, and query are dropped. */
+export function redirectTargetOrigin(location: string | null, requestUrl: string): string {
+  if (!location) return 'unknown';
+  let parsed: URL;
+  try {
+    parsed = new URL(location, requestUrl);
+  } catch {
+    return 'unreadable';
+  }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return 'unreadable';
+  return `${parsed.protocol}//${parsed.host}`;
+}
+
+export function unexpectedRedirectMessage(status: number, location: string | null, requestUrl: string): string {
+  const origin = redirectTargetOrigin(location, requestUrl);
+  return `${UNEXPECTED_REDIRECT}: kvmd returned an unexpected HTTP ${status} redirect to ${origin}. The redirect was not followed.`;
+}
+
+function headerValue(headers: Record<string, string | string[] | undefined>, name: string): string | null {
+  const value = headers[name];
+  if (Array.isArray(value)) return value[0] ?? null;
+  return typeof value === 'string' ? value : null;
+}
+
 function isRetryableGetError(err: KvmdError): boolean {
   if (err.type === 'PIKVM_HID_STATE_UNKNOWN') return false;
   if (err.type === TLS_PIN_MISMATCH || err.type === TLS_VERIFY_FAILED) return false;
+  if (err.type === UNEXPECTED_REDIRECT) return false;
   if (err.type === 'PIKVM_UNREACHABLE' || err.type === 'PIKVM_TIMEOUT') return true;
   return err.status === 502 || err.status === 503;
 }
@@ -861,9 +890,21 @@ export class PiKVMClient {
         body: body ? (typeof body === 'object' ? JSON.stringify(body) : body) : undefined,
         dispatcher: testDispatchers.get(this) ?? this.dispatcher,
         signal: AbortSignal.timeout(timeoutMs),
+        redirect: 'manual',
       });
     } catch (err) {
       throw transportError(err, endpoint, hidPost, this.config.tls.default.device);
+    }
+
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get('location');
+      await this.cancelBody(response);
+      throw new KvmdError(
+        response.status,
+        UNEXPECTED_REDIRECT,
+        this.redact(unexpectedRedirectMessage(response.status, location, url.toString())),
+        endpoint,
+      );
     }
 
     if (!response.ok) {
@@ -1617,16 +1658,36 @@ export class PiKVMClient {
       deadline.disarm();
     }
     try {
-      const response = await undiciRequest(url, {
-        method: 'POST',
+      // request() does not follow redirects. maxRedirections 0 is the
+      // explicit off switch; the type omits the field.
+      const requestOptions = {
+        method: 'POST' as const,
         headers,
         body: upload,
         dispatcher: testDispatchers.get(this) ?? this.dispatcher,
         headersTimeout: this.config.msdJobTimeoutMs,
         bodyTimeout: this.config.msdIdleTimeoutMs,
         signal: deadline.signal,
-        idempotent: false,
-      });
+        idempotent: false as const,
+        maxRedirections: 0,
+      };
+      const response = await undiciRequest(url, requestOptions);
+      if (response.statusCode >= 300 && response.statusCode < 400) {
+        const location = headerValue(response.headers, 'location');
+        try {
+          for await (const chunk of response.body) {
+            void chunk;
+          }
+        } catch {
+          // The redirect body is already finished.
+        }
+        throw new KvmdError(
+          response.statusCode,
+          UNEXPECTED_REDIRECT,
+          this.redact(unexpectedRedirectMessage(response.statusCode, location, url.toString())),
+          endpoint,
+        );
+      }
       return response;
     } catch (err) {
       if (watch?.sourceError || (!isContentLengthMismatch(err) && isSourceReadError(err))) {
@@ -1676,6 +1737,16 @@ export class PiKVMClient {
       chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
     }
     return Buffer.concat(chunks).toString('utf8');
+  }
+
+  private async cancelBody(response: { body?: { cancel?: () => Promise<void> } | null }): Promise<void> {
+    const cancel = response.body?.cancel;
+    if (typeof cancel !== 'function') return;
+    try {
+      await cancel.call(response.body);
+    } catch {
+      // The redirect body is already closed.
+    }
   }
 
   private async dumpBody(body: unknown): Promise<void> {

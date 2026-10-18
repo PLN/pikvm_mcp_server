@@ -1,6 +1,7 @@
 // Modified 2026-10 by PLN: MSD client tests (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: MSD deadline caps and upload error codes (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: source-error flag and partial-image message (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: a kvmd 302 is an unexpected redirect (GPL-3.0; see NOTICE).
 
 /**
  * Plain kvmd MSD client methods against the mock. No MCP tools.
@@ -480,7 +481,9 @@ test('MSD POSTs are not retried and a remote redirect is not followed', async ()
       (err) => {
         assert.ok(err instanceof KvmdError);
         assert.equal(err.status, 302);
-        assert.equal(err.type, 'PIKVM_HTTP_ERROR');
+        assert.equal(err.type, 'PIKVM_UNEXPECTED_REDIRECT');
+        assert.match(err.message, /https:\/\/example\.test/);
+        assert.equal(err.message.includes('/elsewhere'), false);
         assert.equal(err.endpoint, 'POST /api/msd/write_remote');
         return true;
       },
