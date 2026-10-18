@@ -1,6 +1,7 @@
 /**
  * Modified 2026-10 by PLN: PIKVM_REQUEST_TIMEOUT_MS (GPL-3.0; see NOTICE).
  * Modified 2026-10 by PLN: MSD upload deadlines (GPL-3.0; see NOTICE).
+ * Modified 2026-10 by PLN: cap MSD job at 7 days and idle at 1 hour (GPL-3.0; see NOTICE).
  *
  * loadEnvFile unit tests — verify PIKVM_MCP_NO_DOTENV=1 makes .env lose to
  * explicitly-set process env (the gateway systemd landmine fix).
@@ -18,7 +19,9 @@ import { join } from 'node:path';
 import { loadEnvFile, loadConfig } from '../dist/config.js';
 import {
   MSD_IDLE_TIMEOUT_DEFAULT_MS,
+  MSD_IDLE_TIMEOUT_MAX_MS,
   MSD_JOB_TIMEOUT_DEFAULT_MS,
+  MSD_JOB_TIMEOUT_MAX_MS,
   clampRequestTimeoutMs,
   parseRequestTimeoutMs,
 } from '../dist/request-timeout.js';
@@ -206,6 +209,12 @@ test('MSD upload deadlines default to 6 hours and 60 seconds', () => {
     assert.equal(loadConfig().pikvm.msdIdleTimeoutMs, MSD_IDLE_TIMEOUT_DEFAULT_MS);
     process.env.PIKVM_MSD_JOB_TIMEOUT_MS = '21600001';
     assert.equal(loadConfig().pikvm.msdJobTimeoutMs, 21600001);
+    process.env.PIKVM_MSD_JOB_TIMEOUT_MS = '99999999999';
+    process.env.PIKVM_MSD_IDLE_TIMEOUT_MS = '99999999999';
+    assert.equal(loadConfig().pikvm.msdJobTimeoutMs, MSD_JOB_TIMEOUT_MAX_MS);
+    assert.equal(loadConfig().pikvm.msdIdleTimeoutMs, MSD_IDLE_TIMEOUT_MAX_MS);
+    assert.equal(MSD_JOB_TIMEOUT_MAX_MS, 604800000);
+    assert.equal(MSD_IDLE_TIMEOUT_MAX_MS, 3600000);
   } finally {
     for (const [k, v] of Object.entries(saved)) {
       if (v === undefined) delete process.env[k];

@@ -1,5 +1,6 @@
 // Modified 2026-10 by PLN: configurable error, status, and delay routes (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: MSD state machine (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: incomplete images and kvmd error classes (GPL-3.0; see NOTICE).
 
 /**
  * Minimal KVMD REST mock implementing exactly the routes src/pikvm/client.ts
@@ -18,8 +19,13 @@
  * the live drive. `uploads` records write bodies. `bytes` holds stored
  * image bytes. Options: `free`, `busyFor` (how many MSD mutations
  * answer MsdIsBusyError), `failMidWrite`, `failSetConnected`,
- * `legacyFreeShape`, `writeHoldMs`, and `remote` (`lines`, `gapMs`,
- * `headerDelayMs`, `stallAfterHeadersMs`, `redirectTo`).
+ * `legacyFreeShape`, `writeHoldMs`, and `remote` (`lines`, `chunks`,
+ * `gapMs`, `headerDelayMs`, `stallAfterHeadersMs`, `redirectTo`).
+ * A write that is aborted or shorter than Content-Length keeps a
+ * complete:false image unless remove_incomplete is set. Image writable
+ * follows kvmd: .iso is not writable; an upload is in storage and not
+ * adopted, so any other name is writable. Error class names and the
+ * messages that kvmd defines are from kvmd v4.227 (see NOTICE).
  */
 
 import http from 'node:http';
@@ -151,12 +157,22 @@ const MSD_UNKNOWN = 'The image is not found in the storage';
 const MSD_NONE = 'The image is not selected';
 const MSD_OFFLINE = 'MSD is not found';
 
+function imageWritable(name) {
+  // kvmd FileImage.__is_writable (v4.227): .iso is never writable.
+  // An image in storage that was not adopted is writable. Uploads here
+  // are that case. Adopted or external images would follow the file mode.
+  if (String(name).toLowerCase().endsWith('.iso')) return false;
+  const inStorage = true;
+  const adopted = false;
+  if (inStorage && !adopted) return true;
+  return false;
+}
+
 function imageMeta(name, size, complete) {
-  const iso = name.toLowerCase().endsWith('.iso');
   return {
     size,
     mod_ts: 0,
-    writable: !iso,
+    writable: imageWritable(name),
     cdromable: true,
     removable: true,
     complete,
@@ -310,7 +326,7 @@ export async function startKvmdMock(options = {}) {
       if (guardMutation(res)) return true;
       const connected = flagParam(u.searchParams.get('connected'));
       if (connected && options.failSetConnected) {
-        kvmdFail(res, 400, 'MsdIoError', 'connect failed');
+        kvmdFail(res, 400, 'MsdOperationError', 'connect failed');
         return true;
       }
       if (connected) {
@@ -383,32 +399,41 @@ export async function startKvmdMock(options = {}) {
         return true;
       }
       const buf = await readIncoming(req);
+      const declared = Number(contentLength);
+      const full = buf.length === declared;
       uploads.push({
         image,
         body: buf,
         contentLength,
         transferEncoding,
         removeIncomplete,
-        complete: !options.failMidWrite && buf.length === Number(contentLength),
+        complete: full && !options.failMidWrite,
       });
-      if (clientGone(req, res)) return true;
-      if (buf.length !== Number(contentLength)) {
+      const keepIncomplete = () => {
+        if (removeIncomplete || !image) return;
+        state.images[image] = imageMeta(image, buf.length, false);
+        bytes.set(image, buf);
+      };
+      const keepComplete = () => {
+        state.images[image] = imageMeta(image, buf.length, true);
+        bytes.set(image, buf);
+        state.parts[''].free = Math.max(0, state.parts[''].free - buf.length);
+      };
+      if (options.failMidWrite) {
+        keepIncomplete();
+        if (clientGone(req, res)) return true;
+        kvmdFail(res, 400, 'MsdOperationError', 'write failed');
+        return true;
+      }
+      if (!full) {
+        keepIncomplete();
+        if (clientGone(req, res)) return true;
         kvmdFail(res, 400, 'ValidatorError', 'Content-Length does not match the body');
         return true;
       }
-      if (options.failMidWrite) {
-        if (!removeIncomplete) {
-          state.images[image] = imageMeta(image, buf.length, false);
-          bytes.set(image, buf);
-        }
-        kvmdFail(res, 400, 'MsdIoError', 'write failed');
-        return true;
-      }
       if (options.writeHoldMs) await waitOrSocketClose(req, options.writeHoldMs);
+      keepComplete();
       if (clientGone(req, res)) return true;
-      state.images[image] = imageMeta(image, buf.length, true);
-      bytes.set(image, buf);
-      state.parts[''].free = Math.max(0, state.parts[''].free - buf.length);
       kvmdOk(res, { image: { name: image, size: buf.length, written: buf.length } });
       return true;
     }
@@ -439,6 +464,15 @@ export async function startKvmdMock(options = {}) {
       res.flushHeaders();
       if (remote.stallAfterHeadersMs) await waitOrClose(req, remote.stallAfterHeadersMs);
       if (req.destroyed || res.writableEnded) return true;
+      if (Array.isArray(remote.chunks)) {
+        for (const chunk of remote.chunks) {
+          if (remote.gapMs) await waitOrClose(req, remote.gapMs);
+          if (req.destroyed || res.writableEnded) return true;
+          res.write(String(chunk));
+        }
+        res.end();
+        return true;
+      }
       const lines = remote.lines ?? [
         JSON.stringify({ ok: true, result: { image: { name, size: 4, written: 2 } } }),
         JSON.stringify({ ok: true, result: { image: { name, size: 4, written: 4 } } }),

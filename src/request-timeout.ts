@@ -1,5 +1,6 @@
 // Modified 2026-10 by PLN: clamp PIKVM_REQUEST_TIMEOUT_MS (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: MSD upload job and idle deadlines (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: cap MSD job at 7 days and idle at 1 hour (GPL-3.0; see NOTICE).
 
 /** Default abort deadline for one ordinary kvmd call. */
 export const REQUEST_TIMEOUT_DEFAULT_MS = 5000;
@@ -40,18 +41,33 @@ export const MSD_JOB_TIMEOUT_DEFAULT_MS = 6 * 60 * 60 * 1000;
 export const MSD_IDLE_TIMEOUT_DEFAULT_MS = 60 * 1000;
 
 /**
- * Parse an MSD deadline. Only a string of digits is accepted.
- * Anything else, including 0, uses `fallback`. No upper clamp.
+ * Seven days. Node's timer delay is a 32-bit signed integer: a larger
+ * value throws RangeError from AbortSignal.timeout, or makes setTimeout
+ * fire after 1 ms. Uploads must not see either.
  */
-export function parseMsdTimeoutMs(raw: string | undefined, fallback: number): number {
+export const MSD_JOB_TIMEOUT_MAX_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** One hour. Same timer limit as the job ceiling, on a shorter cap. */
+export const MSD_IDLE_TIMEOUT_MAX_MS = 60 * 60 * 1000;
+
+/**
+ * Parse an MSD deadline. Only a string of digits is accepted.
+ * Anything else, including 0, uses `fallback`. Values above `max`
+ * clamp to `max`.
+ */
+export function parseMsdTimeoutMs(raw: string | undefined, fallback: number, max: number): number {
   if (raw === undefined || !/^\d+$/.test(raw)) return fallback;
-  return normalizeMsdTimeoutMs(Number(raw), fallback);
+  return normalizeMsdTimeoutMs(Number(raw), fallback, max);
 }
 
-/** A positive integer, or `fallback` when the value is unusable. */
-export function normalizeMsdTimeoutMs(value: number, fallback: number): number {
+/**
+ * A positive integer in 1..max, or `fallback` when the value is unusable.
+ * Values above `max` clamp to `max`.
+ */
+export function normalizeMsdTimeoutMs(value: number, fallback: number, max: number): number {
   if (!Number.isFinite(value) || value <= 0) return fallback;
   const n = Math.trunc(value);
   if (!Number.isSafeInteger(n) || n <= 0) return fallback;
+  if (n > max) return max;
   return n;
 }

@@ -155,8 +155,11 @@ pikvm/kvmd v4.227
 (https://github.com/pikvm/kvmd/commit/0dd244fabc8ca5731fc594311211a5ab8544c85a),
 in particular kvmd/apps/kvmd/api/msd.py, kvmd/plugins/msd/otg/storage.py,
 kvmd/plugins/msd/__init__.py, and kvmd/htserver.py. Those files were
-read as API facts only. No kvmd source was copied. No code from another
-pikvm_mcp_server fork was added for these methods.
+read as API facts. The mock reproduces kvmd error class names and the
+messages those classes define, which is GPL-compatible: the source is
+pikvm/kvmd v4.227
+(https://github.com/pikvm/kvmd/commit/0dd244fabc8ca5731fc594311211a5ab8544c85a).
+No code from another pikvm_mcp_server fork was added for these methods.
 
 2026-10, by PLN:
   Added plain kvmd MSD methods on the client: getMsdState (parts map
@@ -170,6 +173,27 @@ pikvm_mcp_server fork was added for these methods.
   (default 60 seconds). On undici 7.24.1, headersTimeout does not
   abort a body that is still being written without socket backpressure,
   and bodyTimeout is only the gap between response bytes after headers.
-  The AbortSignal is the upload ceiling. A Content-Length mismatch is
+  The job AbortSignal is the upload ceiling. A stream that ends short
+  of Content-Length, or a chunk that runs past it, is
   UND_ERR_REQ_CONTENT_LENGTH_MISMATCH and is reported as
-  PIKVM_CONTENT_LENGTH_MISMATCH. The mock grew an MSD state machine.
+  PIKVM_CONTENT_LENGTH_MISMATCH. undici 7.24.1 does not promise that
+  when a chunk ends exactly on Content-Length and further bytes are
+  not yet buffered. The mock grew an MSD state machine.
+
+2026-10, by PLN:
+  Clamped PIKVM_MSD_JOB_TIMEOUT_MS to 7 days (604800000) and
+  PIKVM_MSD_IDLE_TIMEOUT_MS to 1 hour (3600000). Upload deadlines use
+  a cleared setTimeout and AbortController, created inside the request
+  try, so a value above 2^31-1 cannot throw RangeError or fire after
+  1 ms. After POST /msd/write or /msd/write_remote has started, a
+  timeout, a socket reset, or HTTP 504 is PIKVM_MSD_STATE_UNKNOWN
+  ("image may be partial or complete; re-read /api/msd; do not resend").
+  Connection refused before the request is sent stays PIKVM_UNREACHABLE.
+  An error reading the local upload stream is PIKVM_SOURCE_READ_ERROR.
+  msdWriteRemote raises PIKVM_MSD_STATE_UNKNOWN when the stream ends
+  with written not equal to size. getMsdState sums free space of
+  writable parts only. The mock keeps a complete:false image when a
+  write is aborted or short, unless remove_incomplete is set. Image
+  writable follows kvmd v4.227: a name ending in .iso is not writable;
+  an image in storage that was not adopted is. Simulated write and
+  connect failures use MsdOperationError.

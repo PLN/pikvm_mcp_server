@@ -1,5 +1,6 @@
 // Modified 2026-10 by PLN: typed KvmdError, timeouts, GET retry (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: client MSD methods (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: MSD deadline caps and upload error codes (GPL-3.0; see NOTICE).
 // AbortSignal.timeout and PIKVM_UNREACHABLE / PIKVM_AUTH_FAILED no-retry codes
 // adapted from dtrukr/pikvm_mcp_server src/pikvm/client.ts @ d120243 (GPL-3.0).
 // Snapshot HTTP 503 retry-once adapted from dvaerum/pikvm_mcp_server
@@ -12,21 +13,28 @@
 // MSD upload ceiling: msdWrite and msdWriteRemote do not use
 // PIKVM_REQUEST_TIMEOUT_MS. kvmd answers POST /msd/write only after it has
 // read the body, so the 5s ordinary abort would kill a real image.
-// PIKVM_MSD_JOB_TIMEOUT_MS (default 6 hours) is an AbortSignal wall clock
-// and undici headersTimeout. PIKVM_MSD_IDLE_TIMEOUT_MS (default 60 seconds)
-// aborts when the request body or the response body stops moving, and is
-// also undici bodyTimeout.
+// PIKVM_MSD_JOB_TIMEOUT_MS (default 6 hours, max 7 days) is a cleared
+// setTimeout plus AbortController, and undici headersTimeout.
+// PIKVM_MSD_IDLE_TIMEOUT_MS (default 60 seconds, max 1 hour) aborts when
+// the request body or the response body stops moving, and is also undici
+// bodyTimeout. AbortSignal.timeout is not used: above 2^32-1 it throws
+// RangeError, and a delay of 2^31 or more makes the timer fire after 1 ms.
 // Checked on undici 7.24.1: headersTimeout does not abort a request body
 // that is still being written without socket backpressure. Once the body
 // has ended it is only the wait for response headers. bodyTimeout starts
 // after response headers and resets on each response chunk, so it does not
 // cap a multi-GB stream that keeps sending. Delays above 1s use undici's
-// about-1s fast timer. The AbortSignal is the hard ceiling. A body that is
-// not exactly Content-Length raises UND_ERR_REQ_CONTENT_LENGTH_MISMATCH
-// (strictContentLength default) and is reported as
-// PIKVM_CONTENT_LENGTH_MISMATCH. MSD POSTs are not retried.
-// MSD facts are from pikvm/kvmd v4.227 (0dd244f) and docs.pikvm.org. No
-// kvmd source is copied.
+// about-1s fast timer. The job AbortSignal is the hard ceiling.
+// A stream that ends short of Content-Length, or a chunk that runs past
+// it, is UND_ERR_REQ_CONTENT_LENGTH_MISMATCH and is reported as
+// PIKVM_CONTENT_LENGTH_MISMATCH. A chunk that ends exactly on
+// Content-Length, with more bytes not yet buffered, can upload as a
+// shorter complete image. MSD POSTs are not retried.
+// After POST /msd/write or /msd/write_remote has started, a timeout, a
+// socket reset, or HTTP 504 is PIKVM_MSD_STATE_UNKNOWN. Connection refused
+// before the request is sent stays PIKVM_UNREACHABLE. An error reading
+// the local source is PIKVM_SOURCE_READ_ERROR.
+// MSD facts are from pikvm/kvmd v4.227 (0dd244f) and docs.pikvm.org.
 
 /**
  * PiKVM API Client
@@ -47,7 +55,9 @@ import {
 import { capKvmdField, redactSecrets } from '../redact.js';
 import {
   MSD_IDLE_TIMEOUT_DEFAULT_MS,
+  MSD_IDLE_TIMEOUT_MAX_MS,
   MSD_JOB_TIMEOUT_DEFAULT_MS,
+  MSD_JOB_TIMEOUT_MAX_MS,
   clampRequestTimeoutMs,
   normalizeMsdTimeoutMs,
 } from '../request-timeout.js';
@@ -392,6 +402,24 @@ function isContentLengthMismatch(err: unknown): boolean {
   return errorCodes(err).includes('UND_ERR_REQ_CONTENT_LENGTH_MISMATCH');
 }
 
+/** Image may already exist, complete or not. Do not upload it again. */
+const MSD_STATE_UNKNOWN_MESSAGE =
+  'image may be partial or complete; re-read /api/msd; do not resend';
+
+const SOURCE_READ_MESSAGE = 'failed to read the upload source';
+
+function isSourceReadError(err: unknown): boolean {
+  return errorCodes(err).includes('EIO') || errorCodes(err).includes('PIKVM_SOURCE_READ_ERROR');
+}
+
+function isConnectTimeout(err: unknown): boolean {
+  return errorCodes(err).includes('UND_ERR_CONNECT_TIMEOUT');
+}
+
+function msdStateUnknown(status: number, endpoint: string): KvmdError {
+  return new KvmdError(status, 'PIKVM_MSD_STATE_UNKNOWN', MSD_STATE_UNKNOWN_MESSAGE, endpoint);
+}
+
 function finiteNumber(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
@@ -433,7 +461,6 @@ function readParts(storage: Record<string, unknown> | null): {
   const raw = storage?.parts;
   if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
     const parts: Record<string, MsdPart> = {};
-    let sum = 0;
     let saw = false;
     for (const [name, info] of Object.entries(raw as Record<string, unknown>)) {
       if (!info || typeof info !== 'object') continue;
@@ -442,11 +469,14 @@ function readParts(storage: Record<string, unknown> | null): {
       const size = finiteNumber(row.size);
       if (free === null || size === null) continue;
       parts[name] = { size, free, writable: row.writable === true };
-      sum += free;
       saw = true;
     }
     if (saw) {
-      return { parts, free: parts[''] ? parts[''].free : sum };
+      let writableFree = 0;
+      for (const part of Object.values(parts)) {
+        if (part.writable) writableFree += part.free;
+      }
+      return { parts, free: writableFree };
     }
   }
   return { parts: null, free: finiteNumber(storage?.free) };
@@ -531,13 +561,28 @@ function readWriteImage(result: unknown): MsdWriteResult | null {
  * When the source ends, idle is disarmed: kvmd has not sent headers yet,
  * and that wait is the job ceiling, not the idle gap.
  */
-function trackUpload(source: Readable, bump: () => void, disarm: () => void): Readable {
+interface MsdWatch {
+  sourceError: boolean;
+}
+
+function trackUpload(
+  source: Readable,
+  bump: () => void,
+  disarm: () => void,
+  watch: MsdWatch,
+): Readable {
   return Readable.from(async function* () {
     try {
       for await (const chunk of source) {
         bump();
         yield chunk;
       }
+    } catch (err) {
+      watch.sourceError = true;
+      const wrapped = new Error(SOURCE_READ_MESSAGE);
+      (wrapped as { code?: string; cause?: unknown }).code = 'PIKVM_SOURCE_READ_ERROR';
+      (wrapped as { cause?: unknown }).cause = err;
+      throw wrapped;
     } finally {
       disarm();
     }
@@ -554,30 +599,41 @@ interface MsdDeadline {
 }
 
 function startMsdDeadline(jobMs: number, idleMs: number): MsdDeadline {
-  const job = AbortSignal.timeout(jobMs);
+  const jobCtrl = new AbortController();
   const idleCtrl = new AbortController();
-  let timer: ReturnType<typeof setTimeout> | undefined;
+  let idleTimer: ReturnType<typeof setTimeout> | undefined;
+  let jobTimer: ReturnType<typeof setTimeout> | undefined;
+  const timeoutError = () => new DOMException(
+    'The operation was aborted due to timeout',
+    'TimeoutError',
+  );
   const arm = () => {
-    if (idleCtrl.signal.aborted || job.aborted) return;
-    if (timer) clearTimeout(timer);
-    timer = setTimeout(() => {
-      idleCtrl.abort(new DOMException('The operation was aborted due to timeout', 'TimeoutError'));
+    if (idleCtrl.signal.aborted || jobCtrl.signal.aborted) return;
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      idleCtrl.abort(timeoutError());
     }, idleMs);
   };
   const disarm = () => {
-    if (timer) clearTimeout(timer);
-    timer = undefined;
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = undefined;
   };
-  const done = () => {
-    disarm();
-  };
-  arm();
   const onJob = () => {
     disarm();
   };
-  job.addEventListener('abort', onJob, { once: true });
+  const done = () => {
+    disarm();
+    if (jobTimer) clearTimeout(jobTimer);
+    jobTimer = undefined;
+    jobCtrl.signal.removeEventListener('abort', onJob);
+  };
+  jobTimer = setTimeout(() => {
+    jobCtrl.abort(timeoutError());
+  }, jobMs);
+  jobCtrl.signal.addEventListener('abort', onJob, { once: true });
+  arm();
   return {
-    signal: AbortSignal.any([job, idleCtrl.signal]),
+    signal: AbortSignal.any([jobCtrl.signal, idleCtrl.signal]),
     arm,
     disarm,
     done,
@@ -627,10 +683,12 @@ export class PiKVMClient {
     this.config.msdJobTimeoutMs = normalizeMsdTimeoutMs(
       this.config.msdJobTimeoutMs,
       MSD_JOB_TIMEOUT_DEFAULT_MS,
+      MSD_JOB_TIMEOUT_MAX_MS,
     );
     this.config.msdIdleTimeoutMs = normalizeMsdTimeoutMs(
       this.config.msdIdleTimeoutMs,
       MSD_IDLE_TIMEOUT_DEFAULT_MS,
+      MSD_IDLE_TIMEOUT_MAX_MS,
     );
     redactionPasswords.set(this, this.config.password);
 
@@ -1327,24 +1385,32 @@ export class PiKVMClient {
     if (options.image !== undefined) query.set('image', options.image);
     if (options.timeout !== undefined) query.set('timeout', String(options.timeout));
     const endpoint = 'POST /api/msd/write_remote';
-    const deadline = startMsdDeadline(this.config.msdJobTimeoutMs, this.config.msdIdleTimeoutMs);
+    let deadline: MsdDeadline | undefined;
     let responseBody: AsyncIterable<Uint8Array> | undefined;
     try {
+      deadline = startMsdDeadline(this.config.msdJobTimeoutMs, this.config.msdIdleTimeoutMs);
       const response = await this.msdDispatch(
         `/msd/write_remote?${query}`,
         endpoint,
         undefined,
         undefined,
         deadline,
+        undefined,
       );
       responseBody = response.body;
       if (response.statusCode < 200 || response.statusCode >= 300) {
         const text = await this.readUploadText(response.body, deadline);
-        throw this.httpFailure(response.statusCode, text, endpoint);
+        throw this.msdHttpFailure(response.statusCode, text, endpoint);
       }
       deadline.arm();
       const decoder = new TextDecoder();
       let pending = '';
+      let last: MsdWriteResult | undefined;
+      const take = (line: string) => {
+        let image: MsdWriteResult | undefined;
+        for (const row of this.ndjsonLine(line, response.statusCode, endpoint)) image = row;
+        return image;
+      };
       for await (const chunk of response.body) {
         deadline.arm();
         pending += decoder.decode(chunk, { stream: true });
@@ -1352,18 +1418,33 @@ export class PiKVMClient {
         while (nl !== -1) {
           const line = pending.slice(0, nl).replace(/\r$/, '');
           pending = pending.slice(nl + 1);
-          if (line) yield* this.ndjsonLine(line, response.statusCode, endpoint);
+          if (line) {
+            const image = take(line);
+            if (image) {
+              last = image;
+              yield image;
+            }
+          }
           nl = pending.indexOf('\n');
         }
       }
       pending += decoder.decode();
       const tail = pending.replace(/\r$/, '').trim();
-      if (tail) yield* this.ndjsonLine(tail, response.statusCode, endpoint);
+      if (tail) {
+        const image = take(tail);
+        if (image) {
+          last = image;
+          yield image;
+        }
+      }
+      if (!last || last.written !== last.size) {
+        throw msdStateUnknown(response.statusCode, endpoint);
+      }
     } catch (err) {
       if (err instanceof KvmdError) throw err;
       throw this.msdTransport(err, endpoint);
     } finally {
-      deadline.done();
+      deadline?.done();
       await this.dumpBody(responseBody);
     }
   }
@@ -1406,15 +1487,17 @@ export class PiKVMClient {
     body: Readable | undefined,
     size: number | undefined,
   ): Promise<{ statusCode: number; result: unknown }> {
-    const deadline = startMsdDeadline(this.config.msdJobTimeoutMs, this.config.msdIdleTimeoutMs);
+    let deadline: MsdDeadline | undefined;
     let responseBody: AsyncIterable<Uint8Array> | undefined;
+    const watch: MsdWatch = { sourceError: false };
     try {
-      const response = await this.msdDispatch(path, endpoint, body, size, deadline);
+      deadline = startMsdDeadline(this.config.msdJobTimeoutMs, this.config.msdIdleTimeoutMs);
+      const response = await this.msdDispatch(path, endpoint, body, size, deadline, watch);
       responseBody = response.body;
       deadline.arm();
       const text = await this.readUploadText(response.body, deadline);
       if (response.statusCode < 200 || response.statusCode >= 300) {
-        throw this.httpFailure(response.statusCode, text, endpoint);
+        throw this.msdHttpFailure(response.statusCode, text, endpoint);
       }
       if (!text) return { statusCode: response.statusCode, result: {} };
       let parsed: KvmdEnvelope;
@@ -1432,9 +1515,12 @@ export class PiKVMClient {
       return { statusCode: response.statusCode, result: parsed.result };
     } catch (err) {
       if (err instanceof KvmdError) throw err;
+      if (watch.sourceError && !isContentLengthMismatch(err)) {
+        throw new KvmdError(0, 'PIKVM_SOURCE_READ_ERROR', SOURCE_READ_MESSAGE, endpoint);
+      }
       throw this.msdTransport(err, endpoint);
     } finally {
-      deadline.done();
+      deadline?.done();
       await this.dumpBody(responseBody);
     }
   }
@@ -1445,6 +1531,7 @@ export class PiKVMClient {
     body: Readable | undefined,
     size: number | undefined,
     deadline: MsdDeadline,
+    watch: MsdWatch | undefined,
   ): Promise<{ statusCode: number; body: AsyncIterable<Uint8Array> & { destroy?: () => void; text?: () => Promise<string> } }> {
     const url = new URL(`/api${path}`, this.config.host);
     const headers: Record<string, string> = {
@@ -1455,7 +1542,7 @@ export class PiKVMClient {
     if (body !== undefined && size !== undefined) {
       headers['content-length'] = String(size);
       headers['content-type'] = 'application/octet-stream';
-      upload = trackUpload(body, deadline.arm, deadline.disarm);
+      upload = trackUpload(body, deadline.arm, deadline.disarm, watch ?? { sourceError: false });
     } else {
       // No request body. The wait for response headers is the job ceiling.
       // Idle starts again once those headers arrive.
@@ -1474,8 +1561,17 @@ export class PiKVMClient {
       });
       return response;
     } catch (err) {
+      if (!isContentLengthMismatch(err) && (watch?.sourceError || isSourceReadError(err))) {
+        throw new KvmdError(0, 'PIKVM_SOURCE_READ_ERROR', SOURCE_READ_MESSAGE, endpoint);
+      }
       throw this.msdTransport(err, endpoint);
     }
+  }
+
+  /** HTTP 504 on an upload means nginx gave up while kvmd may still be writing. */
+  private msdHttpFailure(status: number, text: string, endpoint: string): KvmdError {
+    if (status === 504) return msdStateUnknown(status, endpoint);
+    return this.httpFailure(status, text, endpoint);
   }
 
   private msdTransport(err: unknown, endpoint: string): KvmdError {
@@ -1488,7 +1584,15 @@ export class PiKVMClient {
         endpoint,
       );
     }
-    return transportError(err, endpoint, false);
+    if (isSourceReadError(err)) {
+      return new KvmdError(0, 'PIKVM_SOURCE_READ_ERROR', SOURCE_READ_MESSAGE, endpoint);
+    }
+    const codes = errorCodes(err);
+    const beforeSend = codes.some((code) => PRE_SEND_CODES.has(code)) || isConnectTimeout(err);
+    if (!beforeSend && (isTimeoutError(err) || failedAfterSend(err))) {
+      return msdStateUnknown(0, endpoint);
+    }
+    return new KvmdError(0, 'PIKVM_UNREACHABLE', 'kvmd network error', endpoint);
   }
 
   private async readUploadText(
