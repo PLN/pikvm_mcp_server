@@ -12,7 +12,8 @@
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
-    "test": "npm run build && node --test \"test/*.test.mjs\""
+    "test": "npm run build && node --test \"test/*.test.mjs\"",
+    "test:hw": "npm run build && node --test --test-concurrency=1 \"test/hw/*.hw.test.mjs\""
   },
   "keywords": [
     "mcp",

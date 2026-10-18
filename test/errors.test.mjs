@@ -1,6 +1,7 @@
 // Modified 2026-10 by PLN: KvmdError, timeout, and GET retry tests (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: connect timeout and DNS unreachable tests (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: pikvm_type delay is milliseconds (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: header and body timeouts stay timeouts (GPL-3.0; see NOTICE).
 
 /**
  * KvmdError, request timeout, and bounded GET retry.
@@ -700,15 +701,12 @@ function coded(message, code) {
  * `cause`. undici request() rejects the dispatcher error itself, so the
  * code is on that error. Both shapes are covered below.
  */
-async function withCodedDispatch(code, method, run) {
+async function withDispatchError(error, method, run) {
   const agent = new MockAgent();
   agent.disableNetConnect();
   const origin = 'http://127.0.0.1:40123';
   const pool = agent.get(origin);
   let hits = 0;
-  const error = code === 'UND_ERR_CONNECT_TIMEOUT'
-    ? Object.assign(new Error('wrapped'), { cause: coded('Connect Timeout Error', code) })
-    : coded(code, code);
   pool.intercept({
     path: () => {
       hits += 1;
@@ -729,6 +727,13 @@ async function withCodedDispatch(code, method, run) {
   } finally {
     await agent.close();
   }
+}
+
+async function withCodedDispatch(code, method, run) {
+  const error = code === 'UND_ERR_CONNECT_TIMEOUT'
+    ? Object.assign(new Error('wrapped'), { cause: coded('Connect Timeout Error', code) })
+    : coded(code, code);
+  await withDispatchError(error, method, run);
 }
 
 function assertUnreachable(err) {
@@ -761,6 +766,51 @@ test('ENOTFOUND is unreachable and a GET is tried 3 times', async () => {
     assert.equal(hits(), 3);
   });
   await withCodedDispatch('ENOTFOUND', 'POST', async (pikvm, hits) => {
+    await assert.rejects(
+      () => pikvm.msdWrite('disk.img', Readable.from(Buffer.from('abcd')), 4),
+      assertUnreachable,
+    );
+    assert.equal(hits(), 1);
+  });
+});
+
+function assertTimeout(err) {
+  assert.ok(err instanceof KvmdError);
+  assert.equal(err.type, 'PIKVM_TIMEOUT');
+  assert.notEqual(err.type, 'PIKVM_UNREACHABLE');
+  assert.equal(err.message, 'kvmd request timed out');
+  return true;
+}
+
+test('header and body timeouts stay PIKVM_TIMEOUT', async () => {
+  for (const code of ['UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT']) {
+    await withCodedDispatch(code, 'GET', async (pikvm, hits) => {
+      await assert.rejects(() => pikvm.getResolution(true), assertTimeout);
+      assert.equal(hits(), 3);
+    });
+  }
+});
+
+test('a connect timeout nested under TimeoutError stays unreachable', async () => {
+  const nested = () => Object.assign(new Error('The operation was aborted due to timeout'), {
+    name: 'TimeoutError',
+    cause: coded('Connect Timeout Error', 'UND_ERR_CONNECT_TIMEOUT'),
+  });
+  await withDispatchError(nested(), 'GET', async (pikvm, hits) => {
+    await assert.rejects(() => pikvm.getResolution(true), assertUnreachable);
+    assert.equal(hits(), 3);
+  });
+  await withDispatchError(nested(), 'POST', async (pikvm, hits) => {
+    await assert.rejects(() => pikvm.sendKey('KeyA'), (err) => {
+      assert.ok(err instanceof KvmdError);
+      assert.equal(err.type, 'PIKVM_UNREACHABLE');
+      assert.notEqual(err.type, 'PIKVM_HID_STATE_UNKNOWN');
+      assert.notEqual(err.type, 'PIKVM_TIMEOUT');
+      return true;
+    });
+    assert.equal(hits(), 1);
+  });
+  await withDispatchError(nested(), 'POST', async (pikvm, hits) => {
     await assert.rejects(
       () => pikvm.msdWrite('disk.img', Readable.from(Buffer.from('abcd')), 4),
       assertUnreachable,

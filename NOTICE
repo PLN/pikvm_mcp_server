@@ -12,6 +12,9 @@ Modified 2026-10 by PLN: the upload double close was the EBADF (GPL-3.0; see bel
 Modified 2026-10 by PLN: abort tests reject a raw-fd upload read (GPL-3.0; see below).
 Modified 2026-10 by PLN: connect timeout and DNS map to unreachable (GPL-3.0; see below).
 Modified 2026-10 by PLN: pikvm_type delay is milliseconds (GPL-3.0; see below).
+Modified 2026-10 by PLN: opt-in hardware suite (GPL-3.0; see below).
+Modified 2026-10 by PLN: header and body timeouts stay timeouts (GPL-3.0; see below).
+Modified 2026-10 by PLN: hardware ISO, net check, and cleanup names (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -402,3 +405,49 @@ No code from another pikvm_mcp_server fork was added for these methods.
   32 characters at 200 ms is 49s and is sent. 33 characters at 200 ms
   is 50.2s and is refused before the call. No code from another
   pikvm_mcp_server fork was added.
+
+2026-10, by PLN:
+  Added an opt-in hardware suite under test/hw, run with npm run
+  test:hw. npm test stays test/*.test.mjs, and the CI workflow does
+  not call test:hw. With PIKVM_HW_TEST_DEVICE unset, every hardware
+  test skips and does not open a socket. Only the name default is
+  accepted, through the resolveDevice stub and the legacy PIKVM_HOST
+  credentials. The device registry is still Phase B item 10. The
+  default level is read-only. PIKVM_HW_TEST_ALLOW_MSD=1 runs an
+  upload, cdrom mount, two ejects, a flash read-only mount, and
+  remove of an mcp-hwtest-* image, and restores the drive snapshot
+  in a finally block. force is the dangerous override for a connected
+  or busy drive. PIKVM_HW_TEST_ALLOW_HID=1 types a short string only
+  when HID is armed. A normal test drives a forced failure against
+  the kvmd mock and checks that cleanup restores the snapshot.
+  package.json gained the test:hw script. No code from another
+  pikvm_mcp_server fork was added.
+
+2026-10, by PLN:
+  Removed isConnectTimeout. UND_ERR_CONNECT_TIMEOUT is already in the
+  pre-send set, and that set is read from the error and from each
+  cause, so the extra check on the MSD path did not change the result.
+  A coded UND_ERR_HEADERS_TIMEOUT or UND_ERR_BODY_TIMEOUT stays
+  PIKVM_TIMEOUT. A connect timeout nested under a TimeoutError stays
+  PIKVM_UNREACHABLE, because a pre-send failure is classified before
+  the timeout check. No code from another pikvm_mcp_server fork was
+  added.
+
+2026-10, by PLN:
+  The hardware image is a 1 MiB ISO 9660 volume written in Node
+  (512 sectors of 2048 bytes), with a primary volume descriptor at
+  sector 16, a terminator at sector 17, and a root directory at
+  sector 18. There is no xorriso, genisoimage, or 64-byte fixture.
+  The kernel fsg gadget needs at least 300 sectors for cdrom.
+  Cleanup removes only the image names this run created and reports
+  any other mcp-hwtest-* name as a leftover. A cdrom mount passes
+  expectImage only when the snapshot was already connected. With no
+  snapshot image, cleanup still restores the cdrom and rw flags.
+  The self-skip check reads the network marker on stdout and stderr
+  together, because node --test relays a child file's stderr onto
+  the runner's stdout. TAP does not name the files, so a reporter
+  lists readonly.hw.test.mjs, msd.hw.test.mjs, and hid.hw.test.mjs,
+  and the check requires all 7 tests to be skipped. The guard also
+  patches ESM dns lookup. The closed-port probe uses port 65000.
+  test:hw passes --test-concurrency=1.
+  No code from another pikvm_mcp_server fork was added.
