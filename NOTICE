@@ -6,6 +6,7 @@ Modified 2026-10 by PLN: hashing jobs, bad-image cleanup, upload try-lock (GPL-3
 Modified 2026-10 by PLN: URL fetch allowlist and Tailscale opt-in (GPL-3.0; see below).
 Modified 2026-10 by PLN: metadata embeddings, connect timeout, and fetch cleanup (GPL-3.0; see below).
 Modified 2026-10 by PLN: deny local NAT64 and non-global wrapped IPv4 (GPL-3.0; see below).
+Modified 2026-10 by PLN: normalized fetch host and named allowlist errors (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -326,4 +327,15 @@ No code from another pikvm_mcp_server fork was added for these methods.
   ALLOW_PRIVATE and a Tailscale CIDR do not cover a wrapped form.
   :: and ::1 stay plain IPv6. ::ffff:0:0/96 stays plain IPv4, because
   that is how a socket presents an IPv4 address. No code from another
+  pikvm_mcp_server fork was added.
+
+2026-10, by PLN:
+  A trailing-dot hostname is normalized before DNS and before the URL
+  is sent to kvmd, so both use the same host. An always-denied allowlist
+  entry, including a Tailscale CIDR such as 100.100.100.100/32, is
+  rejected at config load and the error names that entry with userinfo
+  and the query removed. A non-numeric
+  PIKVM_MSD_URL_CONNECT_TIMEOUT_SEC uses the 30 second default and logs
+  a warning. That connect timeout stays independent of the 60 second
+  idle timeout and is not clamped to it. No code from another
   pikvm_mcp_server fork was added.

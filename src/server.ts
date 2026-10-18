@@ -5,6 +5,7 @@
 // Modified 2026-10 by PLN: hashing jobs and typed upload errors (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: URL fetch tool and transfer mount block (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: write_remote connect timeout (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: redactUrl on tool errors (GPL-3.0; see NOTICE).
 
 /**
  * MCP server factory for PiKVM tools
@@ -49,7 +50,7 @@ import {
   startMsdFetch,
   startMsdUpload,
 } from './msd.js';
-import { MsdUrlPolicyError, redactUrlUserinfo } from './url-policy.js';
+import { MsdUrlPolicyError, redactUrl } from './url-policy.js';
 
 export interface McpServerDeps {
   pikvm: PiKVMClient;
@@ -246,7 +247,7 @@ export function msdToolRequiresArm(name: string): boolean {
  * is removed from every message. Other errors stay `Error: <message>`.
  */
 export function formatToolError(error: unknown, password = ''): string {
-  const redact = (value: string) => redactUrlUserinfo(redactSecrets(value, password));
+  const redact = (value: string) => redactUrl(redactSecrets(value, password));
   if (error instanceof MsdExpectImageError || error instanceof MsdImageTransferError) {
     const message = redact(error.message);
     const image = redact(error.image);

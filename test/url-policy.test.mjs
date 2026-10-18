@@ -1,6 +1,7 @@
 // Modified 2026-10 by PLN: URL allowlist and SSRF address policy tests (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: metadata embeddings, Tailscale services, reserved ranges (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: local NAT64 and non-global wrapped IPv4 (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: redactUrl, named allowlist errors, trailing-dot href (GPL-3.0; see NOTICE).
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -9,14 +10,14 @@ import {
   assertResolvedAddresses,
   inspectFetchUrl,
   parseUrlAllowlist,
-  redactUrlUserinfo,
+  redactUrl,
 } from '../dist/url-policy.js';
 
 const HOST = 'https://images.example/iso';
 
-test('redactUrlUserinfo drops userinfo at the last at and drops the query', () => {
+test('redactUrl drops userinfo at the last at and drops the query', () => {
   const text = 'failed https://alice:p@ss@images.example/disk.img?token=keep#frag';
-  const redacted = redactUrlUserinfo(text);
+  const redacted = redactUrl(text);
   assert.equal(redacted.includes('p@ss'), false);
   assert.equal(redacted.includes('alice'), false);
   assert.equal(redacted.includes('token'), false);
@@ -44,7 +45,23 @@ test('allowlist parses https prefixes and tailscale CIDRs', () => {
   assert.throws(() => parseUrlAllowlist('100.64.0.0/0x18'), /tailscale opt-in/);
   assert.throws(() => parseUrlAllowlist('100.101.102.103/16'), /tailscale opt-in/);
   assert.throws(() => parseUrlAllowlist('fd7a:115c:a1e0::50/48'), /tailscale opt-in/);
-  assert.throws(() => parseUrlAllowlist('https://169.254.169.254/iso'), /always denied/);
+  assert.throws(
+    () => parseUrlAllowlist('100.100.100.100/32'),
+    (err) => err instanceof Error && err.message === 'PIKVM_MSD_URL_ALLOWLIST entry 100.100.100.100/32 is always denied',
+  );
+  assert.throws(() => parseUrlAllowlist('100.100.100.200/32'), /always denied/);
+  assert.throws(() => parseUrlAllowlist('fd7a:115c:a1e0::53/128'), /always denied/);
+  assert.equal(parseUrlAllowlist('100.64.0.0/10').tailscale.check('100.101.102.103', 'ipv4'), true);
+  assert.equal(parseUrlAllowlist('100.100.100.0/24').tailscale.check('100.100.100.1', 'ipv4'), true);
+  assert.throws(
+    () => parseUrlAllowlist('https://169.254.169.254/iso'),
+    (err) => err instanceof Error && err.message === 'PIKVM_MSD_URL_ALLOWLIST entry https://169.254.169.254/iso is always denied',
+  );
+  assert.throws(
+    () => parseUrlAllowlist('https://alice:s3cret@[64:ff9b:1::a9fe:a9fe]/meta?token=keep'),
+    (err) => err instanceof Error
+      && err.message === 'PIKVM_MSD_URL_ALLOWLIST entry https://[64:ff9b:1::a9fe:a9fe]/meta is always denied',
+  );
   assert.throws(() => parseUrlAllowlist('https://[fe80::1]/'), /always denied/);
   assert.throws(() => parseUrlAllowlist('https://[fd00:ec2::254]/'), /always denied/);
   assert.throws(() => parseUrlAllowlist('https://100.100.100.100/'), /always denied/);
@@ -127,6 +144,7 @@ test('inspectFetchUrl accepts an allowlisted https URL and rejects the rest', ()
   assert.match(hashed.href, /token=keep/);
   const dotted = inspectFetchUrl('https://images.example./iso/disk.img', allow);
   assert.equal(dotted.hostname, 'images.example');
+  assert.equal(dotted.href, 'https://images.example/iso/disk.img');
   const explicitPort = inspectFetchUrl('https://images.example:443/iso/disk.img', allow);
   assert.equal(explicitPort.hostname, 'images.example');
   assert.equal(explicitPort.href.includes(':443'), false);

@@ -1,6 +1,7 @@
 // Modified 2026-10 by PLN: URL allowlist and SSRF address policy (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: metadata embeddings, Tailscale services, reserved ranges (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: deny 64:ff9b:1::/48 and non-global wrapped IPv4 (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: normalized fetch host, named allowlist errors (GPL-3.0; see NOTICE).
 
 /**
  * https allowlist and address checks for pikvm_msd_fetch_url.
@@ -73,9 +74,10 @@ export interface UrlAllowlist {
 
 /**
  * Drop URL userinfo, cutting at the last `@` before the path, and drop
- * the query string and fragment. kvmd still logs the full URL.
+ * the query string, the fragment, and anything after them. kvmd still
+ * logs the full URL.
  */
-export function redactUrlUserinfo(text: string): string {
+export function redactUrl(text: string): string {
   return text.replace(
     /\b([a-z][a-z0-9+.-]*:\/\/)([^\s/?#]*)([^\s]*)/gi,
     (_match, scheme: string, authority: string, rest: string) => {
@@ -91,7 +93,7 @@ export class MsdUrlPolicyError extends Error {
   readonly type: string;
 
   constructor(type: string, message: string) {
-    super(redactUrlUserinfo(message));
+    super(redactUrl(message));
     this.name = type;
     this.type = type;
   }
@@ -247,6 +249,9 @@ function addTailscaleCidr(list: BlockList, token: string): void {
   if (!tailscaleOuter.check(start, family) || !tailscaleOuter.check(end, family)) {
     throw new Error(CIDR_ERROR);
   }
+  if (alwaysDeny.check(start, family) || alwaysDeny.check(end, family)) {
+    throw new Error(`PIKVM_MSD_URL_ALLOWLIST entry ${redactUrl(token)} is always denied`);
+  }
   list.addSubnet(address, prefix, family);
 }
 
@@ -272,16 +277,16 @@ function parseHttpsEntry(item: string): UrlAllowEntry {
   if (url.protocol !== 'https:') {
     throw new Error('PIKVM_MSD_URL_ALLOWLIST entry must use https');
   }
+  const host = normalizeHost(url.hostname);
+  const bare = stripBrackets(host);
+  if (isIP(bare) && isAlwaysDeniedAddress(bare)) {
+    throw new Error(`PIKVM_MSD_URL_ALLOWLIST entry ${redactUrl(item)} is always denied`);
+  }
   if (url.username || url.password) {
     throw new Error('PIKVM_MSD_URL_ALLOWLIST entry must not contain userinfo');
   }
   if (url.search || url.hash) {
     throw new Error('PIKVM_MSD_URL_ALLOWLIST entry must not contain a query or hash');
-  }
-  const host = normalizeHost(url.hostname);
-  const bare = stripBrackets(host);
-  if (isIP(bare) && isAlwaysDeniedAddress(bare)) {
-    throw new Error('PIKVM_MSD_URL_ALLOWLIST host is always denied');
   }
   const port = url.port === '' ? 443 : Number(url.port);
   let pathPrefix = url.pathname;
@@ -341,6 +346,8 @@ export function inspectFetchUrl(raw: string, allow: UrlAllowlist): InspectedUrl 
     throw new MsdUrlPolicyError('MsdUrlAllowlistError', 'url is not allowlisted');
   }
   url.hash = '';
+  const normalizedHost = normalizeHost(url.hostname);
+  if (normalizedHost !== url.hostname) url.hostname = normalizedHost;
   const segments = url.pathname.split('/').filter((part) => part.length > 0);
   const last = segments.length > 0 ? segments[segments.length - 1] : '';
   let imageFromPath = '';

@@ -8,6 +8,7 @@
 <!-- Modified 2026-10 by PLN: URL fetch allowlist and Tailscale opt-in (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: metadata embeddings, connect timeout, and fetch cleanup (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: deny local NAT64 and non-global wrapped IPv4 (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: connect timeout is independent of the idle timeout (GPL-3.0; see NOTICE) -->
 
 # PiKVM MCP Server
 
@@ -149,7 +150,9 @@ PIKVM_MCP_NO_DOTENV=0
   `100.64.0.0/10` or `fd7a:115c:a1e0::/48`, for example `100.64.0.0/10` or
   `100.101.102.103/32`. A CIDR does not match URLs by itself; the https entry
   still has to match, and every resolved address in those ranges must fall in
-  one of the CIDRs. No https entry hides `pikvm_msd_fetch_url`.
+  one of the CIDRs. A CIDR whose first or last address is always denied,
+  such as `100.100.100.100/32`, is rejected when the config loads, and
+  the error names that entry. No https entry hides `pikvm_msd_fetch_url`.
 - **`PIKVM_MSD_URL_ALLOW_PRIVATE`** — `1` allows an allowlisted host to resolve
   to loopback, unspecified (`0.0.0.0/8`, `::`), RFC1918, other ULA (`fc00::/7`
   outside the Tailscale range), multicast, or broadcast. It does not allow
@@ -168,13 +171,21 @@ PIKVM_MCP_NO_DOTENV=0
   ranges stay denied too (`240.0.0.0/4`, `198.18.0.0/15`, `192.0.0.0/24`,
   `192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`, `fec0::/10`,
   `2001:db8::/32`). A literal allowlist host in an always-denied range is
-  rejected when the config loads. Default `0`.
+  rejected when the config loads. That error names the entry with
+  userinfo and the query removed. Default `0`.
 - **`PIKVM_MSD_URL_CONNECT_TIMEOUT_SEC`** — connect timeout sent to kvmd as
   `write_remote` `timeout=` (aiohttp `sock_connect`). Digits only, default
-  30, clamped to 120. This is not the job wall clock. The job still uses
+  30, clamped to 120. A value that is not a string of digits uses the
+  default and logs a warning. `0` and an empty value use the default
+  quietly. This timer is not clamped to `PIKVM_MSD_IDLE_TIMEOUT_MS`
+  (default 60 seconds). They measure different things: this is how long
+  aiohttp may spend opening the connection, and the idle timeout is how
+  long the progress stream may sit silent. The job wall clock stays
   `PIKVM_MSD_JOB_TIMEOUT_MS`.
-- **Redirect and DNS.** The MCP host's DNS answers can differ from the
-  PiKVM's. kvmd (aiohttp) follows up to 10 redirects, including an https to
+- **Redirect and DNS.** A trailing dot on a hostname is removed before
+  DNS and before the URL is sent, so both use the same host. The MCP
+  host's DNS answers can differ from the PiKVM's. kvmd (aiohttp) follows
+  up to 10 redirects, including an https to
   http downgrade, and resolves DNS itself. This server does not send a
   `redirect: 'manual'` HEAD before the download. Allowlist only
   operator-controlled hosts that do not redirect. A name that changes

@@ -5,6 +5,7 @@
 // Modified 2026-10 by PLN: PIKVM_MSD_LOCAL_DIR and PIKVM_MSD_MAX_BYTES (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: PIKVM_MSD_URL_ALLOWLIST and URL private opt-in (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: write_remote connect timeout (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: warn on a junk connect timeout (GPL-3.0; see NOTICE).
 // Env read adapted from dtrukr/pikvm_mcp_server src/config.ts @ d120243 (GPL-3.0).
 
 /**
@@ -118,8 +119,16 @@ export function parseUrlConnectTimeoutSec(raw: string | undefined): number {
   if (raw === undefined || raw.trim() === '' || raw.trim() === '0') {
     return MSD_URL_CONNECT_TIMEOUT_DEFAULT_SEC;
   }
-  if (!/^[0-9]+$/.test(raw.trim())) return MSD_URL_CONNECT_TIMEOUT_DEFAULT_SEC;
-  const sec = Number(raw.trim());
+  const trimmed = raw.trim();
+  if (!/^[0-9]+$/.test(trimmed)) {
+    console.error(JSON.stringify({
+      event: 'msd_config',
+      ok: false,
+      error: 'PIKVM_MSD_URL_CONNECT_TIMEOUT_SEC is not a number of seconds; using the default',
+    }));
+    return MSD_URL_CONNECT_TIMEOUT_DEFAULT_SEC;
+  }
+  const sec = Number(trimmed);
   if (sec > MSD_URL_CONNECT_TIMEOUT_MAX_SEC) return MSD_URL_CONNECT_TIMEOUT_MAX_SEC;
   return sec;
 }

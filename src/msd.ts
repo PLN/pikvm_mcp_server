@@ -4,6 +4,7 @@
 // Modified 2026-10 by PLN: hashing jobs, bad-image cleanup, upload try-lock (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: URL fetch jobs and mount block during a transfer (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: fetch cleanup only after our progress line (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: redactUrl on MSD errors (GPL-3.0; see NOTICE).
 
 /**
  * Policy for MSD status, mount, eject, upload, and remove.
@@ -33,7 +34,7 @@ import {
   assertResolvedAddresses,
   inspectFetchUrl,
   MsdUrlPolicyError,
-  redactUrlUserinfo,
+  redactUrl,
   resolveFetchHost,
   type UrlAllowlist,
 } from './url-policy.js';
@@ -197,7 +198,7 @@ function errorFields(err: unknown): ErrorFields {
     return {
       status: err.status,
       type: err.type,
-      message: redactUrlUserinfo(err.message),
+      message: redactUrl(err.message),
       endpoint: err.endpoint,
     };
   }
@@ -211,14 +212,14 @@ function errorFields(err: unknown): ErrorFields {
     return {
       status: 0,
       type: err.type,
-      message: redactUrlUserinfo(err.message),
+      message: redactUrl(err.message),
       endpoint: '',
     };
   }
   return {
     status: 0,
     type: 'Error',
-    message: redactUrlUserinfo(err instanceof Error ? err.message : 'MSD operation failed'),
+    message: redactUrl(err instanceof Error ? err.message : 'MSD operation failed'),
     endpoint: '',
   };
 }

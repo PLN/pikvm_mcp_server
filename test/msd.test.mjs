@@ -5,6 +5,7 @@
 // Modified 2026-10 by PLN: URL fetch jobs and mount block during a transfer (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: fetch cleanup only after our progress line (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: local NAT64 and non-global wrapped IPv4 (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: trailing-dot host is the form sent to kvmd (GPL-3.0; see NOTICE).
 
 /**
  * MSD tools against the mock. The HTTP harness matches test/http.test.mjs.
@@ -1598,7 +1599,10 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
       const done = await pollJob(base, sessionId, jobId);
       assert.equal(done.state, 'done');
       assert.equal(seen, 'images.example');
-      assert.ok(mock.calls.some((call) => call.path === '/api/msd/write_remote'));
+      const call = mock.calls.find((item) => item.path === '/api/msd/write_remote');
+      assert.ok(call);
+      assert.equal(call.query.includes('images.example.'), false);
+      assert.match(call.query, /images\.example%2Fiso%2Fdisk\.img/);
     });
   });
 

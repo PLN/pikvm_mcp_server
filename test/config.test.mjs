@@ -7,6 +7,7 @@
  * Modified 2026-10 by PLN: PIKVM_MSD_URL_ALLOWLIST and URL private opt-in (GPL-3.0; see NOTICE).
  * Modified 2026-10 by PLN: write_remote connect timeout (GPL-3.0; see NOTICE).
  * Modified 2026-10 by PLN: local NAT64 allowlist literals (GPL-3.0; see NOTICE).
+ * Modified 2026-10 by PLN: junk connect timeout warning (GPL-3.0; see NOTICE).
  *
  * loadEnvFile unit tests — verify PIKVM_MCP_NO_DOTENV=1 makes .env lose to
  * explicitly-set process env (the gateway systemd landmine fix).
@@ -330,7 +331,53 @@ test('PIKVM_MSD_URL_ALLOWLIST is empty by default and ALLOW_PRIVATE is off', () 
     assert.throws(() => loadConfig(), /always denied/);
     process.env.PIKVM_MSD_URL_ALLOWLIST = 'https://[64:ff9b:1::a9fe:a9fe]/';
     assert.throws(() => loadConfig(), /always denied/);
+    process.env.PIKVM_MSD_URL_ALLOWLIST = '100.100.100.100/32';
+    assert.throws(() => loadConfig(), /100\.100\.100\.100\/32 is always denied/);
+    process.env.PIKVM_MSD_URL_ALLOWLIST = 'https://alice:s3cret@169.254.169.254/iso?token=keep';
+    assert.throws(() => loadConfig(), (err) => {
+      assert.equal(err instanceof Error, true);
+      assert.match(err.message, /169\.254\.169\.254\/iso is always denied/);
+      assert.equal(err.message.includes('s3cret'), false);
+      assert.equal(err.message.includes('token'), false);
+      return true;
+    });
   } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+});
+
+test('a non-numeric connect timeout uses the default and warns', () => {
+  const keys = [
+    'PIKVM_HOST',
+    'PIKVM_PASSWORD',
+    'PIKVM_MSD_URL_CONNECT_TIMEOUT_SEC',
+  ];
+  const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  const orig = console.error;
+  const logged = [];
+  console.error = (line) => {
+    logged.push(String(line));
+  };
+  process.env.PIKVM_HOST = 'http://mock.test';
+  process.env.PIKVM_PASSWORD = 'testpw';
+  try {
+    process.env.PIKVM_MSD_URL_CONNECT_TIMEOUT_SEC = '30s';
+    assert.equal(loadConfig().msd.connectTimeoutSec, 30);
+    assert.equal(logged.some((line) => line.includes('30s')), false);
+    assert.ok(logged.some((line) => line.includes('msd_config') && line.includes('using the default')));
+    logged.length = 0;
+    process.env.PIKVM_MSD_URL_CONNECT_TIMEOUT_SEC = '';
+    assert.equal(loadConfig().msd.connectTimeoutSec, 30);
+    process.env.PIKVM_MSD_URL_CONNECT_TIMEOUT_SEC = '0';
+    assert.equal(loadConfig().msd.connectTimeoutSec, 30);
+    process.env.PIKVM_MSD_URL_CONNECT_TIMEOUT_SEC = '9999';
+    assert.equal(loadConfig().msd.connectTimeoutSec, 120);
+    assert.equal(logged.length, 0);
+  } finally {
+    console.error = orig;
     for (const [k, v] of Object.entries(saved)) {
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;
