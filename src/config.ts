@@ -1,3 +1,6 @@
+// Modified 2026-10 by PLN: PIKVM_REQUEST_TIMEOUT_MS (GPL-3.0; see NOTICE).
+// Env read adapted from dtrukr/pikvm_mcp_server src/config.ts @ d120243 (GPL-3.0).
+
 /**
  * Configuration management for PiKVM MCP Server
  *
@@ -8,6 +11,7 @@
 import { config as loadEnv } from 'dotenv';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { parseRequestTimeoutMs } from './request-timeout.js';
 
 // Load .env file from project root
 // - quiet: true prevents stdout output that would corrupt MCP protocol
@@ -53,6 +57,8 @@ export interface Config {
     password: string;
     verifySsl: boolean;
     defaultKeymap: string;
+    /** Abort deadline for one ordinary kvmd call, from PIKVM_REQUEST_TIMEOUT_MS. */
+    requestTimeoutMs: number;
   };
   calibration: {
     rounds: number;
@@ -74,6 +80,8 @@ export function loadConfig(): Config {
     throw new Error('PIKVM_PASSWORD environment variable is required');
   }
 
+  const requestTimeoutMs = parseRequestTimeoutMs(process.env.PIKVM_REQUEST_TIMEOUT_MS);
+
   const port = parseInt(process.env.PIKVM_MCP_PORT || '', 10);
   const http: HttpConfig | undefined = Number.isFinite(port) && port > 0
     ? {
@@ -91,6 +99,7 @@ export function loadConfig(): Config {
       password,
       verifySsl: process.env.PIKVM_VERIFY_SSL === 'true',
       defaultKeymap: process.env.PIKVM_DEFAULT_KEYMAP || 'en-us',
+      requestTimeoutMs,
     },
     calibration: {
       rounds: parseInt(process.env.PIKVM_CALIBRATION_ROUNDS || '5', 10),

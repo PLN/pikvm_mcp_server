@@ -1,3 +1,13 @@
+// Modified 2026-10 by PLN: typed KvmdError, timeouts, GET retry (GPL-3.0; see NOTICE).
+// AbortSignal.timeout and PIKVM_UNREACHABLE / PIKVM_AUTH_FAILED no-retry codes
+// adapted from dtrukr/pikvm_mcp_server src/pikvm/client.ts @ d120243 (GPL-3.0).
+// Snapshot HTTP 503 retry-once adapted from dvaerum/pikvm_mcp_server
+// fetchSnapshotWithRetry and PiKVMApiError @ b5fdc31 (GPL-3.0).
+//
+// HID ceilings: /hid/print is 5s + 1.5 × (4·min(len,1024) + 2) × perEventSec + 5s,
+// at least 10s, and is refused above 50s. Other HID POSTs use 30s. When a
+// ceiling expires the error is PIKVM_HID_STATE_UNKNOWN and the call is not retried.
+
 /**
  * PiKVM API Client
  *
@@ -7,6 +17,14 @@
 
 import { Agent, fetch } from 'undici';
 import sharp from 'sharp';
+import {
+  HID_OTHER_DEADLINE_MS,
+  HID_PRINT_REFUSE_MS,
+  HID_STATE_UNKNOWN_MESSAGE,
+  hidPrintCeilingMs,
+} from '../hid-deadline.js';
+import { capKvmdField, redactSecrets } from '../redact.js';
+import { clampRequestTimeoutMs } from '../request-timeout.js';
 
 export interface PiKVMConfig {
   host: string;
@@ -14,6 +32,8 @@ export interface PiKVMConfig {
   password: string;
   verifySsl?: boolean;
   defaultKeymap?: string;
+  /** Abort deadline for one ordinary kvmd call. Default 5000. */
+  requestTimeoutMs?: number;
 }
 
 export interface TypeOptions {
@@ -78,6 +98,200 @@ export interface CalibrationResult {
   message: string;
 }
 
+/**
+ * Failure from one kvmd call.
+ *
+ * `type` is kvmd's `result.error` when the body is
+ * `{ok:false,result:{error,error_msg}}`. Network, timeout, and auth
+ * failures use PIKVM_UNREACHABLE, PIKVM_TIMEOUT, and PIKVM_AUTH_FAILED.
+ * `message` is kvmd's `error_msg` after secret redaction. `endpoint` is
+ * the method and path with no query string.
+ */
+export class KvmdError extends Error {
+  readonly status: number;
+  readonly type: string;
+  readonly endpoint: string;
+
+  constructor(status: number, type: string, message: string, endpoint: string) {
+    super(message);
+    this.name = 'KvmdError';
+    this.status = status;
+    this.type = type;
+    this.endpoint = endpoint;
+  }
+}
+
+/** Idempotent GET attempts, including the first. */
+const MAX_GET_ATTEMPTS = 3;
+
+/** Backoff before the second and third GET attempt. */
+const GET_RETRY_BACKOFF_MS = [250, 500] as const;
+
+/** Added to each GET retry backoff. Inclusive range 0..99. */
+const GET_RETRY_JITTER_MS = 100;
+
+/**
+ * Grace before the single snapshot 503 retry. ustreamer can answer 503
+ * while it is starting after an idle stop; a short backoff is not enough.
+ */
+const SNAPSHOT_503_GRACE_MS = 1500;
+
+function isSnapshotPath(path: string): boolean {
+  return path.split('?')[0] === '/streamer/snapshot';
+}
+
+/**
+ * POST /hid and /hid/* finish only when kvmd has applied the input.
+ * A client abort does not cancel that work, and a retry would send it
+ * again. These calls use a per-call ceiling instead of the ordinary
+ * deadline, and expiry is never retried.
+ */
+function isHidPost(method: string, path: string): boolean {
+  if (method.toUpperCase() !== 'POST') return false;
+  const pathname = path.split('?')[0];
+  return pathname === '/hid' || pathname.startsWith('/hid/');
+}
+
+function isTimeoutError(err: unknown): boolean {
+  const seen = new Set<unknown>();
+  let current: unknown = err;
+  while (current && typeof current === 'object' && !seen.has(current)) {
+    seen.add(current);
+    const name = (current as { name?: unknown }).name;
+    const code = (current as { code?: unknown }).code;
+    if (name === 'TimeoutError') return true;
+    if (
+      code === 'UND_ERR_CONNECT_TIMEOUT' ||
+      code === 'UND_ERR_HEADERS_TIMEOUT' ||
+      code === 'UND_ERR_BODY_TIMEOUT'
+    ) {
+      return true;
+    }
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+function parseKvmdFailure(text: string): { error: string; error_msg: string } | null {
+  try {
+    const parsed = JSON.parse(text) as {
+      result?: { error?: unknown; error_msg?: unknown };
+    };
+    const error = parsed?.result?.error;
+    const errorMsg = parsed?.result?.error_msg;
+    if (typeof error === 'string' && typeof errorMsg === 'string') {
+      return { error, error_msg: errorMsg };
+    }
+  } catch {
+    // Not the kvmd JSON error shape.
+  }
+  return null;
+}
+
+/** Nothing was written. Connection refused and DNS failures stay unreachable. */
+const PRE_SEND_CODES = new Set([
+  'ECONNREFUSED',
+  'ENOTFOUND',
+  'EAI_AGAIN',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+]);
+
+/**
+ * The request may already be at kvmd. A reset here must not be retried,
+ * and must not be reported as a clean "unreachable".
+ */
+const POST_SEND_SOCKET_CODES = new Set([
+  'ECONNRESET',
+  'EPIPE',
+  'ECONNABORTED',
+  'UND_ERR_SOCKET',
+  'UND_ERR_CLOSED',
+]);
+
+function errorCodes(err: unknown): string[] {
+  const codes: string[] = [];
+  const seen = new Set<unknown>();
+  let current: unknown = err;
+  while (current && typeof current === 'object' && !seen.has(current)) {
+    seen.add(current);
+    const code = (current as { code?: unknown }).code;
+    if (typeof code === 'string') codes.push(code);
+    current = (current as { cause?: unknown }).cause;
+  }
+  return codes;
+}
+
+function failedAfterSend(err: unknown): boolean {
+  const codes = errorCodes(err);
+  if (codes.some((code) => PRE_SEND_CODES.has(code))) return false;
+  return codes.some((code) => POST_SEND_SOCKET_CODES.has(code));
+}
+
+function transportError(err: unknown, endpoint: string, hid: boolean): KvmdError {
+  if (isTimeoutError(err)) {
+    if (hid) {
+      return new KvmdError(0, 'PIKVM_HID_STATE_UNKNOWN', HID_STATE_UNKNOWN_MESSAGE, endpoint);
+    }
+    return new KvmdError(0, 'PIKVM_TIMEOUT', 'kvmd request timed out', endpoint);
+  }
+  if (hid && failedAfterSend(err)) {
+    return new KvmdError(0, 'PIKVM_HID_STATE_UNKNOWN', HID_STATE_UNKNOWN_MESSAGE, endpoint);
+  }
+  return new KvmdError(0, 'PIKVM_UNREACHABLE', 'kvmd network error', endpoint);
+}
+
+function isRetryableGetError(err: KvmdError): boolean {
+  if (err.type === 'PIKVM_HID_STATE_UNKNOWN') return false;
+  if (err.type === 'PIKVM_UNREACHABLE' || err.type === 'PIKVM_TIMEOUT') return true;
+  return err.status === 502 || err.status === 503;
+}
+
+/** `delay` as it appears on the query string, or undefined when omitted. */
+function printDelaySent(path: string): number | undefined {
+  const query = path.includes('?') ? path.slice(path.indexOf('?') + 1) : '';
+  const raw = new URLSearchParams(query).get('delay');
+  if (raw === null || raw === '') return undefined;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+function printIsSlow(path: string): boolean {
+  const query = path.includes('?') ? path.slice(path.indexOf('?') + 1) : '';
+  const slow = new URLSearchParams(query).get('slow');
+  return slow === '1' || slow === 'true';
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function jitterMs(): number {
+  return Math.floor(Math.random() * GET_RETRY_JITTER_MS);
+}
+
+/**
+ * HID abort timers are multiplied by this in tests. Not a config field.
+ * Refusal still uses the unscaled estimate.
+ */
+const hidDeadlineScales = new WeakMap<PiKVMClient, number>();
+
+/** Configured password for tool-error redaction. Not a client method. */
+const redactionPasswords = new WeakMap<PiKVMClient, string>();
+
+/** Test-only. Shrinks HID abort timers without putting a scale on PiKVMConfig. */
+export function setHidDeadlineScaleForTests(client: PiKVMClient, scale: number): void {
+  if (!Number.isFinite(scale) || scale <= 0) return;
+  hidDeadlineScales.set(client, scale);
+}
+
+/** Package-internal. The tool error path redacts with this password. */
+export function redactionPassword(client: PiKVMClient): string {
+  return redactionPasswords.get(client) ?? '';
+}
+
 export class PiKVMClient {
   private config: Required<PiKVMConfig>;
   private dispatcher: Agent;
@@ -92,14 +306,20 @@ export class PiKVMClient {
     this.config = {
       verifySsl: false,
       defaultKeymap: 'en-us',
+      requestTimeoutMs: 5000,
       ...config,
     };
+    this.config.requestTimeoutMs = clampRequestTimeoutMs(this.config.requestTimeoutMs);
+    redactionPasswords.set(this, this.config.password);
 
-    // Create dispatcher with SSL configuration
+    // headersTimeout and bodyTimeout 0 turn off undici's 300s defaults.
+    // Each call sets its own AbortSignal, including HID ceilings.
     this.dispatcher = new Agent({
       connect: {
         rejectUnauthorized: this.config.verifySsl,
       },
+      headersTimeout: 0,
+      bodyTimeout: 0,
     });
   }
 
@@ -111,7 +331,18 @@ export class PiKVMClient {
   }
 
   /**
-   * Make an authenticated request to the PiKVM API
+   * Make an authenticated request to the PiKVM API.
+   *
+   * Idempotent GETs are tried up to three times on a network error, a
+   * timeout, HTTP 502, or HTTP 503. POST is never retried. HTTP 400, 401,
+   * 403, 409, 500, and 504 are never retried. GET /streamer/snapshot on
+   * HTTP 503 waits out the ustreamer idle-stop grace and retries once.
+   * That extra try does not consume one of the three attempts, so a
+   * snapshot can make at most four calls. HID POSTs use a per-call
+   * ceiling and are never retried. /hid/print above 50s is refused
+   * before the request is sent. A socket reset after a HID POST was
+   * sent is PIKVM_HID_STATE_UNKNOWN. A connect refusal stays
+   * PIKVM_UNREACHABLE.
    */
   private async request<T = unknown>(
     method: string,
@@ -119,7 +350,43 @@ export class PiKVMClient {
     body?: string | object,
     contentType?: string
   ): Promise<T> {
+    const idempotentGet = method.toUpperCase() === 'GET';
+    const snapshot = idempotentGet && isSnapshotPath(path);
+    let generalFailures = 0;
+    let snapshot503Retried = false;
+
+    for (;;) {
+      try {
+        return await this.requestOnce<T>(method, path, body, contentType);
+      } catch (err) {
+        if (!idempotentGet || !(err instanceof KvmdError) || !isRetryableGetError(err)) {
+          throw err;
+        }
+        if (snapshot && err.status === 503) {
+          if (snapshot503Retried) throw err;
+          snapshot503Retried = true;
+          await delay(SNAPSHOT_503_GRACE_MS);
+          continue;
+        }
+        generalFailures += 1;
+        if (generalFailures >= MAX_GET_ATTEMPTS) throw err;
+        const backoff = GET_RETRY_BACKOFF_MS[generalFailures - 1];
+        await delay(backoff + jitterMs());
+      }
+    }
+  }
+
+  /**
+   * One kvmd call. Throws KvmdError on HTTP, network, and timeout failures.
+   */
+  private async requestOnce<T = unknown>(
+    method: string,
+    path: string,
+    body?: string | object,
+    contentType?: string
+  ): Promise<T> {
     const url = new URL(`/api${path}`, this.config.host);
+    const endpoint = `${method.toUpperCase()} ${url.pathname}`;
 
     const headers: Record<string, string> = {
       'X-KVMD-User': this.config.username,
@@ -136,27 +403,55 @@ export class PiKVMClient {
       }
     }
 
-    const response = await fetch(url.toString(), {
-      method,
-      headers,
-      body: body ? (typeof body === 'object' ? JSON.stringify(body) : body) : undefined,
-      dispatcher: this.dispatcher,
-    });
+    const hidPost = isHidPost(method, path);
+    const timeoutMs = hidPost
+      ? this.hidTimeoutMs(path, body)
+      : this.config.requestTimeoutMs;
+    let response;
+    try {
+      response = await fetch(url.toString(), {
+        method,
+        headers,
+        body: body ? (typeof body === 'object' ? JSON.stringify(body) : body) : undefined,
+        dispatcher: this.dispatcher,
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+    } catch (err) {
+      throw transportError(err, endpoint, hidPost);
+    }
 
     if (!response.ok) {
-      const errorText = await response.text();
-      // Sanitize error text to avoid exposing sensitive information
-      const sanitizedError = errorText
-        .replace(/password[=:][^\s,"]*/gi, 'password=[REDACTED]')
-        .replace(/X-KVMD-Passwd[^,\s"]*/gi, 'X-KVMD-Passwd=[REDACTED]')
-        .substring(0, 200); // Limit error message length
-      throw new Error(`PiKVM API error ${response.status}: ${sanitizedError}`);
+      const errorText = await this.readBody(() => response.text(), endpoint, hidPost);
+      const parsed = parseKvmdFailure(errorText);
+      if (response.status === 401 || response.status === 403) {
+        throw new KvmdError(
+          response.status,
+          'PIKVM_AUTH_FAILED',
+          this.kvmdField(parsed?.error_msg ?? 'authentication failed'),
+          endpoint,
+        );
+      }
+      if (parsed) {
+        throw new KvmdError(
+          response.status,
+          this.kvmdField(parsed.error),
+          this.kvmdField(parsed.error_msg),
+          endpoint,
+        );
+      }
+      const fallback = this.redact(errorText).substring(0, 200);
+      throw new KvmdError(
+        response.status,
+        'PIKVM_HTTP_ERROR',
+        fallback || `HTTP ${response.status}`,
+        endpoint,
+      );
     }
 
     // Check content type for response handling
     const responseType = response.headers.get('content-type') || '';
     if (responseType.includes('image/')) {
-      return response.arrayBuffer() as Promise<T>;
+      return await this.readBody(() => response.arrayBuffer() as Promise<T>, endpoint, hidPost);
     }
 
     // Handle empty responses (204 No Content)
@@ -164,7 +459,7 @@ export class PiKVMClient {
       return {} as T;
     }
 
-    const text = await response.text();
+    const text = await this.readBody(() => response.text(), endpoint, hidPost);
     if (!text) {
       return {} as T;
     }
@@ -174,6 +469,51 @@ export class PiKVMClient {
     } catch {
       // If not JSON, return as-is wrapped in an object
       return { result: text } as T;
+    }
+  }
+
+  /** Redact secrets, then cap a kvmd error type or error_msg at about 1 KB. */
+  private kvmdField(value: string): string {
+    return capKvmdField(this.redact(value));
+  }
+
+  private redact(value: string): string {
+    return redactSecrets(value, this.config.password);
+  }
+
+  /**
+   * Abort timer for one HID POST. Print uses the length × delay ceiling
+   * and is refused above 50s. Every other HID POST uses 30s.
+   * The test hook shrinks the timer; the refusal check does not.
+   */
+  private hidTimeoutMs(path: string, body: string | object | undefined): number {
+    const pathname = path.split('?')[0];
+    let ceilingMs = HID_OTHER_DEADLINE_MS;
+    if (pathname === '/hid/print') {
+      const text = typeof body === 'string' ? body : '';
+      ceilingMs = hidPrintCeilingMs(text.length, printDelaySent(path), printIsSlow(path));
+      if (ceilingMs > HID_PRINT_REFUSE_MS) {
+        const seconds = Math.ceil(ceilingMs / 1000);
+        throw new Error(
+          `Refusing /hid/print: estimated time is ${seconds}s, above the 50s ceiling. Shorten the text or lower the delay.`,
+        );
+      }
+    }
+    const scale = hidDeadlineScales.get(this) ?? 1;
+    return Math.max(1, Math.round(ceilingMs * scale));
+  }
+
+  /**
+   * Body reads can fail after headers: the deadline aborts a slow body,
+   * or the socket resets. A HID reset is PIKVM_HID_STATE_UNKNOWN.
+   * Other resets match a failed fetch, and GET retry treats them the
+   * same way.
+   */
+  private async readBody<T>(read: () => Promise<T>, endpoint: string, hid: boolean): Promise<T> {
+    try {
+      return await read();
+    } catch (err) {
+      throw transportError(err, endpoint, hid);
     }
   }
 

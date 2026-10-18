@@ -1,4 +1,4 @@
-<!-- Modified 2026-10 by PLN: Node.js engines note and GPL-3.0-only licence line (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: Node.js engines note, GPL-3.0-only licence line, and PIKVM_REQUEST_TIMEOUT_MS (GPL-3.0; see NOTICE) -->
 
 # PiKVM MCP Server
 
@@ -76,7 +76,12 @@ PIKVM_USERNAME=admin
 PIKVM_PASSWORD=your_password
 PIKVM_VERIFY_SSL=false
 PIKVM_DEFAULT_KEYMAP=en-us
+PIKVM_REQUEST_TIMEOUT_MS=5000
 ```
+
+`PIKVM_REQUEST_TIMEOUT_MS` is the abort deadline, in milliseconds, for one ordinary kvmd call. It must be a string of digits from 1 to 600000 (default 5000). `5000abc`, `1e3`, ` 5000 `, `5.5`, and `0` use the default. A value above 600000 is clamped to 600000. An idempotent GET that fails with a network error, a timeout, HTTP 502, or HTTP 503 is tried up to 3 times (backoff 250 ms, then 500 ms, plus a little jitter). POST is not retried. HTTP 500 and 504 are not retried. `GET /streamer/snapshot` retries HTTP 503 once after a 1500 ms grace period, for the ustreamer idle-stop race. That extra try does not use up one of the three attempts, so a snapshot can make at most 4 calls.
+
+POST `/hid/*` uses its own ceiling, because kvmd answers only after the input has been applied and a client abort does not cancel that work. `/hid/print` waits `5s + 1.5 × (4·min(length,1024) + 2) × perEventSec + 5s`, and at least 10s. `perEventSec` is the `delay` value sent to kvmd (kvmd treats that number as seconds), or 0.02s when `slow` is set and `delay` is omitted, or 0 otherwise. When that ceiling expires the tool returns `PIKVM_HID_STATE_UNKNOWN` (`input may still be applying; do not resend`) and the call is not retried. A print whose estimate is above 50s is refused before any kvmd call, with a message to shorten the text or lower the delay. With `slow` and no `delay`, that line is 333 characters: 332 still fits under 50s, and 333 does not. kvmd itself accepts up to 1024 characters. PiKVM's nginx likely applies the default 60s `proxy_read_timeout` on `/api/`; that has not been confirmed on hardware. Every other HID POST (key, shortcut, mouse, wheel, reset) uses a fixed 30s ceiling and the same unknown-state error. A connection reset or other socket error after a HID POST was sent is also `PIKVM_HID_STATE_UNKNOWN` and is not retried. A failure before the request is sent, such as connection refused, stays `PIKVM_UNREACHABLE` and is not retried either.
 
 ## HTTP Mode (remote / gateway deployments)
 

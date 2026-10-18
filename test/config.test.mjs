@@ -1,4 +1,6 @@
 /**
+ * Modified 2026-10 by PLN: PIKVM_REQUEST_TIMEOUT_MS (GPL-3.0; see NOTICE).
+ *
  * loadEnvFile unit tests — verify PIKVM_MCP_NO_DOTENV=1 makes .env lose to
  * explicitly-set process env (the gateway systemd landmine fix).
  *
@@ -13,6 +15,7 @@ import { mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadEnvFile, loadConfig } from '../dist/config.js';
+import { clampRequestTimeoutMs, parseRequestTimeoutMs } from '../dist/request-timeout.js';
 
 async function withEnvFile(contents, fn) {
   const dir = await mkdtemp(join(tmpdir(), 'pikvm-env-'));
@@ -95,6 +98,74 @@ test('HTTP config: bind host defaults to 127.0.0.1, PIKVM_MCP_HOST overrides', (
     assert.equal(loadConfig().http.host, '127.0.0.1', 'bind must default to loopback');
     process.env.PIKVM_MCP_HOST = '10.66.0.7';
     assert.equal(loadConfig().http.host, '10.66.0.7', 'bridge gateway IP must be settable');
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+});
+
+test('clampRequestTimeoutMs uses 5000 for non-positive values and clamps the top', () => {
+  assert.equal(clampRequestTimeoutMs(Number.NaN), 5000);
+  assert.equal(clampRequestTimeoutMs(Number.POSITIVE_INFINITY), 5000);
+  assert.equal(clampRequestTimeoutMs(0), 5000);
+  assert.equal(clampRequestTimeoutMs(-4), 5000);
+  assert.equal(clampRequestTimeoutMs(0.4), 5000);
+  assert.equal(clampRequestTimeoutMs(1.9), 1);
+  assert.equal(clampRequestTimeoutMs(1500), 1500);
+  assert.equal(clampRequestTimeoutMs(600000), 600000);
+  assert.equal(clampRequestTimeoutMs(600001), 600000);
+});
+
+test('parseRequestTimeoutMs accepts digits only', () => {
+  assert.equal(parseRequestTimeoutMs(undefined), 5000);
+  assert.equal(parseRequestTimeoutMs(''), 5000);
+  assert.equal(parseRequestTimeoutMs('1500'), 1500);
+  assert.equal(parseRequestTimeoutMs('600000'), 600000);
+  assert.equal(parseRequestTimeoutMs('600001'), 600000);
+  assert.equal(parseRequestTimeoutMs('0'), 5000);
+  assert.equal(parseRequestTimeoutMs('5000abc'), 5000);
+  assert.equal(parseRequestTimeoutMs('1e3'), 5000);
+  assert.equal(parseRequestTimeoutMs(' 5000 '), 5000);
+  assert.equal(parseRequestTimeoutMs('5.5'), 5000);
+  assert.equal(parseRequestTimeoutMs('-4'), 5000);
+  assert.equal(parseRequestTimeoutMs('1.9'), 5000);
+});
+
+test('PIKVM_REQUEST_TIMEOUT_MS is digits only, else 5000, and clamps above 600000', () => {
+  const saved = {
+    PIKVM_HOST: process.env.PIKVM_HOST,
+    PIKVM_PASSWORD: process.env.PIKVM_PASSWORD,
+    PIKVM_REQUEST_TIMEOUT_MS: process.env.PIKVM_REQUEST_TIMEOUT_MS,
+  };
+  process.env.PIKVM_HOST = 'http://mock.test';
+  process.env.PIKVM_PASSWORD = 'testpw';
+  try {
+    delete process.env.PIKVM_REQUEST_TIMEOUT_MS;
+    assert.equal(loadConfig().pikvm.requestTimeoutMs, 5000);
+    process.env.PIKVM_REQUEST_TIMEOUT_MS = '1500';
+    assert.equal(loadConfig().pikvm.requestTimeoutMs, 1500);
+    process.env.PIKVM_REQUEST_TIMEOUT_MS = '1.9';
+    assert.equal(loadConfig().pikvm.requestTimeoutMs, 5000);
+    process.env.PIKVM_REQUEST_TIMEOUT_MS = '0';
+    assert.equal(loadConfig().pikvm.requestTimeoutMs, 5000);
+    process.env.PIKVM_REQUEST_TIMEOUT_MS = '-4';
+    assert.equal(loadConfig().pikvm.requestTimeoutMs, 5000);
+    process.env.PIKVM_REQUEST_TIMEOUT_MS = '5000abc';
+    assert.equal(loadConfig().pikvm.requestTimeoutMs, 5000);
+    process.env.PIKVM_REQUEST_TIMEOUT_MS = '1e3';
+    assert.equal(loadConfig().pikvm.requestTimeoutMs, 5000);
+    process.env.PIKVM_REQUEST_TIMEOUT_MS = ' 5000 ';
+    assert.equal(loadConfig().pikvm.requestTimeoutMs, 5000);
+    process.env.PIKVM_REQUEST_TIMEOUT_MS = '5.5';
+    assert.equal(loadConfig().pikvm.requestTimeoutMs, 5000);
+    process.env.PIKVM_REQUEST_TIMEOUT_MS = '600000';
+    assert.equal(loadConfig().pikvm.requestTimeoutMs, 600000);
+    process.env.PIKVM_REQUEST_TIMEOUT_MS = '600001';
+    assert.equal(loadConfig().pikvm.requestTimeoutMs, 600000);
+    process.env.PIKVM_REQUEST_TIMEOUT_MS = 'nope';
+    assert.equal(loadConfig().pikvm.requestTimeoutMs, 5000);
   } finally {
     for (const [k, v] of Object.entries(saved)) {
       if (v === undefined) delete process.env[k];
