@@ -86,7 +86,7 @@ export async function pinCommand(args: string[]): Promise<void> {
   let dest: string | undefined;
   if (!registry) {
     if (device !== 'default') {
-      throw new Error('only device "default" is supported until the registry (Phase B item 10)');
+      throw new Error('only device "default" is supported when no device registry is set');
     }
     dest = out ?? (process.env.PIKVM_TLS_CERT_FILE || undefined);
     if (!dest) {

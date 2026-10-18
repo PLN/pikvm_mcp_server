@@ -1,4 +1,5 @@
 // Modified 2026-10 by PLN: device registry (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: reject a duplicate device key and a shared origin (GPL-3.0; see NOTICE).
 // Host normalisation follows the idea of dtrukr/pikvm_mcp_server
 // normalizeHost at 097b529 (GPL-3.0, a fork of
 // KultivatorConsulting/pikvm_mcp_server). This file is written fresh.
@@ -260,6 +261,7 @@ export function parseDeviceRegistry(
     throw new Error(`registry: unknown field ${JSON.stringify(extra)}`);
   }
   if (!isPlainObject(value.devices)) throw new Error('registry devices must be an object');
+  // Duplicate device names are rejected from the raw JSON before parse.
   const names = Object.keys(value.devices);
   if (names.length === 0) throw new Error('registry devices must name at least one device');
   for (const name of names) {
@@ -286,7 +288,213 @@ export function parseDeviceRegistry(
   for (const name of names) {
     devices.set(name, parseDevice(name, value.devices[name], env, requirePinnedCert));
   }
+  const origins = new Map<string, string>();
+  for (const [name, device] of devices) {
+    const previous = origins.get(device.host);
+    if (previous !== undefined) {
+      throw new Error(
+        `registry devices ${JSON.stringify(previous)} and ${JSON.stringify(name)} use the same origin`,
+      );
+    }
+    origins.set(device.host, name);
+  }
   return { defaultName, devices };
+}
+
+/** Repeated device name in the raw devices object, if there is one. */
+function duplicateDeviceName(text: string): string | undefined {
+  let i = 0;
+  const n = text.length;
+
+  function skipWs(): void {
+    while (i < n && text.charCodeAt(i) <= 32) i += 1;
+  }
+
+  function fail(): never {
+    throw new Error('registry scan');
+  }
+
+  function parseString(): string {
+    if (text[i] !== '"') fail();
+    i += 1;
+    let out = '';
+    while (i < n) {
+      const c = text[i];
+      if (c === '"') {
+        i += 1;
+        return out;
+      }
+      if (c === '\\') {
+        i += 1;
+        if (i >= n) fail();
+        const e = text[i];
+        i += 1;
+        if (e === 'u') {
+          const hex = text.slice(i, i + 4);
+          if (!/^[0-9a-fA-F]{4}$/.test(hex)) fail();
+          out += String.fromCharCode(Number.parseInt(hex, 16));
+          i += 4;
+          continue;
+        }
+        if (e === '"' || e === '\\' || e === '/') {
+          out += e;
+          continue;
+        }
+        if (e === 'b') { out += '\b'; continue; }
+        if (e === 'f') { out += '\f'; continue; }
+        if (e === 'n') { out += '\n'; continue; }
+        if (e === 'r') { out += '\r'; continue; }
+        if (e === 't') { out += '\t'; continue; }
+        fail();
+      }
+      out += c;
+      i += 1;
+    }
+    fail();
+  }
+
+  function skipValue(): void {
+    skipWs();
+    const c = text[i];
+    if (c === '"') {
+      parseString();
+      return;
+    }
+    if (c === '{') {
+      skipObject();
+      return;
+    }
+    if (c === '[') {
+      skipArray();
+      return;
+    }
+    if (c === 't' || c === 'f' || c === 'n' || c === '-' || (c !== undefined && c >= '0' && c <= '9')) {
+      while (i < n) {
+        const code = text.charCodeAt(i);
+        if (code <= 32 || text[i] === ',' || text[i] === ']' || text[i] === '}') break;
+        i += 1;
+      }
+      return;
+    }
+    fail();
+  }
+
+  function skipObject(): void {
+    if (text[i] !== '{') fail();
+    i += 1;
+    skipWs();
+    if (text[i] === '}') {
+      i += 1;
+      return;
+    }
+    for (;;) {
+      skipWs();
+      parseString();
+      skipWs();
+      if (text[i] !== ':') fail();
+      i += 1;
+      skipValue();
+      skipWs();
+      if (text[i] === ',') {
+        i += 1;
+        continue;
+      }
+      if (text[i] === '}') {
+        i += 1;
+        return;
+      }
+      fail();
+    }
+  }
+
+  function skipArray(): void {
+    if (text[i] !== '[') fail();
+    i += 1;
+    skipWs();
+    if (text[i] === ']') {
+      i += 1;
+      return;
+    }
+    for (;;) {
+      skipValue();
+      skipWs();
+      if (text[i] === ',') {
+        i += 1;
+        continue;
+      }
+      if (text[i] === ']') {
+        i += 1;
+        return;
+      }
+      fail();
+    }
+  }
+
+  function deviceNames(): string | undefined {
+    if (text[i] !== '{') fail();
+    i += 1;
+    skipWs();
+    if (text[i] === '}') {
+      i += 1;
+      return undefined;
+    }
+    const seen = new Set<string>();
+    for (;;) {
+      skipWs();
+      const name = parseString();
+      if (seen.has(name)) return name;
+      seen.add(name);
+      skipWs();
+      if (text[i] !== ':') fail();
+      i += 1;
+      skipValue();
+      skipWs();
+      if (text[i] === ',') {
+        i += 1;
+        continue;
+      }
+      if (text[i] === '}') {
+        i += 1;
+        return undefined;
+      }
+      fail();
+    }
+  }
+
+  function scan(): string | undefined {
+    skipWs();
+    if (text[i] !== '{') return undefined;
+    i += 1;
+    skipWs();
+    if (text[i] === '}') return undefined;
+    for (;;) {
+      skipWs();
+      const key = parseString();
+      skipWs();
+      if (text[i] !== ':') fail();
+      i += 1;
+      skipWs();
+      if (key === 'devices' && text[i] === '{') {
+        const duplicate = deviceNames();
+        if (duplicate !== undefined) return duplicate;
+      } else {
+        skipValue();
+      }
+      skipWs();
+      if (text[i] === ',') {
+        i += 1;
+        continue;
+      }
+      if (text[i] === '}') return undefined;
+      fail();
+    }
+  }
+
+  try {
+    return scan();
+  } catch {
+    return undefined;
+  }
 }
 
 /** Undefined when neither registry variable is set. Both set is an error. */
@@ -313,6 +521,10 @@ export function loadDeviceRegistry(
     }
   }
   if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+  const duplicate = duplicateDeviceName(text);
+  if (duplicate !== undefined) {
+    throw new Error(`registry device name ${JSON.stringify(duplicate)} is duplicated`);
+  }
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);

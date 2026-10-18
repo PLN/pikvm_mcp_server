@@ -8,6 +8,7 @@
 // Modified 2026-10 by PLN: close the upload file handle once (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: fh.close waits for the in-flight read (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: job reads stay on the device that created them (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: the retained-job cap is per device (GPL-3.0; see NOTICE).
 
 /**
  * Policy for MSD status, mount, eject, upload, and remove.
@@ -491,18 +492,25 @@ function jobTtlOf(value: number | undefined): number {
   return value !== undefined && Number.isSafeInteger(value) && value >= 0 ? value : JOB_TTL_MS;
 }
 
-/** Drop finished jobs older than the TTL, then the oldest finished jobs past the cap. */
+/** Drop finished jobs older than the TTL, then each device's oldest finished jobs past the cap. */
 function pruneJobs(limit: number, ttlMs: number): void {
   const now = Date.now();
   for (const [id, job] of jobs) {
     if (job.finishedAt !== undefined && now - job.finishedAt > ttlMs) jobs.delete(id);
   }
-  if (jobs.size <= limit) return;
-  const finished = [...jobs.entries()].filter(([, job]) => job.finishedAt !== undefined);
-  finished.sort((a, b) => (a[1].finishedAt ?? 0) - (b[1].finishedAt ?? 0));
-  for (const [id] of finished) {
-    if (jobs.size <= limit) break;
-    jobs.delete(id);
+  const names = new Set<string>();
+  for (const job of jobs.values()) names.add(job.device);
+  for (const device of names) {
+    const owned = [...jobs.entries()].filter(([, job]) => job.device === device);
+    if (owned.length <= limit) continue;
+    const finished = owned.filter(([, job]) => job.finishedAt !== undefined);
+    finished.sort((a, b) => (a[1].finishedAt ?? 0) - (b[1].finishedAt ?? 0));
+    let extra = owned.length - limit;
+    for (const [id] of finished) {
+      if (extra <= 0) break;
+      jobs.delete(id);
+      extra -= 1;
+    }
   }
 }
 
@@ -547,7 +555,7 @@ export interface UploadRequest {
   beforeUploadStream?: () => Promise<void>;
   /** Overrides the 1.5s storage.uploading poll. Unset in production. */
   uploadPollMs?: number;
-  /** Retained-job cap. Default 64. Unset in production. */
+  /** Retained-job cap for one device. Default 64. Unset in production. */
   jobLimit?: number;
   /** Finished-job TTL in ms. Default 24h. Unset in production. */
   jobTtlMs?: number;

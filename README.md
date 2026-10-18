@@ -18,6 +18,7 @@
 <!-- Modified 2026-10 by PLN: TLS verify, pin, and insecure modes (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: pin the leaf, expiry wording, and Node >=22.9.0 (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: kvmd redirects are not followed (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: calibration and scale are shared across HTTP sessions (GPL-3.0; see NOTICE) -->
 
 # PiKVM MCP Server
 
@@ -172,7 +173,7 @@ A host is normalised to an http(s) origin. A path, query, or fragment is dropped
 
 `armHid` and `armMsd` on a device can only narrow the process ceiling. In stdio the ceiling is armed. In HTTP the ceiling is `PIKVM_MCP_ARM_HID` and `PIKVM_MCP_ARM_MSD` (default disarmed). An omitted device flag leaves the ceiling. `true` cannot arm a device the ceiling has disarmed. `msdLocalDir` overrides `PIKVM_MSD_LOCAL_DIR` for that device. `hwTest` must be true before the hardware suite will use the device.
 
-Each device has its own client, busy lock, MSD job lock, calibration, and arm state. Every `pikvm_*` tool except `pikvm_devices` takes an optional `device` argument. Omitted means the registry default. An unknown name is an error that lists the known names and does not open a connection. While a registry is active, tool output names the device that was used. `pikvm_devices` lists names, origins, TLS mode, and arm state. It does not return passwords or secret file paths.
+Each device has its own client, busy lock, MSD job lock, calibration, and arm state. Calibration and the screenshot scale are stored on the device and shared by every HTTP session that uses that device. Per-session state is deferred. Every `pikvm_*` tool except `pikvm_devices` takes an optional `device` argument. Omitted means the registry default. An unknown name is an error that lists the known names and does not open a connection. While a registry is active, tool output names the device that was used. `pikvm_devices` lists names, origins, TLS mode, and arm state. It does not return passwords or secret file paths.
 
 Job ids are random 16-byte hex strings. A job is visible only to the device that created it. Asking for it on another device is the same `unknown job` result as an id that does not exist.
 

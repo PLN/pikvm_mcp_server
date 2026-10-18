@@ -138,7 +138,7 @@ const TLS_VERIFY_CODES = new Set([
 export type TlsMode = 'verify' | 'pin' | 'insecure';
 
 export interface DeviceTls {
-  /** Registry key. Only "default" until Phase B item 10. */
+  /** Registry device name. The legacy device is "default". */
   device: string;
   mode: TlsMode;
   certFile?: string;

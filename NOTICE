@@ -25,6 +25,7 @@ Modified 2026-10 by PLN: kvmd redirects are not followed (GPL-3.0; see below).
 Modified 2026-10 by PLN: a reset after the certificate stays unreachable (GPL-3.0; see below).
 Modified 2026-10 by PLN: device registry (GPL-3.0; see below).
 Modified 2026-10 by PLN: listed host is an origin (GPL-3.0; see below).
+Modified 2026-10 by PLN: duplicate devices, a shared origin, and a per-device job cap (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -567,7 +568,7 @@ No code from another pikvm_mcp_server fork was added for these methods.
   PIKVM_UNEXPECTED_REDIRECT. No existing code fits: PIKVM_UNREACHABLE
   is retried, and an HTTP error would not say that the redirect was
   refused. The message includes the status and the Location origin
-  only, with no userinfo, path, query, or password.   The error is not
+  only, with no userinfo, path, query, or password. The error is not
   retried. No code from another pikvm_mcp_server fork was copied.
 
 2026-10, by PLN:
@@ -610,3 +611,12 @@ No code from another pikvm_mcp_server fork was added for these methods.
   fatal text, the pin command, and the hardware logs pass a host
   through that origin or through redactUrl. No code from another
   pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  A repeated key in the registry devices object is a startup error
+  that names the device. Two devices that normalise to the same origin
+  are a startup error that names both, so they cannot take separate
+  MSD locks on one kvmd. The retained-job cap counts each device on
+  its own. Calibration and the screenshot scale stay on the device
+  and are shared by every HTTP session for that device. Per-session
+  state is deferred. No code from another pikvm_mcp_server fork was copied.

@@ -1,6 +1,7 @@
 // Modified 2026-10 by PLN: TLS verify, pin, and insecure modes (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: invalid-CA, partial trust, expiry, and IPv6 pin tests (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: TLS 1.2 reset stays unreachable (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: pin without a registry names only default (GPL-3.0; see NOTICE).
 
 /**
  * Self-signed server minted in this process. No committed key.
@@ -592,7 +593,7 @@ describe('pin CLI', { concurrency: false }, () => {
     const result = await runPin(['lab1', '--yes', '--out', join(tmpdir(), 'unused.pem')], pinEnv());
     assert.notEqual(result.code, 0);
     assert.match(result.stderr, /only device "default"/);
-    assert.match(result.stderr, /Phase B item 10/);
+    assert.match(result.stderr, /when no device registry is set/);
     assert.equal(connections, before);
   });
 

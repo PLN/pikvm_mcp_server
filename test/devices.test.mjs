@@ -1,5 +1,6 @@
 // Modified 2026-10 by PLN: device registry tests (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: legacy listed host is an origin (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: duplicate devices, shared origin, and per-device job cap (GPL-3.0; see NOTICE).
 
 /**
  * Registry parsing, per-device locks, and the hardware hwTest gate.
@@ -160,6 +161,12 @@ describe('device registry', { concurrency: false }, () => {
         [registryJson({ lab1: device({ password: SENTINEL }) }), /password is not accepted\. Use passwordFile or passwordCredential/],
         [registryJson({ lab1: device({ passwordFile, passwordCredential: 'pikvm-lab1' }) }), /not both/],
         [registryJson({ lab1: device({ host: 'https://user:pass@100.64.0.8', passwordFile, tls: { mode: 'insecure' } }) }), /must not include userinfo/],
+        ['{"devices":{"lab1":{"host":"https://100.64.0.8","username":"admin","passwordFile":"/tmp/SENTINEL-password-9f3a"},"lab1":{"host":"https://100.64.0.9","username":"admin","passwordFile":"/tmp/SENTINEL-password-9f3a"}}}', /registry device name "lab1" is duplicated/],
+        ['{"devices":{"lab1":{"host":"https://100.64.0.8","username":"admin","passwordFile":"/tmp/SENTINEL-password-9f3a"},"\\u006c\\u0061\\u0062\\u0031":{"host":"https://100.64.0.9","username":"admin","passwordFile":"/tmp/SENTINEL-password-9f3a"}}}', /registry device name "lab1" is duplicated/],
+        [registryJson({
+          lab1: device({ host: 'https://100.64.0.8/kvm', passwordFile, tls: { mode: 'insecure' } }),
+          lab2: device({ host: 'https://100.64.0.8:443', passwordFile, tls: { mode: 'insecure' } }),
+        }, 'lab1'), /registry devices "lab1" and "lab2" use the same origin/],
         ['{', /invalid JSON/],
       ];
       for (const [json, pattern] of cases) {
@@ -480,7 +487,7 @@ describe('two devices', { concurrency: false }, () => {
             tls: { mode: 'insecure' },
           }),
           lab2: device({
-            host: `http://127.0.0.1:${port}`,
+            host: 'https://100.64.0.9',
             passwordFile,
             tls: { mode: 'insecure' },
           }),
@@ -679,30 +686,34 @@ describe('two devices', { concurrency: false }, () => {
     const minted = mintCert();
     const dir = tempDir();
     const sockets = new Set();
-    const server = https.createServer({ key: minted.key, cert: minted.cert }, (_req, res) => {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end('{}');
-    });
-    server.on('connection', (socket) => {
-      sockets.add(socket);
-      socket.on('close', () => sockets.delete(socket));
-    });
-    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-    const port = server.address().port;
+    function listen() {
+      const server = https.createServer({ key: minted.key, cert: minted.cert }, (_req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end('{}');
+      });
+      server.on('connection', (socket) => {
+        sockets.add(socket);
+        socket.on('close', () => sockets.delete(socket));
+      });
+      return new Promise((resolve) => {
+        server.listen(0, '127.0.0.1', () => resolve(server));
+      });
+    }
+    const pinServer = await listen();
+    const openServer = await listen();
     try {
       const passwordFile = writeSecret(dir, 'pw', 'pw-1');
       const certFile = join(dir, 'lab1.pem');
       writeFileSync(certFile, minted.cert, { mode: 0o644 });
-      const host = `https://127.0.0.1:${port}`;
       const config = withEnv({
         PIKVM_DEVICES: registryJson({
           pin1: device({
-            host,
+            host: `https://127.0.0.1:${pinServer.address().port}`,
             passwordFile,
             tls: { mode: 'pin', certFile },
           }),
           open1: device({
-            host,
+            host: `https://127.0.0.1:${openServer.address().port}`,
             passwordFile,
             tls: { mode: 'insecure' },
           }),
@@ -720,7 +731,85 @@ describe('two devices', { concurrency: false }, () => {
       }
     } finally {
       for (const socket of sockets) socket.destroy();
-      await new Promise((resolve) => server.close(resolve));
+      await Promise.all([pinServer, openServer].map((server) => new Promise((resolve) => {
+        server.close(resolve);
+      })));
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('a full device does not prune another device\'s finished jobs', async () => {
+    const dir = tempDir();
+    try {
+      const passwordFile = writeSecret(dir, 'pw', 'pw-1');
+      writeFileSync(join(dir, 'disk.iso'), Buffer.alloc(32, 3));
+      const config = withEnv({
+        PIKVM_DEVICES: registryJson({
+          capa: device({
+            host: 'https://100.64.0.8',
+            passwordFile,
+            tls: { mode: 'insecure' },
+            msdLocalDir: dir,
+          }),
+          capb: device({
+            host: 'https://100.64.0.9',
+            passwordFile,
+            tls: { mode: 'insecure' },
+            msdLocalDir: dir,
+          }),
+        }, 'capa'),
+      }, () => loadConfig());
+      const fleet = buildFleet(config, { hid: true, msd: true });
+      const capa = fleet.devices.get('capa');
+      const srv = await listen(() => createMcpServer({
+        pikvm: capa.client,
+        lock: capa.lock,
+        fleet,
+        calibrationConfig,
+        armGateEnforced: false,
+        msdArmGateEnforced: false,
+        msd: { ...config.msd, jobLimit: 1 },
+      }));
+      try {
+        const sessionId = await openSession(srv.base);
+        async function finish(device) {
+          const started = await callTool(srv.base, sessionId, 'pikvm_msd_upload', {
+            device,
+            file: 'disk.iso',
+            confirmImage: 'disk.iso',
+            sha256: 'a'.repeat(64),
+          });
+          assert.equal(started.isError, undefined, started.content?.[0]?.text);
+          const { jobId } = JSON.parse(started.content[0].text);
+          let view;
+          for (let i = 0; i < 40; i += 1) {
+            const read = await callTool(srv.base, sessionId, 'pikvm_msd_job', { device, jobId });
+            assert.equal(read.isError, undefined, read.content?.[0]?.text);
+            view = JSON.parse(read.content[0].text);
+            if (view.state === 'failed' || view.state === 'done') break;
+            await new Promise((resolve) => setTimeout(resolve, 25));
+          }
+          assert.equal(view.state, 'failed');
+          return jobId;
+        }
+        const kept = await finish('capb');
+        const dropped = await finish('capa');
+        const still = await callTool(srv.base, sessionId, 'pikvm_msd_job', { device: 'capb', jobId: kept });
+        assert.equal(still.isError, undefined, still.content?.[0]?.text);
+        assert.equal(JSON.parse(still.content[0].text).state, 'failed');
+        const newest = await finish('capa');
+        const gone = await callTool(srv.base, sessionId, 'pikvm_msd_job', { device: 'capa', jobId: dropped });
+        assert.equal(gone.isError, true);
+        assert.match(gone.content[0].text, /unknown job/);
+        const capaKept = await callTool(srv.base, sessionId, 'pikvm_msd_job', { device: 'capa', jobId: newest });
+        assert.equal(JSON.parse(capaKept.content[0].text).state, 'failed');
+        const other = await callTool(srv.base, sessionId, 'pikvm_msd_job', { device: 'capb', jobId: kept });
+        assert.equal(JSON.parse(other.content[0].text).state, 'failed');
+      } finally {
+        await srv.close();
+        await closeFleet(fleet);
+      }
+    } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   });

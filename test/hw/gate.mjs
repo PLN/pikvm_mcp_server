@@ -1,5 +1,6 @@
 // Modified 2026-10 by PLN: hardware suite device gate (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: registry devices must set hwTest (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: a missing registry still accepts only default (GPL-3.0; see NOTICE).
 
 /**
  * Which device the hardware suite may talk to.
@@ -28,7 +29,7 @@ export function hwDeviceRequest(env = process.env) {
     if (name !== 'default') {
       throw new Error(
         `PIKVM_HW_TEST_DEVICE=${JSON.stringify(name)} is refused. `
-        + 'Only "default" is accepted until the device registry exists (Phase B item 10).',
+        + 'Only "default" is accepted when no device registry is set.',
       );
     }
     return { skip: false, name };
