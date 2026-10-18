@@ -15,6 +15,9 @@ Modified 2026-10 by PLN: pikvm_type delay is milliseconds (GPL-3.0; see below).
 Modified 2026-10 by PLN: opt-in hardware suite (GPL-3.0; see below).
 Modified 2026-10 by PLN: header and body timeouts stay timeouts (GPL-3.0; see below).
 Modified 2026-10 by PLN: hardware ISO, net check, and cleanup names (GPL-3.0; see below).
+Modified 2026-10 by PLN: password and bearer secret files (GPL-3.0; see below).
+Modified 2026-10 by PLN: empty secret vars are unset (GPL-3.0; see below).
+Modified 2026-10 by PLN: restore leftover images and reject fetch bad ports (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -451,3 +454,45 @@ No code from another pikvm_mcp_server fork was added for these methods.
   patches ESM dns lookup. The closed-port probe uses port 65000.
   test:hw passes --test-concurrency=1.
   No code from another pikvm_mcp_server fork was added.
+
+2026-10, by PLN:
+  PIKVM_PASSWORD and PIKVM_MCP_BEARER resolve in this order: the direct
+  environment variable, then <NAME>_FILE, then
+  $CREDENTIALS_DIRECTORY/<credName> when that directory variable is set.
+  The credential names are pikvm-password and pikvm-mcp-bearer. The
+  order follows dvaerum/pikvm_mcp_server src/config.ts resolveSecret at
+  afbe454d42a5b994bf903883a2712c0e77e84a7b (GPL-3.0, a fork of
+  KultivatorConsulting/pikvm_mcp_server). The reader is written fresh;
+  that file was not copied. Exactly one trailing newline (LF or CRLF)
+  is removed. Other whitespace stays. An empty result is an error.
+  Symlinks are followed and the target must be a regular file. A mode
+  with group or other bits warns on stderr and the value is never
+  logged. The mode check is skipped on Windows. Files larger than
+  64 KiB are rejected before the body is read. A missing credential
+  file means unset. A missing *_FILE is an error that names the
+  variable and the path. The direct variable wins when both it and
+  *_FILE are set, and a one-line notice names the ignored variable.
+  A bearer is required only for HTTP transport. redactConfig replaces
+  the password and the bearer before a config object is shown.
+  Phase B item 10 passwordFile is still to be done and should call
+  the same helper. No code from another pikvm_mcp_server fork was
+  copied.
+
+2026-10, by PLN:
+  An empty PIKVM_PASSWORD, PIKVM_MCP_BEARER, or the matching _FILE
+  variable is unset and falls through. Empty file content is still an
+  error. Direct values are kept verbatim. File bytes lose one trailing
+  newline and a leading UTF-8 BOM. A NUL byte is an error that names
+  the variable and the path. Secret files are opened O_RDONLY|O_NONBLOCK
+  and checked with fstat on that fd, so a FIFO does not block. Symlinks
+  stay allowed. HTTP mode without a bearer names PIKVM_MCP_BEARER,
+  PIKVM_MCP_BEARER_FILE, and CREDENTIALS_DIRECTORY/pikvm-mcp-bearer.
+  A bearer with leading or trailing whitespace is rejected at startup
+  by name only. No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  Hardware cleanup restores the snapshot image when this run did not
+  create that name, including a leftover mcp-hwtest-* image that was
+  already selected. The closed-port probe rejects ports on the Fetch
+  bad-port list before a connection. No code from another
+  pikvm_mcp_server fork was added.

@@ -1,3 +1,4 @@
+// Modified 2026-10 by PLN: reject a bearer with surrounding whitespace (GPL-3.0; see NOTICE).
 /**
  * Streamable HTTP transport for the MCP server
  *
@@ -55,6 +56,8 @@ function bearerTokenMatches(header: string | undefined, expected: string): boole
   const spaceIdx = header.indexOf(' ');
   if (spaceIdx === -1) return false;
   const scheme = header.slice(0, spaceIdx).toLowerCase();
+  // The configured bearer is rejected at startup when it has surrounding
+  // whitespace, so this trim cannot disagree with the stored token.
   const token = header.slice(spaceIdx + 1).trim();
   if (scheme !== 'bearer' || !token) return false;
   return timingSafeEqual(sha256(token), sha256(expected));

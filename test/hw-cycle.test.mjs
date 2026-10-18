@@ -1,5 +1,6 @@
 // Modified 2026-10 by PLN: MSD cycle cleanup against the mock (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: 1 MiB ISO and leftover names (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: restore a leftover image this run did not create (GPL-3.0; see NOTICE).
 
 /**
  * Forced-failure dry run. The kvmd mock stands in for the device.
@@ -199,6 +200,37 @@ describe('MSD cycle dry run', { concurrency: false }, () => {
       assert.equal(mock.state.images[imageName], undefined);
       assert.ok(logs.some((line) => line.includes('leftover') && line.includes('mcp-hwtest-stale.iso')));
       assert.ok(logs.some((line) => line.includes('cleanup restored disk.img')));
+    });
+  });
+
+  test('a selected leftover mcp-hwtest image is restored', async () => {
+    const imageName = hwTestImageName();
+    const logs = [];
+    await withCycle({
+      images: ['mcp-hwtest-stale.img', 'keep.img'],
+      drive: { image: 'mcp-hwtest-stale.img', connected: true, cdrom: false, rw: true },
+    }, async ({ mock, dir, session, pikvm }) => {
+      await writeFile(join(dir, imageName), hwIsoBytes());
+      await assert.rejects(
+        () => runMsdWriteCycle(session.call, {
+          allow: 'force',
+          imageName,
+          allowlist: ALLOW,
+          failAfter: 'mount-cdrom',
+          timeoutMs: 5000,
+          client: pikvm,
+          log: (line) => logs.push(line),
+        }),
+        /forced failure/,
+      );
+      assert.equal(mock.state.drive.connected, true);
+      assert.equal(mock.state.drive.image.name, 'mcp-hwtest-stale.img');
+      assert.equal(mock.state.drive.cdrom, false);
+      assert.equal(mock.state.drive.rw, true);
+      assert.ok(mock.state.images['mcp-hwtest-stale.img']);
+      assert.ok(mock.state.images['keep.img']);
+      assert.equal(mock.state.images[imageName], undefined);
+      assert.ok(logs.some((line) => line.includes('cleanup restored mcp-hwtest-stale.img')));
     });
   });
 

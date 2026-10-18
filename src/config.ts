@@ -6,6 +6,8 @@
 // Modified 2026-10 by PLN: PIKVM_MSD_URL_ALLOWLIST and URL private opt-in (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: write_remote connect timeout (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: warn on a junk connect timeout (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: password and bearer secret files (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: empty secret vars are unset (GPL-3.0; see NOTICE).
 // Env read adapted from dtrukr/pikvm_mcp_server src/config.ts @ d120243 (GPL-3.0).
 
 /**
@@ -26,6 +28,7 @@ import {
   parseMsdTimeoutMs,
   parseRequestTimeoutMs,
 } from './request-timeout.js';
+import { resolveSecret } from './secrets.js';
 import { parseUrlAllowlist, type UrlAllowlist } from './url-policy.js';
 
 // Load .env file from project root
@@ -163,10 +166,11 @@ export function loadConfig(): Config {
     throw new Error('PIKVM_HOST environment variable is required');
   }
 
-  const password = process.env.PIKVM_PASSWORD;
-  if (!password) {
-    throw new Error('PIKVM_PASSWORD environment variable is required');
-  }
+  const password = resolveSecret({
+    name: 'PIKVM_PASSWORD',
+    credName: 'pikvm-password',
+    required: true,
+  });
 
   const requestTimeoutMs = parseRequestTimeoutMs(process.env.PIKVM_REQUEST_TIMEOUT_MS);
   const msdJobTimeoutMs = parseMsdTimeoutMs(
@@ -180,12 +184,19 @@ export function loadConfig(): Config {
     MSD_IDLE_TIMEOUT_MAX_MS,
   );
 
+  const bearerToken = resolveSecret({
+    name: 'PIKVM_MCP_BEARER',
+    credName: 'pikvm-mcp-bearer',
+  });
+  if (typeof bearerToken === 'string' && bearerToken !== bearerToken.trim()) {
+    throw new Error('PIKVM_MCP_BEARER has leading or trailing whitespace');
+  }
   const port = parseInt(process.env.PIKVM_MCP_PORT || '', 10);
   const http: HttpConfig | undefined = Number.isFinite(port) && port > 0
     ? {
         port,
         host: process.env.PIKVM_MCP_HOST || '127.0.0.1',
-        bearerToken: process.env.PIKVM_MCP_BEARER,
+        bearerToken,
         armHid: process.env.PIKVM_MCP_ARM_HID === '1',
         armMsd: process.env.PIKVM_MCP_ARM_MSD === '1',
       }
@@ -217,4 +228,19 @@ export function loadConfig(): Config {
     },
     http,
   };
+}
+
+/** A copy safe to log. Password and bearer are replaced. The values are not copied into the result. */
+export function redactConfig(config: Config): Config {
+  const copy: Config = {
+    ...config,
+    pikvm: { ...config.pikvm, password: '[REDACTED]' },
+  };
+  if (config.http) {
+    copy.http = {
+      ...config.http,
+      bearerToken: config.http.bearerToken === undefined ? undefined : '[REDACTED]',
+    };
+  }
+  return copy;
 }
