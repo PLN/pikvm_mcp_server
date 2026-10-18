@@ -26,6 +26,7 @@ import { buildFleet } from './devices.js';
 import { createMcpServer, type McpServerDeps } from './server.js';
 import { startHttpServer } from './http.js';
 import { pinCommand } from './pin.js';
+import { inspect } from 'node:util';
 import { redactUrl } from './url-policy.js';
 
 async function listen(config: Config, deps: McpServerDeps): Promise<void> {
@@ -115,7 +116,7 @@ const started = process.argv[2] === 'pin'
   : main();
 
 started.catch((error) => {
-  const text = error instanceof Error ? (error.stack ?? error.message) : String(error);
+  const text = error instanceof Error ? inspect(error) : String(error);
   console.error('Fatal error:', redactUrl(text));
   process.exit(1);
 });

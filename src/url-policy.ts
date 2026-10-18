@@ -2,6 +2,7 @@
 // Modified 2026-10 by PLN: metadata embeddings, Tailscale services, reserved ranges (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: deny 64:ff9b:1::/48 and non-global wrapped IPv4 (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: normalized fetch host, named allowlist errors (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: redact an error chain (GPL-3.0; see NOTICE).
 
 /**
  * https allowlist and address checks for pikvm_msd_fetch_url.
@@ -87,6 +88,31 @@ export function redactUrl(text: string): string {
       return `${scheme}${host}${path}`;
     },
   );
+}
+
+interface CodedError extends Error {
+  code?: unknown;
+  type?: unknown;
+}
+
+/** Copy an error with userinfo and query removed, keeping code and cause. */
+export function redactError(err: unknown): Error {
+  return copyRedacted(err, new Set());
+}
+
+function copyRedacted(err: unknown, seen: Set<unknown>): Error {
+  if (!(err instanceof Error)) return new Error(redactUrl(String(err)));
+  if (seen.has(err)) return new Error(redactUrl(err.message));
+  seen.add(err);
+  const copy = new Error(redactUrl(err.message));
+  copy.name = err.name;
+  const coded = err as CodedError;
+  if (typeof coded.code === 'string') (copy as CodedError).code = coded.code;
+  if (typeof coded.type === 'string') (copy as CodedError).type = coded.type;
+  if (err.cause !== undefined) {
+    copy.cause = err.cause instanceof Error ? copyRedacted(err.cause, seen) : err.cause;
+  }
+  return copy;
 }
 
 export class MsdUrlPolicyError extends Error {

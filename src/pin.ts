@@ -26,7 +26,7 @@
 
 import { existsSync } from 'node:fs';
 import { loadDeviceRegistry } from './registry.js';
-import { redactUrl } from './url-policy.js';
+import { redactError } from './url-policy.js';
 import {
   probeLeafCertificate,
   readPinnedCert,
@@ -112,8 +112,7 @@ export async function pinCommand(args: string[]): Promise<void> {
   try {
     cert = await probeLeafCertificate(host);
   } catch (err) {
-    const message = err instanceof Error ? err.message : 'TLS handshake failed';
-    throw new Error(redactUrl(message));
+    throw redactError(err);
   }
   printCertificate(cert);
 

@@ -609,8 +609,9 @@ No code from another pikvm_mcp_server fork was added for these methods.
   string is what the client connects with. The listed host is
   new URL(host).origin. Tool errors, a logged config, startup and
   fatal text, the pin command, and the hardware logs pass a host
-  through that origin or through redactUrl. No code from another
-  pikvm_mcp_server fork was copied.
+  through that origin or through redactUrl. A copied error keeps its
+  code and its cause, so a pin mismatch stays visible after the URL
+  is redacted. No code from another pikvm_mcp_server fork was copied.
 
 2026-10, by PLN:
   A repeated key in the registry devices object is a startup error

@@ -21,7 +21,7 @@ import { startHttpServer } from '../../dist/http.js';
 import { BusyLock } from '../../dist/pikvm/lock.js';
 import { PiKVMClient, unexpectedRedirectMessage } from '../../dist/pikvm/client.js';
 import { redactSecrets } from '../../dist/redact.js';
-import { redactUrl } from '../../dist/url-policy.js';
+import { redactError, redactUrl } from '../../dist/url-policy.js';
 import { createMcpServer } from '../../dist/server.js';
 import { resolveDevice } from '../../dist/msd.js';
 import { hwDeviceRequest } from './gate.mjs';
@@ -216,8 +216,7 @@ export async function kvmdGet(pikvmConfig, pathAndQuery) {
         redirect: 'manual',
       });
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'kvmd GET failed';
-      throw new Error(redactUrl(message));
+      throw redactError(err);
     }
     if (response.status >= 300 && response.status < 400) {
       const location = response.headers.get('location');
