@@ -16,6 +16,7 @@
 <!-- Modified 2026-10 by PLN: empty secret vars are unset (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: bearer whitespace is HTTP-only (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: TLS verify, pin, and insecure modes (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: pin the leaf, expiry wording, and Node >=22.9.0 (GPL-3.0; see NOTICE) -->
 
 # PiKVM MCP Server
 
@@ -139,7 +140,7 @@ kvmd ships a self-signed certificate. Three modes select how this process checks
 | `PIKVM_TLS_CERT_FILE` | PEM file for `pin`. Required in that mode. A regular file, at most 64 KiB. Opened the same non-blocking way as a secret file. It is not a secret: a loose mode is not warned. |
 | `PIKVM_VERIFY_SSL` | Legacy switch. Exactly `true` means `verify`. Any other value, including unset, means `insecure`. Ignored when `PIKVM_TLS_MODE` is set, with one stderr line when the two disagree. |
 
-`verify` uses the system CA store and checks the hostname. A stock self-signed certificate fails with `PIKVM_TLS_VERIFY_FAILED`. `pin` sends the pinned PEM as the only CA, keeps certificate checking on, and compares the leaf SPKI sha256. The hostname is not the identity, so an IP or a name that is not on the certificate still matches when the key matches. `insecure` turns certificate checks off.
+`verify` uses the system CA store and checks the hostname. A stock self-signed certificate fails with `PIKVM_TLS_VERIFY_FAILED`. `pin` sends the pinned PEM as the only CA, keeps certificate checking on, and compares the leaf SPKI sha256. The hostname is not the identity, so an IP or a name that is not on the certificate still matches when the key matches. A CA-signed leaf is trusted on its own (`allowPartialTrustChain`), which is how a Tailscale or Let's Encrypt certificate works after `pin default`. Pin the leaf only. Pinning a CA or an intermediate fails with `PIKVM_TLS_PIN_MISMATCH`, because that key is not the leaf key. `insecure` turns certificate checks off.
 
 `insecure` is the current default: if `PIKVM_TLS_MODE` is unset and `PIKVM_VERIFY_SSL` is not exactly `true`, the process uses `insecure` and writes one stderr line naming that mode and `pikvm-mcp-server pin default`. That keeps existing self-signed setups working. Switching the default to `pin` or `verify` waits for a later major release. An explicit `PIKVM_TLS_MODE=insecure` logs the same kind of warning. A pin failure or a verify failure is terminal. It is not retried, it is not reported as `PIKVM_UNREACHABLE`, and it never falls back to `insecure`.
 
@@ -152,11 +153,13 @@ pikvm-mcp-server pin default
 export PIKVM_TLS_MODE=pin
 ```
 
-`pin default` connects once, with verification disabled only for that handshake. It sends no request and no password. It prints the subject, issuer, validity, SHA-256 certificate fingerprint, and SPKI sha256. On a terminal it writes the file only after you type `yes`. Without a terminal it writes nothing unless you pass `--yes`. `--yes` is for a scripted re-pin after the new certificate was verified out of band. Replacing an existing file prints the old SPKI and the new SPKI first. The write is a temp file in the same directory, then a rename, mode `0644`. The command does not run by itself, and a pin failure does not run it.
+`pin default` connects once, with verification disabled only for that handshake. It sends no request and no password. It prints the subject, issuer, validity, SHA-256 certificate fingerprint, and SPKI sha256. On a terminal it writes the file only after you type `yes`. Without a terminal it writes nothing unless you pass `--yes`. `--yes` is for a scripted re-pin after the new certificate was verified out of band. Replacing an existing file prints the old SPKI and the new SPKI first. A file that is already there but is corrupt or not a certificate is shown as `old SPKI sha256: unreadable`, and the command still asks before it writes. The write is a temp file in the same directory, then a rename, mode `0644`. The rename replaces a symlink at `--out` and does not write through it. On POSIX the directory is fsynced after the rename, best-effort. The command writes the leaf only, and it does not run by itself. A pin failure does not run it. An `https://[::1]/` host is connected as `::1` with no SNI name.
 
 An optional alternative is `verify` with a Tailscale certificate. On the PiKVM, `tailscale cert pikvm.example.ts.net` creates a certificate for that MagicDNS name. Trust the Tailscale CA on the machine that runs this server, set `PIKVM_HOST=https://pikvm.example.ts.net` and `PIKVM_TLS_MODE=verify`, and leave `PIKVM_TLS_CERT_FILE` unset. That is a choice, not the default, and it still needs the name on the certificate to match the host.
 
-kvmd regenerates its self-signed certificate when the PiKVM is reinstalled. The next call then fails with `PIKVM_TLS_PIN_MISMATCH`. The message names device `default`, the expected SPKI sha256, and the presented SPKI sha256. The process does not retry the call, does not try `insecure`, and does not rewrite the pin file.
+kvmd regenerates its self-signed certificate when the PiKVM is reinstalled. The next call then fails with `PIKVM_TLS_PIN_MISMATCH`. The message names device `default`, the expected SPKI sha256, and the presented SPKI sha256. The process does not retry the call, does not try `insecure`, and does not rewrite the pin file. A chain failure whose OpenSSL code is outside the usual set, including an invalid CA or a path-length failure, is still `PIKVM_TLS_VERIFY_FAILED` or `PIKVM_TLS_PIN_MISMATCH`. It is not `PIKVM_UNREACHABLE` and it is not retried.
+
+An expired pinned certificate stays rejected with `PIKVM_TLS_VERIFY_FAILED`. The message says the certificate has expired. Regenerate or renew the kvmd certificate, then pin the new certificate. Pinning the expired certificate again does not make it valid.
 
 1. Read both fingerprints in the error. They are public; the password is not logged.
 2. Compare the presented fingerprint out of band, on a channel you already trust.
@@ -311,7 +314,7 @@ curl -i -X POST http://localhost:8675/mcp \
 
 ## Usage with Claude Code
 
-> **Node.js:** `engines` is `>=22` because Node.js 20 is end-of-life. The runtime dependency undici 7.24.1 needs Node.js >=20.18.1, and `npm test` quotes a glob that `node --test` expands only on Node.js 21 and later. This server uses ES modules. If `node --version` shows an older version, replace `"command": "node"` with the full path to a compatible binary (e.g. `"/usr/local/bin/node"` or your nvm path like `"~/.nvm/versions/node/v22.x.x/bin/node"`). This is common when nvm's default alias points to an older version.
+> **Node.js:** `engines` is `>=22.9.0`. Pin mode sets `allowPartialTrustChain`, which Node added in 22.9.0, so a CA-signed leaf can be the pin. Node.js 20 is end-of-life. The runtime dependency undici 7.24.1 needs Node.js >=20.18.1, and `npm test` quotes a glob that `node --test` expands only on Node.js 21 and later. This server uses ES modules. If `node --version` shows an older version, replace `"command": "node"` with the full path to a compatible binary (e.g. `"/usr/local/bin/node"` or your nvm path like `"~/.nvm/versions/node/v22.x.x/bin/node"`). This is common when nvm's default alias points to an older version.
 
 Add to your Claude Code MCP settings (`~/.config/claude-code/settings.json` or via the settings UI):
 

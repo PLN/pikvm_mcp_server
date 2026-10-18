@@ -1,4 +1,5 @@
 // Modified 2026-10 by PLN: test-only self-signed certificates (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: CA, path length, and expired test certificates (GPL-3.0; see NOTICE).
 
 /**
  * A self-signed certificate minted at test time with node:crypto.
@@ -51,8 +52,21 @@ function sanDns(dns) {
   return tlv(0xa3, seq(ext));
 }
 
-function bitString(buf) {
-  return tlv(0x03, Buffer.concat([Buffer.from([0x00]), buf]));
+function bitString(buf, unused = 0) {
+  return tlv(0x03, Buffer.concat([Buffer.from([unused]), buf]));
+}
+
+function extension(oidHex, critical, value) {
+  const parts = [oid(oidHex)];
+  if (critical) parts.push(tlv(0x01, Buffer.from([0xff])));
+  parts.push(tlv(0x04, value));
+  return seq(...parts);
+}
+
+function basicCa(ca, pathLen) {
+  const parts = [tlv(0x01, Buffer.from([ca ? 0xff : 0x00]))];
+  if (pathLen !== undefined) parts.push(tlv(0x02, Buffer.from([pathLen])));
+  return seq(...parts);
 }
 
 /** Leaf certificate whose name does not match 127.0.0.1. */
@@ -82,4 +96,73 @@ export function mintCert(cn = 'pikvm.example.ts.net') {
     .update(parsed.publicKey.export({ type: 'spki', format: 'der' }))
     .digest('hex');
   return { cert, key, spkiSha256, raw: parsed.raw };
+}
+
+/**
+ * A certificate with basicConstraints and keyUsage.
+ * Pass `issuer` to sign with that CA's key. `ca: true` marks a CA.
+ * `pathLen` is the basicConstraints path length. Dates default to a
+ * year of validity. Nothing here is a real host key.
+ */
+export function mintNode(opts = {}) {
+  const cn = opts.cn ?? 'pikvm.example.ts.net';
+  const keys = opts.keys ?? crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const subject = dn(cn);
+  const issuerSubject = opts.issuer ? opts.issuer.subject : subject;
+  const signer = opts.issuer ? opts.issuer.privateKey : keys.privateKey;
+  const extensions = [];
+  if (opts.ca === true) {
+    extensions.push(extension('551d13', true, basicCa(true, opts.pathLen)));
+    extensions.push(extension('551d0f', true, bitString(Buffer.from([0x06]), 1)));
+  } else if (opts.ca === false) {
+    extensions.push(extension('551d13', true, basicCa(false)));
+    extensions.push(extension('551d0f', true, bitString(Buffer.from([0xa0]), 0)));
+  }
+  if (opts.dns) {
+    extensions.push(extension('551d11', false, seq(tlv(0x82, Buffer.from(opts.dns)))));
+  }
+  const notBefore = opts.notBefore ?? new Date(Date.now() - 86_400_000);
+  const notAfter = opts.notAfter ?? new Date(Date.now() + 365 * 86_400_000);
+  const spki = keys.publicKey.export({ type: 'spki', format: 'der' });
+  const serial = crypto.randomBytes(8);
+  serial[0] &= 0x7f;
+  const extra = extensions.length ? tlv(0xa3, seq(...extensions)) : Buffer.alloc(0);
+  const tbs = seq(
+    Buffer.from('a003020102', 'hex'),
+    tlv(0x02, serial),
+    SHA256_RSA,
+    issuerSubject,
+    seq(utc(notBefore), utc(notAfter)),
+    subject,
+    spki,
+    extra,
+  );
+  const signature = crypto.sign('sha256', tbs, signer);
+  const der = seq(tbs, SHA256_RSA, bitString(signature));
+  const body = der.toString('base64').match(/.{1,64}/g).join('\n');
+  const cert = `-----BEGIN CERTIFICATE-----\n${body}\n-----END CERTIFICATE-----\n`;
+  const parsed = new crypto.X509Certificate(cert);
+  const spkiSha256 = crypto.createHash('sha256')
+    .update(parsed.publicKey.export({ type: 'spki', format: 'der' }))
+    .digest('hex');
+  return {
+    cert,
+    key: keys.privateKey.export({ type: 'pkcs8', format: 'pem' }),
+    privateKey: keys.privateKey,
+    subject,
+    spkiSha256,
+    raw: parsed.raw,
+    ca: parsed.ca,
+  };
+}
+
+/** A self-signed leaf whose notAfter is yesterday. */
+export function mintExpired(cn = 'pikvm.example.ts.net') {
+  return mintNode({
+    cn,
+    ca: false,
+    dns: cn,
+    notBefore: new Date(Date.now() - 30 * 86_400_000),
+    notAfter: new Date(Date.now() - 86_400_000),
+  });
 }

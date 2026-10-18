@@ -1,4 +1,5 @@
 // Modified 2026-10 by PLN: pikvm-mcp-server pin (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: a corrupt pin file does not stop a re-pin (GPL-3.0; see NOTICE).
 
 /**
  * `pikvm-mcp-server pin <device>` prints the leaf certificate and, after
@@ -11,6 +12,11 @@
  * --yes skips the interactive question. It is for a scripted re-pin after
  * the new certificate was checked out of band. A non-TTY without --yes
  * writes nothing.
+ *
+ * The file this writes is the leaf. Pinning a CA or an intermediate
+ * later fails with a pin mismatch, because that key is not the leaf.
+ * An existing file that is corrupt or not a certificate is printed as
+ * unreadable and does not stop the confirmation.
  */
 
 import { existsSync } from 'node:fs';
@@ -83,8 +89,13 @@ export async function pinCommand(args: string[]): Promise<void> {
   printCertificate(cert);
 
   if (existsSync(dest)) {
-    const current = readPinnedCert(dest);
-    console.log(`old SPKI sha256: ${current.spkiSha256}`);
+    let previous = 'unreadable';
+    try {
+      previous = readPinnedCert(dest).spkiSha256;
+    } catch {
+      previous = 'unreadable';
+    }
+    console.log(`old SPKI sha256: ${previous}`);
     console.log(`new SPKI sha256: ${cert.spkiSha256}`);
   }
 

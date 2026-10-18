@@ -1,4 +1,5 @@
 // Modified 2026-10 by PLN: TLS verify, pin, and insecure modes (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: invalid-CA, partial trust, expiry, and IPv6 pin tests (GPL-3.0; see NOTICE).
 
 /**
  * Self-signed server minted in this process. No committed key.
@@ -11,6 +12,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -30,12 +32,18 @@ import { loadConfig } from '../dist/config.js';
 import { KvmdError, PiKVMClient } from '../dist/pikvm/client.js';
 import {
   TLS_CERT_MAX_BYTES,
+  TLS_VERIFY_FAILED,
   assertPinNotInsecure,
+  classifyTlsFailure,
+  classifyUnauthorizedPeer,
+  isTlsVerifyCode,
   kvmdConnectOptions,
+  probeLeafCertificate,
   readPinnedCert,
+  writeCertAtomic,
 } from '../dist/tls.js';
 import { kvmdGet } from './hw/session.mjs';
-import { mintCert } from './tls-cert.mjs';
+import { mintCert, mintExpired, mintNode } from './tls-cert.mjs';
 
 const REPO = join(fileURLToPath(import.meta.url), '..', '..');
 const right = mintCert();
@@ -224,6 +232,7 @@ test('pin connect options keep rejectUnauthorized true', () => {
   );
   const options = kvmdConnectOptions(pinSpec(right));
   assert.equal(options.rejectUnauthorized, true);
+  assert.equal(options.allowPartialTrustChain, true);
   assert.equal(typeof options.checkServerIdentity, 'function');
   assert.doesNotThrow(() => assertPinNotInsecure(options));
   const identity = options.checkServerIdentity;
@@ -580,5 +589,357 @@ describe('pin CLI', { concurrency: false }, () => {
     assert.match(result.stderr, /only device "default"/);
     assert.match(result.stderr, /Phase B item 10/);
     assert.equal(connections, before);
+  });
+
+  test('a corrupt pin file is unreadable and --yes still replaces it', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pikvm-pin-'));
+    const dest = join(dir, 'default.pem');
+    writeFileSync(dest, 'not-a-cert\n', { mode: 0o644 });
+    try {
+      const refused = await runPin(['default', '--out', dest], pinEnv());
+      assert.notEqual(refused.code, 0);
+      assert.match(refused.stdout, /old SPKI sha256: unreadable/);
+      assert.match(refused.stdout, new RegExp(`new SPKI sha256: ${right.spkiSha256}`));
+      assert.equal(readFileSync(dest, 'utf8'), 'not-a-cert\n');
+
+      const replaced = await runPin(['default', '--yes', '--out', dest], pinEnv());
+      assert.equal(replaced.code, 0, replaced.stderr);
+      assert.match(replaced.stdout, /old SPKI sha256: unreadable/);
+      assert.match(replaced.stdout, new RegExp(`new SPKI sha256: ${right.spkiSha256}`));
+      assert.equal(readPinnedCert(dest).spkiSha256, right.spkiSha256);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+function chainServer(cert, key) {
+  const sockets = new Set();
+  let connections = 0;
+  const server = tls.createServer({ key, cert }, (socket) => {
+    socket.end('HTTP/1.1 200 OK\r\ncontent-length: 11\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{"ok":true}');
+  });
+  server.on('connection', (socket) => {
+    connections += 1;
+    sockets.add(socket);
+    socket.on('close', () => sockets.delete(socket));
+  });
+  return {
+    server,
+    connections: () => connections,
+    async listen() {
+      await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+      return server.address().port;
+    },
+    async close() {
+      for (const socket of sockets) socket.destroy();
+      await new Promise((resolve) => server.close(resolve));
+    },
+  };
+}
+
+async function verifyOnce(port, extraCa) {
+  const script = `
+    import { PiKVMClient } from ${JSON.stringify(join(REPO, 'dist', 'pikvm', 'client.js'))};
+    const client = new PiKVMClient({
+      host: process.env.PROBE_HOST,
+      username: 'admin',
+      password: 'not-a-real-password',
+      tls: { default: { device: 'default', mode: 'verify' } },
+      requestTimeoutMs: 3000,
+    });
+    try {
+      await client.getMsdState();
+      process.stdout.write('OK');
+    } catch (err) {
+      process.stdout.write(JSON.stringify({ type: err.type, message: err.message }));
+    } finally {
+      await client.close();
+    }
+  `;
+  const child = spawn(process.execPath, ['--input-type=module', '-e', script], {
+    env: {
+      PATH: process.env.PATH,
+      HOME: process.env.HOME ?? '/tmp',
+      NODE_EXTRA_CA_CERTS: extraCa,
+      PROBE_HOST: `https://127.0.0.1:${port}`,
+    },
+  });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
+  child.stdout.on('data', (chunk) => {
+    stdout += chunk;
+  });
+  child.stderr.on('data', (chunk) => {
+    stderr += chunk;
+  });
+  const code = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      reject(new Error(`verify probe did not exit\n${stdout}\n${stderr}`));
+    }, 10000);
+    child.once('exit', (status) => {
+      clearTimeout(timer);
+      resolve(status);
+    });
+    child.once('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+  });
+  return { code, stdout, stderr };
+}
+
+describe('TLS chain classification', { concurrency: false }, () => {
+  test('the X509 backstop includes codes outside the original set', () => {
+    assert.equal(isTlsVerifyCode('INVALID_CA'), true);
+    assert.equal(isTlsVerifyCode('PATH_LENGTH_EXCEEDED'), true);
+    assert.equal(isTlsVerifyCode('INVALID_PURPOSE'), true);
+    assert.equal(isTlsVerifyCode('UNLISTED_TLS_FAILURE'), false);
+    const invalid = classifyTlsFailure(Object.assign(new Error('invalid CA certificate'), { code: 'INVALID_CA' }), 'default');
+    assert.equal(invalid.type, 'PIKVM_TLS_VERIFY_FAILED');
+    assert.match(invalid.message, /INVALID_CA/);
+    const unlisted = classifyUnauthorizedPeer(
+      { device: 'default', mode: 'verify' },
+      right.raw,
+      'UNLISTED_TLS_FAILURE',
+    );
+    assert.equal(unlisted.code, TLS_VERIFY_FAILED);
+    assert.match(unlisted.message, /UNLISTED_TLS_FAILURE/);
+    assert.match(unlisted.message, /device default/);
+    const mismatch = classifyUnauthorizedPeer(pinSpec(wrong), right.raw, 'UNLISTED_TLS_FAILURE');
+    assert.equal(mismatch.code, 'PIKVM_TLS_PIN_MISMATCH');
+    assert.match(mismatch.message, new RegExp(right.spkiSha256));
+    assert.match(mismatch.message, new RegExp(wrong.spkiSha256));
+  });
+
+  test('INVALID_CA in verify mode is VERIFY_FAILED with one attempt', async () => {
+    const root = mintNode({ cn: 'Root CA', ca: true });
+    const mid = mintNode({ cn: 'Not A CA', ca: false, issuer: root });
+    const leaf = mintNode({
+      cn: 'pikvm.example.ts.net',
+      dns: 'pikvm.example.ts.net',
+      ca: false,
+      issuer: mid,
+    });
+    const dir = mkdtempSync(join(tmpdir(), 'pikvm-ca-'));
+    const caFile = join(dir, 'root.pem');
+    writeFileSync(caFile, root.cert);
+    const started = chainServer(leaf.cert + mid.cert, leaf.key);
+    try {
+      const port = await started.listen();
+      const before = started.connections();
+      const result = await verifyOnce(port, caFile);
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      assert.equal(result.code, 0, result.stderr);
+      const body = JSON.parse(result.stdout);
+      assert.equal(body.type, 'PIKVM_TLS_VERIFY_FAILED');
+      assert.match(body.message, /INVALID_CA|INVALID_PURPOSE|UNSPECIFIED|KEYUSAGE_NO_CERTSIGN/);
+      assert.equal(body.type === 'PIKVM_UNREACHABLE', false);
+      assert.equal(started.connections() - before, 1);
+    } finally {
+      await started.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('a wrong pin on an invalid-CA chain is PIN_MISMATCH with one attempt', async () => {
+    const root = mintNode({ cn: 'Root CA', ca: true });
+    const mid = mintNode({ cn: 'Not A CA', ca: false, issuer: root });
+    const leaf = mintNode({
+      cn: 'pikvm.example.ts.net',
+      dns: 'pikvm.example.ts.net',
+      ca: false,
+      issuer: mid,
+    });
+    const started = chainServer(leaf.cert + mid.cert, leaf.key);
+    try {
+      const port = await started.listen();
+      const client = clientFor(port, pinSpec(root));
+      const before = started.connections();
+      try {
+        await assert.rejects(() => client.getMsdState(), (err) => {
+          assert.ok(err instanceof KvmdError);
+          assert.equal(err.type, 'PIKVM_TLS_PIN_MISMATCH');
+          assert.match(err.message, new RegExp(root.spkiSha256));
+          assert.match(err.message, new RegExp(leaf.spkiSha256));
+          assert.match(err.message, /pikvm-mcp-server pin default/);
+          assert.equal(err.type === 'PIKVM_UNREACHABLE', false);
+          return true;
+        });
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        assert.equal(started.connections() - before, 1);
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await started.close();
+    }
+  });
+
+  test('PATH_LENGTH_EXCEEDED in verify mode is VERIFY_FAILED with one attempt', async () => {
+    const root = mintNode({ cn: 'Short Root', ca: true, pathLen: 0 });
+    const mid = mintNode({ cn: 'Short Mid', ca: true, issuer: root });
+    const leaf = mintNode({
+      cn: 'pikvm.example.ts.net',
+      dns: 'pikvm.example.ts.net',
+      ca: false,
+      issuer: mid,
+    });
+    const dir = mkdtempSync(join(tmpdir(), 'pikvm-path-'));
+    const caFile = join(dir, 'root.pem');
+    writeFileSync(caFile, root.cert);
+    const started = chainServer(leaf.cert + mid.cert, leaf.key);
+    try {
+      const port = await started.listen();
+      const before = started.connections();
+      const result = await verifyOnce(port, caFile);
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      assert.equal(result.code, 0, `${result.stderr}\n${result.stdout}`);
+      const body = JSON.parse(result.stdout);
+      assert.equal(body.type, 'PIKVM_TLS_VERIFY_FAILED');
+      assert.match(body.message, /PATH_LENGTH_EXCEEDED/);
+      assert.equal(body.type === 'PIKVM_UNREACHABLE', false);
+      assert.equal(started.connections() - before, 1);
+    } finally {
+      await started.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('a CA-signed leaf pinned alone passes, and so does the chain with its intermediate', async () => {
+    const root = mintNode({ cn: 'Public CA', ca: true });
+    const mid = mintNode({ cn: 'Public Intermediate', ca: true, issuer: root });
+    const leaf = mintNode({
+      cn: 'pikvm.example.ts.net',
+      dns: 'pikvm.example.ts.net',
+      issuer: mid,
+    });
+    const alone = chainServer(leaf.cert, leaf.key);
+    try {
+      const port = await alone.listen();
+      const client = clientFor(port, pinSpec(leaf));
+      try {
+        assert.equal(await client.checkAuth(), true);
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await alone.close();
+    }
+    const chained = chainServer(leaf.cert + mid.cert, leaf.key);
+    try {
+      const port = await chained.listen();
+      const client = clientFor(port, pinSpec(leaf));
+      try {
+        assert.equal(await client.checkAuth(), true);
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await chained.close();
+    }
+  });
+
+  test('pinning an intermediate is a pin mismatch', async () => {
+    const root = mintNode({ cn: 'Public CA', ca: true });
+    const mid = mintNode({ cn: 'Public Intermediate', ca: true, issuer: root });
+    const leaf = mintNode({
+      cn: 'pikvm.example.ts.net',
+      dns: 'pikvm.example.ts.net',
+      issuer: mid,
+    });
+    const started = chainServer(leaf.cert + mid.cert, leaf.key);
+    try {
+      const port = await started.listen();
+      const client = clientFor(port, pinSpec(mid));
+      try {
+        await assert.rejects(() => client.getMsdState(), (err) => {
+          assert.ok(err instanceof KvmdError);
+          assert.equal(err.type, 'PIKVM_TLS_PIN_MISMATCH');
+          assert.match(err.message, new RegExp(mid.spkiSha256));
+          assert.match(err.message, new RegExp(leaf.spkiSha256));
+          return true;
+        });
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await started.close();
+    }
+  });
+
+  test('an expired pinned leaf is VERIFY_FAILED and does not say to pin that certificate again', async () => {
+    const expired = mintExpired();
+    const started = chainServer(expired.cert, expired.key);
+    try {
+      const port = await started.listen();
+      const client = clientFor(port, pinSpec(expired));
+      const before = started.connections();
+      try {
+        await assert.rejects(() => client.getMsdState(), (err) => {
+          assert.ok(err instanceof KvmdError);
+          assert.equal(err.type, 'PIKVM_TLS_VERIFY_FAILED');
+          assert.match(err.message, /CERT_HAS_EXPIRED/);
+          assert.match(err.message, /expired/i);
+          assert.match(err.message, /[Rr]egenerate or renew/);
+          assert.match(err.message, /pin the new certificate/);
+          assert.equal(/out-of-band verification/.test(err.message), false);
+          assert.equal(err.type === 'PIKVM_TLS_PIN_MISMATCH', false);
+          assert.equal(err.type === 'PIKVM_UNREACHABLE', false);
+          return true;
+        });
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        assert.equal(started.connections() - before, 1);
+      } finally {
+        await client.close();
+      }
+    } finally {
+      await started.close();
+    }
+  });
+
+  test('rename replaces a symlink and leaves the target untouched', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'pikvm-link-'));
+    try {
+      const target = join(dir, 'target.pem');
+      const link = join(dir, 'out.pem');
+      writeFileSync(target, 'original-target');
+      symlinkSync(target, link);
+      writeCertAtomic(link, right.cert);
+      assert.equal(lstatSync(link).isSymbolicLink(), false);
+      assert.equal(readFileSync(target, 'utf8'), 'original-target');
+      assert.equal(readPinnedCert(link).spkiSha256, right.spkiSha256);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('an IPv6 literal is probed without the URL brackets', async (t) => {
+    const sockets = new Set();
+    const server = tls.createServer({ key: right.key, cert: right.cert });
+    server.on('connection', (socket) => {
+      sockets.add(socket);
+      socket.on('close', () => sockets.delete(socket));
+    });
+    try {
+      await new Promise((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(0, '::1', resolve);
+      });
+    } catch {
+      t.skip('::1 is not available');
+      return;
+    }
+    try {
+      const port = server.address().port;
+      const probed = await probeLeafCertificate(`https://[::1]:${port}`);
+      assert.equal(probed.spkiSha256, right.spkiSha256);
+    } finally {
+      for (const socket of sockets) socket.destroy();
+      await new Promise((resolve) => server.close(resolve));
+    }
   });
 });
