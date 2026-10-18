@@ -7,6 +7,7 @@
 <!-- Modified 2026-10 by PLN: hashing jobs, bad-image cleanup, upload try-lock (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: URL fetch allowlist and Tailscale opt-in (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: metadata embeddings, connect timeout, and fetch cleanup (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: deny local NAT64 and non-global wrapped IPv4 (GPL-3.0; see NOTICE) -->
 
 # PiKVM MCP Server
 
@@ -156,11 +157,14 @@ PIKVM_MCP_NO_DOTENV=0
   opt-in. Link-local and metadata stay denied even when this is `1` and even
   when the host is allowlisted: `169.254.0.0/16`, `fe80::/10`, the AWS IPv6
   metadata address `fd00:ec2::254`, Tailscale's own service addresses
-  `100.100.100.100`, `100.100.100.200`, and `fd7a:115c:a1e0::53`, and the
-  IPv4-mapped forms of every denied range. An IPv4 address embedded in
-  `::/96`, `64:ff9b::/96`, `64:ff9b:1::/48`, or `2002::/16` is extracted and
-  checked with those same IPv4 rules, so a metadata embedding stays denied
-  and a private embedding follows this flag. Reserved and documentation
+  `100.100.100.100`, `100.100.100.200`, and `fd7a:115c:a1e0::53`, the whole
+  local-use NAT64 prefix `64:ff9b:1::/48`, and the IPv4-mapped forms of
+  every denied range. `64:ff9b:1::/48` is denied outright and is not
+  decoded. IPv4 embedded in `::/96` (other than `::` and `::1`),
+  `64:ff9b::/96`, or `2002::/16` is allowed only when that IPv4 is a
+  global public address. `ALLOW_PRIVATE` and a Tailscale CIDR do not
+  cover a wrapped form. An IPv4-mapped address (`::ffff:`) is the socket
+  form of a plain IPv4 address and follows the plain rules. Reserved and documentation
   ranges stay denied too (`240.0.0.0/4`, `198.18.0.0/15`, `192.0.0.0/24`,
   `192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`, `fec0::/10`,
   `2001:db8::/32`). A literal allowlist host in an always-denied range is

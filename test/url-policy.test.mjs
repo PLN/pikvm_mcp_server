@@ -1,5 +1,6 @@
 // Modified 2026-10 by PLN: URL allowlist and SSRF address policy tests (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: metadata embeddings, Tailscale services, reserved ranges (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: local NAT64 and non-global wrapped IPv4 (GPL-3.0; see NOTICE).
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -49,7 +50,10 @@ test('allowlist parses https prefixes and tailscale CIDRs', () => {
   assert.throws(() => parseUrlAllowlist('https://100.100.100.100/'), /always denied/);
   assert.throws(() => parseUrlAllowlist('https://[fd7a:115c:a1e0::53]/'), /always denied/);
   assert.throws(() => parseUrlAllowlist('https://203.0.113.10/iso'), /always denied/);
+  assert.throws(() => parseUrlAllowlist('https://[64:ff9b:1::a9fe:a9fe]/'), /always denied/);
+  assert.throws(() => parseUrlAllowlist('https://[64:ff9b:1::1]/'), /always denied/);
   assert.equal(parseUrlAllowlist('https://100.101.102.103/').entries[0].host, '100.101.102.103');
+  assert.equal(parseUrlAllowlist('https://[64:ff9b::808:808]/').entries[0].host, '[64:ff9b::808:808]');
 });
 
 test('address policy denies private, tailscale, and metadata ranges', () => {
@@ -91,8 +95,16 @@ test('address policy denies private, tailscale, and metadata ranges', () => {
   ]) {
     assert.match(denied(address, wide, true), /always denied/, address);
   }
-  assert.match(denied('64:ff9b::7f00:1', wide, false), /private/);
-  assert.equal(denied('64:ff9b::7f00:1', wide, true), undefined);
+  assert.match(denied('64:ff9b::7f00:1', wide, false), /non-global/);
+  assert.match(denied('64:ff9b::7f00:1', wide, true), /non-global/);
+  assert.match(denied('64:ff9b:1::a9fe:a9fe', wide, true), /always denied/);
+  assert.match(denied('64:ff9b:1::1', wide, true), /always denied/);
+  assert.match(denied('64:ff9b::6440:1', wide, true), /non-global/);
+  assert.match(denied('2002:6440:0001::', wide, true), /non-global/);
+  assert.match(denied('::0a01:0203', wide, true), /non-global/);
+  assert.equal(denied('64:ff9b::808:808', wide, false), undefined);
+  assert.equal(denied('2002:0808:0808::', plain, true), undefined);
+  assert.equal(denied('::0808:0808', plain, false), undefined);
   assert.match(denied('240.0.0.1', plain, true), /reserved or documentation/);
   assert.match(denied('198.18.0.1', plain, true), /reserved or documentation/);
   assert.match(denied('192.0.0.1', plain, true), /reserved or documentation/);

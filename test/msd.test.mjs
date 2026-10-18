@@ -4,6 +4,7 @@
 // Modified 2026-10 by PLN: hashing jobs, bad-image cleanup, upload try-lock (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: URL fetch jobs and mount block during a transfer (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: fetch cleanup only after our progress line (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: local NAT64 and non-global wrapped IPv4 (GPL-3.0; see NOTICE).
 
 /**
  * MSD tools against the mock. The HTTP harness matches test/http.test.mjs.
@@ -1546,7 +1547,12 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
       ['nat64 metadata', '64:ff9b::a9fe:a9fe', true],
       ['6to4 metadata', '2002:a9fe:a9fe::', true],
       ['compatible metadata', '::a9fe:a9fe', true],
-      ['nat64 loopback', '64:ff9b::7f00:1', false],
+      ['nat64 loopback', '64:ff9b::7f00:1', true],
+      ['local nat64 metadata', '64:ff9b:1::a9fe:a9fe', true],
+      ['local nat64 other', '64:ff9b:1::1', true],
+      ['nat64 tailscale', '64:ff9b::6440:1', true],
+      ['6to4 tailscale', '2002:6440:0001::', true],
+      ['compat private', '::0a01:0203', true],
     ];
     for (const [label, address, allowPrivate] of cases) {
       await withSession({ images: [] }, fetchFlags(wide, {

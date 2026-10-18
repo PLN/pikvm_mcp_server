@@ -5,6 +5,7 @@ Modified 2026-10 by PLN: MSD upload jobs and remove (GPL-3.0; see below).
 Modified 2026-10 by PLN: hashing jobs, bad-image cleanup, upload try-lock (GPL-3.0; see below).
 Modified 2026-10 by PLN: URL fetch allowlist and Tailscale opt-in (GPL-3.0; see below).
 Modified 2026-10 by PLN: metadata embeddings, connect timeout, and fetch cleanup (GPL-3.0; see below).
+Modified 2026-10 by PLN: deny local NAT64 and non-global wrapped IPv4 (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -316,3 +317,13 @@ No code from another pikvm_mcp_server fork was added for these methods.
   Error text drops URL userinfo and the query string. kvmd logs the
   full URL in the PiKVM journal. No code from another pikvm_mcp_server
   fork was added.
+
+2026-10, by PLN:
+  64:ff9b:1::/48 is denied outright, including a /96-layout embedding
+  such as 64:ff9b:1::a9fe:a9fe, and an allowlist literal in that prefix
+  is rejected at config load. IPv4 wrapped in ::/96, 64:ff9b::/96, or
+  2002::/16 is allowed only when the inner address is globally public.
+  ALLOW_PRIVATE and a Tailscale CIDR do not cover a wrapped form.
+  :: and ::1 stay plain IPv6. ::ffff:0:0/96 stays plain IPv4, because
+  that is how a socket presents an IPv4 address. No code from another
+  pikvm_mcp_server fork was added.

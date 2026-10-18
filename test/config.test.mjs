@@ -6,6 +6,7 @@
  * Modified 2026-10 by PLN: PIKVM_MSD_LOCAL_DIR and PIKVM_MSD_MAX_BYTES (GPL-3.0; see NOTICE).
  * Modified 2026-10 by PLN: PIKVM_MSD_URL_ALLOWLIST and URL private opt-in (GPL-3.0; see NOTICE).
  * Modified 2026-10 by PLN: write_remote connect timeout (GPL-3.0; see NOTICE).
+ * Modified 2026-10 by PLN: local NAT64 allowlist literals (GPL-3.0; see NOTICE).
  *
  * loadEnvFile unit tests — verify PIKVM_MCP_NO_DOTENV=1 makes .env lose to
  * explicitly-set process env (the gateway systemd landmine fix).
@@ -326,6 +327,8 @@ test('PIKVM_MSD_URL_ALLOWLIST is empty by default and ALLOW_PRIVATE is off', () 
     process.env.PIKVM_MSD_URL_ALLOWLIST = '10.0.0.0/8';
     assert.throws(() => loadConfig(), /tailscale opt-in/);
     process.env.PIKVM_MSD_URL_ALLOWLIST = 'https://169.254.169.254/iso';
+    assert.throws(() => loadConfig(), /always denied/);
+    process.env.PIKVM_MSD_URL_ALLOWLIST = 'https://[64:ff9b:1::a9fe:a9fe]/';
     assert.throws(() => loadConfig(), /always denied/);
   } finally {
     for (const [k, v] of Object.entries(saved)) {

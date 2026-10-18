@@ -1,13 +1,14 @@
 // Modified 2026-10 by PLN: URL allowlist and SSRF address policy (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: metadata embeddings, Tailscale services, reserved ranges (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: deny 64:ff9b:1::/48 and non-global wrapped IPv4 (GPL-3.0; see NOTICE).
 
 /**
  * https allowlist and address checks for pikvm_msd_fetch_url.
  * kvmd downloads the URL itself, so this only rejects names the MCP
  * host can see. Link-local, metadata, and Tailscale service addresses
- * are never allowed. An IPv4 address embedded in ::/96, 64:ff9b::/96,
- * 64:ff9b:1::/48, or 2002::/16 is extracted and checked with the IPv4
- * rules. Tailscale ranges need an explicit CIDR in the allowlist.
+ * are never allowed. 64:ff9b:1::/48 is denied outright. IPv4 embedded
+ * in ::/96, 64:ff9b::/96, or 2002::/16 is allowed only when that IPv4
+ * is globally public. Tailscale ranges need an explicit CIDR.
  */
 
 import { lookup } from 'node:dns/promises';
@@ -18,11 +19,11 @@ const TAILSCALE_V4_PREFIX = 10;
 const TAILSCALE_V6 = 'fd7a:115c:a1e0::';
 const TAILSCALE_V6_PREFIX = 48;
 const NAT64 = 0x0064ff9b0000000000000000n;
-const NAT64_LOCAL = 0x0064ff9b0001n;
 
 const alwaysDeny = new BlockList();
 alwaysDeny.addSubnet('169.254.0.0', 16, 'ipv4');
 alwaysDeny.addSubnet('fe80::', 10, 'ipv6');
+alwaysDeny.addSubnet('64:ff9b:1::', 48, 'ipv6');
 alwaysDeny.addAddress('fd00:ec2::254', 'ipv6');
 alwaysDeny.addAddress('100.100.100.100', 'ipv4');
 alwaysDeny.addAddress('100.100.100.200', 'ipv4');
@@ -178,12 +179,14 @@ function cidrEnds(address: string, prefix: number, family: 'ipv4' | 'ipv6'): [st
   return [bigToIpv6(start), bigToIpv6(end)];
 }
 
-type EmbeddedIpv4 = { kind: 'ipv4'; address: string } | { kind: 'invalid' };
+type EmbeddedIpv4 = { kind: 'ipv4'; address: string };
 
 /**
- * IPv4 carried in ::/96, 64:ff9b::/96, 64:ff9b:1::/48 (RFC 6052), or
- * 2002::/16. The caller runs the IPv4 policy on the extracted address.
- * A local NAT64 address whose u byte is not zero is invalid.
+ * IPv4 carried in ::/96 (except :: and ::1), 64:ff9b::/96, or 2002::/16.
+ * 64:ff9b:1::/48 is not decoded: the whole prefix is always denied.
+ * ::ffff:0:0/96 is not extracted. BlockList matches an IPv4-mapped
+ * address against the IPv4 rules, which is how a socket presents a
+ * plain IPv4 address, so those keep the plain v4 policy.
  */
 function embeddedIpv4(bare: string): EmbeddedIpv4 | undefined {
   if (isIP(bare) !== 6) return undefined;
@@ -194,20 +197,27 @@ function embeddedIpv4(bare: string): EmbeddedIpv4 | undefined {
     return undefined;
   }
   const high96 = value >> 32n;
-  if (high96 === 0n || high96 === NAT64) {
+  if (high96 === 0n) {
+    if (value === 0n || value === 1n) return undefined;
+    return { kind: 'ipv4', address: bigToIpv4(value & 0xffffffffn) };
+  }
+  if (high96 === NAT64) {
     return { kind: 'ipv4', address: bigToIpv4(value & 0xffffffffn) };
   }
   if ((value >> 112n) === 0x2002n) {
     return { kind: 'ipv4', address: bigToIpv4((value >> 80n) & 0xffffffffn) };
   }
-  if ((value >> 80n) === NAT64_LOCAL) {
-    const high = (value >> 64n) & 0xffffn;
-    const marker = (value >> 56n) & 0xffn;
-    const low = (value >> 40n) & 0xffffn;
-    if (marker !== 0n) return { kind: 'invalid' };
-    return { kind: 'ipv4', address: bigToIpv4((high << 16n) | low) };
-  }
   return undefined;
+}
+
+/** True when an IPv4 address is global unicast, with no private or Tailscale opt-in. */
+function isGlobalPublicIpv4(address: string): boolean {
+  if (isIP(address) !== 4) return false;
+  if (alwaysDeny.check(address, 'ipv4')) return false;
+  if (tailscaleOuter.check(address, 'ipv4')) return false;
+  if (privateRanges.check(address, 'ipv4')) return false;
+  if (reservedRanges.check(address, 'ipv4')) return false;
+  return true;
 }
 
 const CIDR_ERROR = 'PIKVM_MSD_URL_ALLOWLIST tailscale opt-in must be a CIDR inside 100.64.0.0/10 or fd7a:115c:a1e0::/48';
@@ -249,8 +259,7 @@ function isAlwaysDeniedAddress(address: string): boolean {
   if (alwaysDeny.check(bare, family) || reservedRanges.check(bare, family)) return true;
   const embedded = embeddedIpv4(bare);
   if (!embedded) return false;
-  if (embedded.kind === 'invalid') return true;
-  return isAlwaysDeniedAddress(embedded.address);
+  return !isGlobalPublicIpv4(embedded.address);
 }
 
 function parseHttpsEntry(item: string): UrlAllowEntry {
@@ -350,7 +359,9 @@ export function inspectFetchUrl(raw: string, allow: UrlAllowlist): InspectedUrl 
 /**
  * Empty string when the address may be used. Otherwise a denial message.
  * Always-deny is checked before Tailscale and private ranges.
- * Embedded IPv4 uses the same IPv4 policy, including that order.
+ * A wrapped IPv4 address is allowed only when the inner address is
+ * globally public. ALLOW_PRIVATE and a Tailscale CIDR do not cover it.
+ * ::ffff:0:0/96 is not wrapped here: BlockList treats it as plain IPv4.
  */
 export function addressDenial(address: string, allow: UrlAllowlist, allowPrivate: boolean): string | undefined {
   const bare = stripBrackets(address.trim());
@@ -359,12 +370,10 @@ export function addressDenial(address: string, allow: UrlAllowlist, allowPrivate
     return `resolved address ${bare} is link-local or metadata and is always denied`;
   }
   const embedded = embeddedIpv4(bare);
-  if (embedded?.kind === 'invalid') {
-    return `resolved address ${bare} is an invalid IPv4 embedding and is always denied`;
-  }
   if (embedded?.kind === 'ipv4') {
-    const inner = addressDenial(embedded.address, allow, allowPrivate);
-    if (inner) return `resolved address ${bare} is denied: ${inner}`;
+    if (!isGlobalPublicIpv4(embedded.address)) {
+      return `resolved address ${bare} wraps a non-global IPv4 address and is always denied`;
+    }
     return undefined;
   }
   if (tailscaleOuter.check(bare, family)) {
