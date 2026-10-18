@@ -1,4 +1,5 @@
 <!-- Modified 2026-10 by PLN: opt-in hardware suite (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: 1 MiB ISO, leftover names, closed port 65000 (GPL-3.0; see NOTICE) -->
 
 # Hardware suite
 
@@ -44,9 +45,9 @@ The read-only level does not need the HTTP arm flags. The MSD and HID levels do,
 
 | Level | Variables | What it touches |
 | --- | --- | --- |
-| Read-only (default) | `PIKVM_HW_TEST_DEVICE=default` plus the host and password | Auth check, `GET /api/info?fields=system,hw` (kvmd version and model are logged), one raw `GET /api/msd` (logged with the password redacted) and `pikvm_msd_status`, the TLS mode in use, one bad-password `GET` (a single 401, `PIKVM_AUTH_FAILED`, not retried), and optionally the same host on port 1 mapped to `PIKVM_UNREACHABLE`. A filtered port is skipped rather than failed. |
-| MSD | also `PIKVM_HW_TEST_ALLOW_MSD=1` and `PIKVM_MCP_ARM_MSD=1` | Uploads a tiny `mcp-hwtest-<timestamp>-<rand>.iso`, mounts it as cdrom, ejects twice (the second result is `alreadyDisconnected`), mounts it as flash read-only, ejects, and removes it. If `PIKVM_HW_TEST_FETCH_URL` is an allowlisted `https` URL, `pikvm_msd_fetch_url` downloads it under another `mcp-hwtest-*` name and then removes that name. |
-| MSD force | `PIKVM_HW_TEST_ALLOW_MSD=force` instead of `1` | Dangerous. If the virtual drive is already connected, the cycle disconnects it, runs the writes above, and remounts the previous image afterwards. A busy drive is not skipped either; the cycle may fail. |
+| Read-only (default) | `PIKVM_HW_TEST_DEVICE=default` plus the host and password | Auth check, `GET /api/info?fields=system,hw` (kvmd version and model are logged), one raw `GET /api/msd` (logged with the password redacted) and `pikvm_msd_status`, the TLS mode in use, one bad-password `GET` (a single 401, `PIKVM_AUTH_FAILED`, not retried), and a closed-port probe of the same host. The probe uses port 65000 unless `PIKVM_HW_TEST_UNREACHABLE_PORT` names another port. Set that variable to `0` or `skip` to skip the probe. A connection refused is `PIKVM_UNREACHABLE`. A filtered port (the request times out) is skipped rather than failed. |
+| MSD | also `PIKVM_HW_TEST_ALLOW_MSD=1` and `PIKVM_MCP_ARM_MSD=1` | Uploads a 1 MiB `mcp-hwtest-<timestamp>-<rand>.iso`, mounts it as cdrom, ejects twice (the second result is `alreadyDisconnected`), mounts it as flash read-only, ejects, and removes it. If `PIKVM_HW_TEST_FETCH_URL` is an allowlisted `https` URL, `pikvm_msd_fetch_url` downloads it under another `mcp-hwtest-*` name and then removes that name. |
+| MSD force | `PIKVM_HW_TEST_ALLOW_MSD=force` instead of `1` | Dangerous. Confirm the target host is not using the virtual drive before running force. If the virtual drive is already connected, the cycle disconnects it, runs the writes above, and remounts the previous image afterwards. A busy drive is not skipped either; the cycle may fail. |
 | HID | also `PIKVM_HW_TEST_ALLOW_HID=1` and `PIKVM_MCP_ARM_HID=1` | `pikvm_type` sends the two characters `hw` with delay 0 and again with delay 50. Delay is milliseconds. kvmd reads seconds, so 50 is sent as `0.05`. This types into whatever has focus. Leave the target on a safe screen, such as an empty text editor, and do not leave a shell prompt focused. |
 
 `PIKVM_HW_TEST_ALLOW_MSD` unset, or any value other than `1` or `force`, skips the MSD cycle. The drive is not changed. If the drive is connected or busy, `1` skips with a message instead of disconnecting it. `force` is the only override.
@@ -55,17 +56,18 @@ The read-only level does not need the HTTP arm flags. The MSD and HID levels do,
 
 ## Image bytes
 
-The storage name is always `mcp-hwtest-<timestamp>-<rand>.iso` (a fetch uses the same prefix and an extra `-url` segment).
+The storage name is always `mcp-hwtest-<timestamp>-<rand>.iso` (a fetch uses the same prefix and an extra `-url` segment). Node writes the file at test time. There is no `xorriso` or `genisoimage` dependency, and there is no small fallback fixture.
 
-`xorriso` is used when it is on `PATH`, otherwise `genisoimage`. Both build a small ISO from a one-line `readme.txt` (`-V MCPHWTEST`, ISO level 1). If neither tool is present, or the tool fails, the file is a fixed 64-byte fixture from `fallbackIsoBytes()` in `test/hw/media.mjs`:
+The image is 1 MiB: 512 sectors of 2048 bytes. The kernel `fsg_lun_open` path refuses a cdrom smaller than 300×2048 bytes (614,400) and a flash image smaller than 512 bytes, and `set_connected` then fails with `ETOOSMALL`.
 
-```text
-bytes 0-7    MCPHWISO
-bytes 8-15   00000001
-bytes 16-63  pikvm-mcp hardware-suite fixture, newline, space padded
-```
+`hwIsoBytes()` in `test/hw/media.mjs` fills that buffer:
 
-That fixture is not a mountable ISO 9660 volume. A real volume needs a 32 KiB system area plus descriptors, which would pass the 32 KiB cap on the fallback. kvmd stores either body. The log line `hw: image ... via xorriso|genisoimage|fixture` says which one was uploaded.
+- Sector 16 is a Primary Volume Descriptor: type 1, `CD001`, version 1, volume space size 512 (both-endian), logical block size 2048 (both-endian), volume set size 1, volume sequence number 1, and a root directory record whose extent is sector 18.
+- Sector 17 is the volume descriptor set terminator (`0xFF`, `CD001`, version 1).
+- Sector 18 is the root directory, with `.` (`0x00`) and `..` (`0x01`) records.
+- Sectors 19 and 20 are the type-L and type-M path tables.
+
+The log line is `hw: image <name> (<bytes> bytes)`.
 
 ## Expected output
 
@@ -90,7 +92,7 @@ hw: raw /api/msd { ... }
 hw: tls verifySsl=false
 ```
 
-The raw MSD JSON is passed through the same password redaction as tool errors. An MSD run also logs the snapshot and, at the end, `hw: no mcp-hwtest images left`. A HID run logs `hw: pikvm_type delay 0 accepted` and the same for 50.
+The raw MSD JSON is passed through the same password redaction as tool errors. An MSD run also logs the snapshot, `hw: image <name> (<bytes> bytes)`, and at the end either `hw: no mcp-hwtest images left` or `hw: leftover mcp-hwtest images: ...`. A leftover line names images this run did not create. A HID run logs `hw: pikvm_type delay 0 accepted` and the same for 50.
 
 ## Cleanup
 
@@ -99,24 +101,24 @@ The MSD cycle records the drive snapshot, then runs the writes in `try` / `final
 The `finally` block:
 
 1. Disconnects the drive if it is connected.
-2. Removes every storage name that starts with `mcp-hwtest-`. `mcp-hwtest.iso` (no hyphen after the word) and every other name are left in place.
-3. Remounts the previous image when the snapshot had one, with the previous cdrom or flash mode, the previous `rw` flag, and the previous connected flag.
-4. Logs any `mcp-hwtest-*` name still present, or `hw: no mcp-hwtest images left`.
+2. Removes only the exact image names this run created (the upload name, and the fetch name when a fetch was requested). Any other `mcp-hwtest-*` name is a leftover: it is logged and not deleted. `mcp-hwtest.iso` (no hyphen after the word) does not match the prefix and is left in place.
+3. Remounts the previous image when the snapshot had one and that name is not an `mcp-hwtest-*` image, with the previous cdrom or flash mode, the previous `rw` flag (forced false for cdrom), and the previous connected flag. When the snapshot had no image, the previous cdrom and `rw` flags are written with `set_params` and no image name.
+4. Logs leftover `mcp-hwtest-*` names that this run did not create, or `hw: no mcp-hwtest images left`.
 
-A failure in the middle, including a forced failure, still runs that block. Killing the process (Ctrl-C, or the machine losing power) does not. Clean up by hand:
+A failure in the middle, including a forced failure, still runs that block. Killing the process (Ctrl-C, or the machine losing power) does not. Clean up by hand. `curl -u admin` prompts for the password; do not put the password on the command line.
 
 ```bash
-curl -k -u admin:replace-with-the-kvmd-password \
+curl -k -u admin \
   https://pikvm.example.ts.net/api/msd
 ```
 
-Remove only names that start with `mcp-hwtest-`. If one of them is still connected, eject first.
+Remove only the names this run logged (`hw: image ...` and the fetch name). Do not delete every `mcp-hwtest-*` name. Leftovers that were already on the device are reported and left alone. If one of this run's names is still connected, eject first.
 
 ```bash
-curl -k -u admin:replace-with-the-kvmd-password \
+curl -k -u admin \
   -X POST 'https://pikvm.example.ts.net/api/msd/set_connected?connected=0'
 
-curl -k -u admin:replace-with-the-kvmd-password \
+curl -k -u admin \
   -X POST 'https://pikvm.example.ts.net/api/msd/remove?image=mcp-hwtest-TIMESTAMP-RAND.iso'
 ```
 
@@ -126,7 +128,7 @@ The `hw: snapshot ...` line is the image to put back, with its `connected`, `cdr
 
 `npm test` expands `test/*.test.mjs` only. These files live in `test/hw/` and are named `*.hw.test.mjs`, so that glob does not see them. The workflow runs `npm ci`, `npm run typecheck`, and `npm test`. It does not run `npm run test:hw`.
 
-On Node 22.14, `node --test test/hw` from the repo root is a directory import (`"type": "module"`) and does not discover the files. Use `npm run test:hw`, which passes `test/hw/*.hw.test.mjs`. A normal test runs `node --test` with its working directory set to `test/hw`, the device variable unset, and asserts that every hardware test skipped and that no socket or DNS lookup happened.
+On Node 22.14, `node --test test/hw` from the repo root is a directory import (`"type": "module"`) and does not discover the files. Use `npm run test:hw`, which passes `test/hw/*.hw.test.mjs` and `--test-concurrency=1`. A normal test runs `node --import` of the network guard and `node --test --test-concurrency=1` with its working directory set to `test/hw` and the device variable unset. The TAP reporter does not print file names, so that test uses `test/hw-discovered-reporter.mjs`, which lists each discovered file. The test asserts that `readonly.hw.test.mjs`, `msd.hw.test.mjs`, and `hid.hw.test.mjs` were all discovered, that all 7 tests skipped, and that stdout and stderr together contain no socket or DNS marker. `node --test` copies a child file's stderr onto the runner's stdout, so the marker is not visible on stderr alone.
 
 ## Manual checklist
 
