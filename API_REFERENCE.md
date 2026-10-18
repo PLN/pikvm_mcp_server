@@ -105,7 +105,7 @@ POST /api/hid/print
 - `limit` - Maximum characters (default: 1024)
 - `keymap` - Keyboard layout (default: `en-us`)
 - `slow` - Use slow typing mode (boolean)
-- `delay` - Delay between keystrokes in ms (0-200)
+- `delay` - kvmd reads this as seconds. The MCP tool takes milliseconds (0-200) and divides by 1000 before sending
 
 **Example:**
 ```bash

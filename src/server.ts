@@ -6,6 +6,7 @@
 // Modified 2026-10 by PLN: URL fetch tool and transfer mount block (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: write_remote connect timeout (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: redactUrl on tool errors (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: pikvm_type delay is milliseconds (GPL-3.0; see NOTICE).
 
 /**
  * MCP server factory for PiKVM tools
@@ -373,7 +374,7 @@ const tools: Tool[] = [
         },
         delay: {
           type: 'number',
-          description: 'Delay between keystrokes in ms (0-200)',
+          description: 'Delay between keystrokes in milliseconds (0-200). Sent to kvmd as seconds.',
         },
       },
       required: ['text'],
