@@ -647,11 +647,11 @@ export async function startKvmdMock(options = {}) {
     res.end(JSON.stringify({ error: 'mock: unknown route' }));
   });
   // closeAllConnections can emit EBADF when the fd is already gone.
-  // An error listener keeps that race from failing the test.
+  // Swallow only that code. Other socket errors, including a short-body
+  // HPE_INVALID_EOF_STATE, stay with the HTTP server's own listener.
   server.on('connection', (socket) => {
     socket.on('error', (err) => {
       if (err?.code === 'EBADF') return;
-      throw err;
     });
   });
 
