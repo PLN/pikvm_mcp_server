@@ -5,6 +5,7 @@
 // Modified 2026-10 by PLN: redact an error chain (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: redact a non-Error cause (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a throwing getter and a deep cause stay redacted (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: a throwing toString and a long array stay bounded (GPL-3.0; see NOTICE).
 
 /**
  * https allowlist and address checks for pikvm_msd_fetch_url.
@@ -100,17 +101,39 @@ interface CodedError extends Error {
 /** Nested causes stop here so a very deep object cannot overflow the stack. */
 const REDACT_DEPTH_CAP = 32;
 
+/** One object or array contributes at most this many entries. */
+const REDACT_ENTRY_CAP = 256;
+
 /** Copy an error with userinfo and query removed, keeping code and cause. */
 export function redactError(err: unknown): Error {
   return copyRedacted(err, new Map(), 0);
+}
+
+/**
+ * Text from a caught value. message and toString are each guarded, so a
+ * getter that throws cannot escape or leave its secret in the result.
+ */
+function caughtText(err: unknown): string {
+  if (err instanceof Error) {
+    try {
+      const message = err.message;
+      if (typeof message === 'string') return redactUrl(message);
+    } catch {
+      // The message getter threw. Fall through to toString.
+    }
+  }
+  try {
+    return redactUrl(String(err));
+  } catch {
+    return 'unreadable';
+  }
 }
 
 function readProperty(source: object, key: string): unknown {
   try {
     return (source as Record<string, unknown>)[key];
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return `[unreadable: ${redactUrl(message)}]`;
+    return `[unreadable: ${caughtText(err)}]`;
   }
 }
 
@@ -143,10 +166,13 @@ function redactValue(value: unknown, seen: Map<object, unknown>, depth: number):
     const copy: unknown[] = [];
     seen.set(value, copy);
     const length = readProperty(value, 'length');
-    const count = typeof length === 'number' && Number.isInteger(length) && length >= 0 ? length : 0;
+    const count = typeof length === 'number' && Number.isInteger(length) && length > 0
+      ? Math.min(length, REDACT_ENTRY_CAP)
+      : 0;
     for (let index = 0; index < count; index += 1) {
       copy.push(redactValue(readProperty(value, String(index)), seen, depth + 1));
     }
+    if (typeof length === 'number' && length > REDACT_ENTRY_CAP) copy.push('[length]');
     return copy;
   }
   const copy: Record<string, unknown> = {};
@@ -155,13 +181,14 @@ function redactValue(value: unknown, seen: Map<object, unknown>, depth: number):
   try {
     keys = Object.keys(value);
   } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    copy.value = `[unreadable: ${redactUrl(message)}]`;
+    copy.value = `[unreadable: ${caughtText(err)}]`;
     return copy;
   }
-  for (const key of keys) {
+  const limited = keys.length > REDACT_ENTRY_CAP ? keys.slice(0, REDACT_ENTRY_CAP) : keys;
+  for (const key of limited) {
     copy[key] = redactValue(readProperty(value, key), seen, depth + 1);
   }
+  if (keys.length > REDACT_ENTRY_CAP) copy['[length]'] = '[length]';
   return copy;
 }
 

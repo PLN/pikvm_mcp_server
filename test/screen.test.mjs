@@ -15,6 +15,7 @@ import { loadConfig } from '../dist/config.js';
 import { buildFleet, closeFleet, startOcrProbes } from '../dist/devices.js';
 import { BusyLock } from '../dist/pikvm/lock.js';
 import { PiKVMClient, pixelToNormalized } from '../dist/pikvm/client.js';
+import { limitedSharp } from '../dist/screenshot.js';
 import { createMcpServer } from '../dist/server.js';
 import { startHttpServer } from '../dist/http.js';
 import { startKvmdMock } from './kvmd-mock.mjs';
@@ -142,6 +143,25 @@ function hidButtons(mock) {
 function moveTarget(call) {
   const query = new URLSearchParams(call.query);
   return { x: Number(query.get('to_x')), y: Number(query.get('to_y')) };
+}
+
+function crashText(err) {
+  if (err instanceof Error) return err.stack || err.message;
+  return String(err);
+}
+
+/** Records process crashes for this test and asserts there were none. */
+function watchCrashes(t) {
+  const crashes = [];
+  const onException = (err) => { crashes.push(err); };
+  const onRejection = (err) => { crashes.push(err); };
+  process.on('uncaughtException', onException);
+  process.on('unhandledRejection', onRejection);
+  t.after(() => {
+    process.off('uncaughtException', onException);
+    process.off('unhandledRejection', onRejection);
+    assert.equal(crashes.length, 0, crashes.map(crashText).join('\n\n'));
+  });
 }
 
 async function waitUntil(fn, ms = 2000) {
@@ -327,7 +347,8 @@ test('screenshot settings reject a bad range and an unknown key', () => {
   }
 });
 
-test('crop bounds and metadata match pixelToNormalized, with and without calibration', async () => {
+test('crop bounds and metadata match pixelToNormalized, with and without calibration', async (t) => {
+  watchCrashes(t);
   const mock = await startKvmdMock();
   try {
     const session = await startLegacy(mock);
@@ -426,7 +447,8 @@ test('crop bounds and metadata match pixelToNormalized, with and without calibra
   }
 });
 
-test('OCR is hidden when every device is disabled, and a disabled device does not fetch', async () => {
+test('OCR is hidden when every device is disabled, and a disabled device does not fetch', async (t) => {
+  watchCrashes(t);
   const off = await startKvmdMock({ ocr: { enabled: false, langs: [] } });
   const on = await startKvmdMock({ ocr: { enabled: true, langs: ['eng'] } });
   const dir = mkdtempSync(join(tmpdir(), 'pikvm-ocr-'));
@@ -554,7 +576,8 @@ test('OCR is hidden when every device is disabled, and a disabled device does no
   }
 });
 
-test('OCR errors are redacted', async () => {
+test('OCR errors are redacted', async (t) => {
+  watchCrashes(t);
   const mock = await startKvmdMock({
     ocr: { enabled: true, langs: ['eng'] },
     ocrError: SECRET,
@@ -737,7 +760,8 @@ test('interleaved screenshots keep request order, and frameId is exact', async (
   }
 });
 
-test('an evicted or cross-device frameId sends no HID', async () => {
+test('an evicted or cross-device frameId sends no HID', async (t) => {
+  watchCrashes(t);
   const mock = await startKvmdMock();
   const other = await startKvmdMock();
   const dir = mkdtempSync(join(tmpdir(), 'pikvm-frame-'));
@@ -879,7 +903,8 @@ function ocrSnapshots(mock) {
   return mock.calls.filter((call) => call.path === '/api/streamer/snapshot' && call.query.includes('ocr=1'));
 }
 
-test('a slow OCR snapshot is one kvmd request', async () => {
+test('a slow OCR snapshot is one kvmd request', async (t) => {
+  watchCrashes(t);
   const mock = await startKvmdMock({
     ocr: { enabled: true, langs: ['eng'] },
     ocrDelayMs: 800,
@@ -907,7 +932,8 @@ test('a slow OCR snapshot is one kvmd request', async () => {
   }
 });
 
-test('an OCR probe does not retry, and unknown is probed again', async () => {
+test('an OCR probe does not retry, and unknown is probed again', async (t) => {
+  watchCrashes(t);
   const mock = await startKvmdMock({
     routes: {
       'GET /api/streamer/ocr': {
@@ -1051,7 +1077,8 @@ test('OCR probes run together, and a disabled answer is cached', async () => {
   }
 });
 
-test('an OCR box is preview pixels, and text is capped', async () => {
+test('an OCR box is preview pixels, and text is capped', async (t) => {
+  watchCrashes(t);
   const big = 'a'.repeat(70 * 1024);
   const mock = await startKvmdMock({
     ocr: { enabled: true, langs: ['eng'] },
@@ -1136,6 +1163,51 @@ test('an OCR box is preview pixels, and text is capped', async () => {
       assert.equal(missing.result.isError, true);
       assert.match(missing.result.content[0].text, /PIKVM_UNKNOWN_FRAME/);
       assert.equal(ocrSnapshots(mock).length, 0);
+    } finally {
+      await session.close();
+    }
+  } finally {
+    await mock.close();
+  }
+});
+
+test('an oversized screenshot is rejected and the click frame stays', async (t) => {
+  watchCrashes(t);
+  const tiny = await sharp({
+    create: { width: 8, height: 8, channels: 3, background: '#111111' },
+  }).jpeg().toBuffer();
+  const sof = tiny.indexOf(Buffer.from([0xff, 0xc0]));
+  assert.ok(sof > 0);
+  const patched = Buffer.from(tiny);
+  patched.writeUInt16BE(8193, sof + 5);
+  patched.writeUInt16BE(8192, sof + 7);
+  await assert.rejects(() => limitedSharp(patched).metadata(), /pixel limit/);
+  await assert.rejects(() => limitedSharp(patched).removeAlpha().raw().toBuffer(), /pixel limit/);
+
+  const mock = await startKvmdMock({ snapshotJpeg: patched, snapshotJpegAfter: 1 });
+  try {
+    const session = await startLegacy(mock);
+    try {
+      const full = await rpc(session.srv.base, session.sessionId, 'tools/call', {
+        name: 'pikvm_screenshot',
+        arguments: {},
+      });
+      assert.notEqual(full.result.isError, true, full.result.content[0].text);
+      const rejected = await rpc(session.srv.base, session.sessionId, 'tools/call', {
+        name: 'pikvm_screenshot',
+        arguments: {},
+      });
+      assert.equal(rejected.result.isError, true);
+      assert.match(rejected.result.content[0].text, /pixel limit/);
+      assert.equal(rejected.result.content.some((part) => part.type === 'image'), false);
+      const clicked = await rpc(session.srv.base, session.sessionId, 'tools/call', {
+        name: 'pikvm_mouse_click',
+        arguments: { x: 480, y: 270 },
+      });
+      assert.notEqual(clicked.result.isError, true, clicked.result.content[0].text);
+      assert.equal(metadataOf(clicked.result).frameId, 'default');
+      assert.equal(metadataOf(clicked.result).width, 960);
+      assert.deepEqual(moveTarget(hidMoves(mock).at(-1)), { x: 17, y: 30 });
     } finally {
       await session.close();
     }

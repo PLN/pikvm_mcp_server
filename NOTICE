@@ -32,6 +32,7 @@ Modified 2026-10 by PLN: a throwing getter and a deep cause stay redacted (GPL-3
 Modified 2026-10 by PLN: screenshot defaults, local crop, and optional OCR (GPL-3.0; see below).
 Modified 2026-10 by PLN: click frames stay on the full preview (GPL-3.0; see below).
 Modified 2026-10 by PLN: OCR is not retried after it is sent (GPL-3.0; see below).
+Modified 2026-10 by PLN: redaction stays bounded, and sharp refuses an oversized image (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -694,4 +695,14 @@ No code from another pikvm_mcp_server fork was added for these methods.
   The OCR box is in preview-frame pixels and is converted to full
   resolution with that frame's scale and origin. Returned text is
   capped at 64 KiB and ends with [truncated] when it is cut.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  redactError guards the message read and the toString read inside
+  the catch. A getter that throws, or a toString that throws, becomes
+  a placeholder and cannot leak the thrown text. An array or object
+  contributes at most 256 entries, then [length]. A sparse array of
+  length 2^25 stays inside that cap. sharp decodes for a crop and for
+  auto-calibrate use limitInputPixels 8192*8192. An image above that
+  is an error and does not replace the click frame.
   No code from another pikvm_mcp_server fork was copied.

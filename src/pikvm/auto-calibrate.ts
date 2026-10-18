@@ -1,4 +1,5 @@
 // Modified 2026-10 by PLN: internal captures do not change the click frame (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: sharp refuses an oversized image (GPL-3.0; see NOTICE).
 
 /**
  * Auto-calibration via visual cursor detection.
@@ -7,7 +8,7 @@
  * and computes calibration factors from detected vs expected positions.
  */
 
-import sharp from 'sharp';
+import { limitedSharp } from '../screenshot.js';
 import { PiKVMClient, ScreenResolution } from './client.js';
 
 // ============================================================================
@@ -80,7 +81,7 @@ const DEFAULT_CONFIG: AutoCalibrationConfig = {
  * Decode a JPEG buffer to raw RGB pixels via sharp.
  */
 async function decodeToRgb(buffer: Buffer): Promise<{ data: Buffer; width: number; height: number }> {
-  const image = sharp(buffer).removeAlpha().raw();
+  const image = limitedSharp(buffer).removeAlpha().raw();
   const { data, info } = await image.toBuffer({ resolveWithObject: true });
   return { data, width: info.width, height: info.height };
 }

@@ -700,6 +700,12 @@ export async function startKvmdMock(options = {}) {
         });
         if (req.destroyed || res.writableEnded || res.destroyed) return;
       }
+      if (options.snapshotJpeg && snapshotIndex >= (options.snapshotJpegAfter ?? 0)) {
+        const jpeg = options.snapshotJpeg;
+        res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Content-Length': jpeg.length });
+        res.end(jpeg);
+        return;
+      }
       if (u.searchParams.get('preview') === '1') {
         const maxWidth = Number(u.searchParams.get('preview_max_width') || 0);
         const maxHeight = Number(u.searchParams.get('preview_max_height') || 0);

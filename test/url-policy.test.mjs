@@ -4,6 +4,7 @@
 // Modified 2026-10 by PLN: redactUrl, named allowlist errors, trailing-dot href (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: redactError covers string, object, and cyclic causes (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: throwing getters and a deep cause stay redacted (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: a throwing toString and a long array stay bounded (GPL-3.0; see NOTICE).
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -17,6 +18,25 @@ import {
 } from '../dist/url-policy.js';
 
 const HOST = 'https://images.example/iso';
+const SECRET = 'https://admin:SECRETPW@127.0.0.1/kvm?token=TOK';
+
+function crashText(err) {
+  if (err instanceof Error) return err.stack || err.message;
+  return String(err);
+}
+
+function watchCrashes(t) {
+  const crashes = [];
+  const onException = (err) => { crashes.push(err); };
+  const onRejection = (err) => { crashes.push(err); };
+  process.on('uncaughtException', onException);
+  process.on('unhandledRejection', onRejection);
+  t.after(() => {
+    process.off('uncaughtException', onException);
+    process.off('unhandledRejection', onRejection);
+    assert.equal(crashes.length, 0, crashes.map(crashText).join('\n\n'));
+  });
+}
 
 test('redactUrl drops userinfo at the last at and drops the query', () => {
   const text = 'failed https://alice:p@ss@images.example/disk.img?token=keep#frag';
@@ -68,7 +88,8 @@ test('redactError redacts an Error cause, a string, an object url, and a cycle',
   assert.equal(boxCopy.self, boxCopy);
 });
 
-test('redactError replaces a throwing getter and stops at the depth cap', () => {
+test('redactError replaces a throwing getter and stops at the depth cap', (t) => {
+  watchCrashes(t);
   const secret = 'https://admin:SECRETPW@127.0.0.1/kvm?token=TOK';
   const box = {};
   Object.defineProperty(box, 'url', {
@@ -102,6 +123,78 @@ test('redactError replaces a throwing getter and stops at the depth cap', () => 
   assert.equal(buriedText.includes('SECRETPW'), false);
   assert.equal(buriedText.includes('TOK'), false);
   assert.equal(buriedText.includes('[depth]'), true);
+});
+
+test('redactError guards a throwing message and toString, and caps entries', (t) => {
+  watchCrashes(t);
+  const box = {};
+  Object.defineProperty(box, 'url', {
+    enumerable: true,
+    get() {
+      const thrown = new Error('placeholder');
+      Object.defineProperty(thrown, 'message', {
+        get() {
+          throw new Error(SECRET);
+        },
+      });
+      thrown.toString = () => {
+        throw new Error(SECRET);
+      };
+      throw thrown;
+    },
+  });
+  const outer = new Error('outer');
+  outer.cause = box;
+  const copied = redactError(outer);
+  const text = JSON.stringify(copied);
+  assert.equal(text.includes('SECRETPW'), false);
+  assert.equal(text.includes('TOK'), false);
+  assert.equal(copied.cause.url, '[unreadable: unreadable]');
+
+  const readable = {};
+  Object.defineProperty(readable, 'url', {
+    enumerable: true,
+    get() {
+      const thrown = new Error('placeholder');
+      Object.defineProperty(thrown, 'message', {
+        get() {
+          throw new Error('nope');
+        },
+      });
+      thrown.toString = () => SECRET;
+      throw thrown;
+    },
+  });
+  const second = new Error('outer');
+  second.cause = readable;
+  const secondCopy = redactError(second);
+  const secondText = JSON.stringify(secondCopy);
+  assert.equal(secondText.includes('SECRETPW'), false);
+  assert.equal(secondText.includes('TOK'), false);
+  assert.equal(secondCopy.cause.url, '[unreadable: https://127.0.0.1/kvm]');
+
+  const sparse = [];
+  sparse.length = 2 ** 25;
+  sparse[0] = SECRET;
+  const wide = new Error('wide');
+  wide.cause = sparse;
+  const started = performance.now();
+  const wideCopy = redactError(wide);
+  assert.ok(performance.now() - started < 1000);
+  assert.equal(wideCopy.cause[0], 'https://127.0.0.1/kvm');
+  assert.equal(wideCopy.cause.length, 257);
+  assert.equal(wideCopy.cause[256], '[length]');
+  assert.equal(JSON.stringify(wideCopy).includes('SECRETPW'), false);
+
+  const many = {};
+  for (let i = 0; i < 300; i += 1) many[`k${i}`] = i === 0 ? SECRET : 'x';
+  const keyed = new Error('keyed');
+  keyed.cause = many;
+  const keyedCopy = redactError(keyed);
+  assert.equal(Object.keys(keyedCopy.cause).length, 257);
+  assert.equal(keyedCopy.cause.k0, 'https://127.0.0.1/kvm');
+  assert.equal(keyedCopy.cause['[length]'], '[length]');
+  assert.equal(JSON.stringify(keyedCopy).includes('SECRETPW'), false);
 });
 
 test('allowlist parses https prefixes and tailscale CIDRs', () => {

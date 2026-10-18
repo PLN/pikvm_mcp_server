@@ -14,6 +14,7 @@
 // Modified 2026-10 by PLN: screenshot preview, crop, and OCR (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: click frames stay on the full preview (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: OCR is not retried after it is sent (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: sharp refuses an oversized image (GPL-3.0; see NOTICE).
 // AbortSignal.timeout and PIKVM_UNREACHABLE / PIKVM_AUTH_FAILED no-retry codes
 // adapted from dtrukr/pikvm_mcp_server src/pikvm/client.ts @ d120243 (GPL-3.0).
 // Snapshot HTTP 503 retry-once adapted from dvaerum/pikvm_mcp_server
@@ -73,7 +74,6 @@ import {
   deviceTlsFrom,
   type DeviceTls,
 } from '../tls.js';
-import sharp from 'sharp';
 import {
   HID_OTHER_DEADLINE_MS,
   HID_PRINT_REFUSE_MS,
@@ -86,6 +86,7 @@ import { redactError, redactUrl } from '../url-policy.js';
 import {
   assertRegionInside,
   capOcrText,
+  limitedSharp,
   OCR_PROBE_TIMEOUT_MS,
   OCR_TIMEOUT_DEFAULT_MS,
   OCR_TIMEOUT_MAX_MS,
@@ -1173,7 +1174,7 @@ export class PiKVMClient {
     const buffer = Buffer.from(arrayBuffer);
 
     const actualResolution = await this.getResolution(true);
-    const metadata = await sharp(buffer).metadata();
+    const metadata = await limitedSharp(buffer).metadata();
     if (!metadata.width || !metadata.height) {
       throw new Error('Failed to read screenshot dimensions');
     }
@@ -1188,7 +1189,7 @@ export class PiKVMClient {
     let width = fullWidth;
     let height = fullHeight;
     if (region) {
-      output = Buffer.from(await sharp(buffer)
+      output = Buffer.from(await limitedSharp(buffer)
         .extract({ left: region.x, top: region.y, width: region.width, height: region.height })
         .jpeg({ quality: options?.quality ?? 70 })
         .toBuffer());

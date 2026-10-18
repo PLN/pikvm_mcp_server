@@ -1,6 +1,7 @@
 // Modified 2026-10 by PLN: screenshot defaults, crop bounds, and OCR state (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: unknown click frame error (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: OCR timeout, frame box, and text cap (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: sharp refuses an oversized image (GPL-3.0; see NOTICE).
 
 /**
  * Preview defaults, crop checks, and OCR state for one device.
@@ -8,6 +9,15 @@
  * dvaerum/pikvm_mcp_server src/pikvm/snapshot.ts at 2d6fa16 (GPL-3.0).
  * This file is written fresh. No other code from that file was copied.
  */
+
+import sharp from 'sharp';
+
+/** Reject a decode above 8192×8192 pixels. */
+export const SHARP_INPUT_PIXEL_LIMIT = 8192 * 8192;
+
+export function limitedSharp(input: Buffer): sharp.Sharp {
+  return sharp(input, { limitInputPixels: SHARP_INPUT_PIXEL_LIMIT });
+}
 
 export const SCREENSHOT_DEFAULT_MAX_WIDTH = 960;
 export const SCREENSHOT_DEFAULT_MAX_HEIGHT = 600;
