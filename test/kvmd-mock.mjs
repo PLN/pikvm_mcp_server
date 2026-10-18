@@ -1,6 +1,7 @@
 // Modified 2026-10 by PLN: configurable error, status, and delay routes (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: MSD state machine (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: incomplete images and kvmd error classes (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: pauseWrite and seeded images (GPL-3.0; see NOTICE).
 
 /**
  * Minimal KVMD REST mock implementing exactly the routes src/pikvm/client.ts
@@ -19,8 +20,12 @@
  * the live drive. `uploads` records write bodies. `bytes` holds stored
  * image bytes. Options: `free`, `busyFor` (how many MSD mutations
  * answer MsdIsBusyError), `failMidWrite`, `failSetConnected`,
- * `legacyFreeShape`, `writeHoldMs`, and `remote` (`lines`, `chunks`,
- * `gapMs`, `headerDelayMs`, `stallAfterHeadersMs`, `redirectTo`).
+ * `legacyFreeShape`, `writeHoldMs`, `pauseWrite`, and `remote` (`lines`,
+ * `chunks`, `gapMs`, `headerDelayMs`, `stallAfterHeadersMs`, `redirectTo`).
+ * `pauseWrite` accepts POST /api/msd/write, pauses the request, and does
+ * not read the body until the socket closes. `images` seeds storage
+ * (`'name.img'` or `{name,size,complete}`). `drive` sets the initial
+ * selection (`image` is a seeded name or null, plus connected/cdrom/rw).
  * A write that is aborted or shorter than Content-Length keeps a
  * complete:false image unless remove_incomplete is set. Image writable
  * follows kvmd: .iso is not writable; an upload is in storage and not
@@ -160,12 +165,8 @@ const MSD_OFFLINE = 'MSD is not found';
 function imageWritable(name) {
   // kvmd FileImage.__is_writable (v4.227): .iso is never writable.
   // An image in storage that was not adopted is writable. Uploads here
-  // are that case. Adopted or external images would follow the file mode.
-  if (String(name).toLowerCase().endsWith('.iso')) return false;
-  const inStorage = true;
-  const adopted = false;
-  if (inStorage && !adopted) return true;
-  return false;
+  // are that case, so every other name is writable.
+  return !String(name).toLowerCase().endsWith('.iso');
 }
 
 function imageMeta(name, size, complete) {
@@ -199,6 +200,31 @@ export async function startKvmdMock(options = {}) {
     uploading: null,
     downloading: null,
   };
+
+  if (Array.isArray(options.images)) {
+    for (const image of options.images) {
+      const name = typeof image === 'string' ? image : image.name;
+      const size = typeof image === 'string' || !Number.isInteger(image.size) ? 4 : image.size;
+      const complete = typeof image === 'string' ? true : image.complete !== false;
+      const body = Buffer.alloc(size, 0x61);
+      state.images[name] = imageMeta(name, size, complete);
+      bytes.set(name, body);
+    }
+  }
+  if (options.drive && typeof options.drive === 'object') {
+    const drive = options.drive;
+    if (typeof drive.image === 'string') {
+      const meta = state.images[drive.image];
+      state.drive.image = meta
+        ? { name: drive.image, size: meta.size, complete: meta.complete, removable: meta.removable }
+        : { name: drive.image, size: null, complete: null, removable: null };
+    } else if (drive.image === null) {
+      state.drive.image = null;
+    }
+    if (typeof drive.connected === 'boolean') state.drive.connected = drive.connected;
+    if (typeof drive.cdrom === 'boolean') state.drive.cdrom = drive.cdrom;
+    if (typeof drive.rw === 'boolean') state.drive.rw = drive.rw;
+  }
 
   function syncBusy() {
     state.busy = busyRemaining > 0;
@@ -366,6 +392,17 @@ export async function startKvmdMock(options = {}) {
       return true;
     }
     if (req.method === 'POST' && u.pathname === '/api/msd/write') {
+      if (options.pauseWrite) {
+        req.pause();
+        await new Promise((resolve) => {
+          const finish = () => resolve();
+          req.once('aborted', finish);
+          req.once('close', finish);
+          req.socket?.once('close', finish);
+        });
+        if (!res.writableEnded && !res.destroyed) res.destroy();
+        return true;
+      }
       const transferEncoding = req.headers['transfer-encoding'] ?? null;
       const contentLength = req.headers['content-length'] ?? null;
       const chunked = String(transferEncoding || '').toLowerCase().includes('chunked');
@@ -558,6 +595,11 @@ export async function startKvmdMock(options = {}) {
     bytes,
     uploads,
     url: `http://127.0.0.1:${port}`,
-    close: () => new Promise((resolve) => server.close(resolve)),
+    close: () => new Promise((resolve) => {
+      // A paused upload can leave the socket open after the client aborts.
+      // Drop it so close settles.
+      server.close(resolve);
+      server.closeAllConnections();
+    }),
   };
 }

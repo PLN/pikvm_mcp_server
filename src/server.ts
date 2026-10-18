@@ -1,4 +1,5 @@
 // Modified 2026-10 by PLN: typed KvmdError, timeouts, GET retry (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: MSD status, mount, and eject (GPL-3.0; see NOTICE).
 
 /**
  * MCP server factory for PiKVM tools
@@ -23,6 +24,7 @@ import type { BusyLock } from './pikvm/lock.js';
 import { autoCalibrateWithRetries } from './pikvm/auto-calibrate.js';
 import { allPrompts, getPromptByName } from './prompts/index.js';
 import { skillTools, isSkillTool, handleSkillToolCall } from './prompts/skill-tools.js';
+import { ejectMsd, mountMsd, publicMsdState, resolveDevice } from './msd.js';
 
 export interface McpServerDeps {
   pikvm: PiKVMClient;
@@ -34,6 +36,13 @@ export interface McpServerDeps {
    * is enforced); stdio callers gate on their own side.
    */
   armGateEnforced: boolean;
+  /**
+   * When true, pikvm_msd_mount and pikvm_msd_eject are disarmed. Only HTTP
+   * mode ever sets this, and only while PIKVM_MCP_ARM_MSD is not 1.
+   * Independent of armGateEnforced: PIKVM_MCP_ARM_HID=1 does not arm MSD.
+   * Omitted means ungated, which is stdio.
+   */
+  msdArmGateEnforced?: boolean;
 }
 
 // ============================================================================
@@ -125,6 +134,28 @@ function validateEnum<T extends string>(value: unknown, allowed: readonly T[], d
   return defaultValue;
 }
 
+function requireEnum<T extends string>(value: unknown, allowed: readonly T[], fieldName: string): T {
+  if (typeof value === 'string' && (allowed as readonly string[]).includes(value)) {
+    return value as T;
+  }
+  throw new Error(`${fieldName} must be one of: ${allowed.join(', ')}`);
+}
+
+function requireBoolean(value: unknown, fieldName: string): boolean {
+  if (typeof value !== 'boolean') {
+    throw new Error(`${fieldName} must be a boolean`);
+  }
+  return value;
+}
+
+/** expectImage may be "" when the drive has no image selected. */
+function requireText(value: unknown, fieldName: string): string {
+  if (typeof value !== 'string') {
+    throw new Error(`${fieldName} is required and must be a string`);
+  }
+  return value;
+}
+
 const VALID_BUTTONS = ['left', 'right', 'middle', 'up', 'down'] as const;
 const VALID_KEY_STATES = ['press', 'release', 'click'] as const;
 
@@ -149,6 +180,15 @@ export const ARM_GATED_TOOLS = new Set([
   'pikvm_mouse_scroll',
   'pikvm_calibrate',
   'pikvm_auto_calibrate',
+]);
+
+/**
+ * MSD changes. pikvm_msd_status is read-only and stays out of this set.
+ * Not part of ARM_GATED_TOOLS: arming HID does not arm mass storage.
+ */
+export const ARM_MSD_GATED_TOOLS = new Set([
+  'pikvm_msd_mount',
+  'pikvm_msd_eject',
 ]);
 
 /**
@@ -191,6 +231,28 @@ function disarmedResult(tool: string) {
       },
     ],
     isError: true,
+  };
+}
+
+function msdDisarmedResult(tool: string) {
+  return {
+    content: [
+      {
+        type: 'text' as const,
+        text:
+          `MSD arm-gate: "${tool}" is blocked. Mass-storage changes are DISARMED ` +
+          `(default in HTTP mode).\n` +
+          `To arm: set PIKVM_MCP_ARM_MSD=1 in the server's environment and restart. ` +
+          `pikvm_msd_status stays available. PIKVM_MCP_ARM_HID=1 does not arm MSD.`,
+      },
+    ],
+    isError: true,
+  };
+}
+
+function jsonText(value: unknown) {
+  return {
+    content: [{ type: 'text' as const, text: JSON.stringify(value) }],
   };
 }
 
@@ -436,6 +498,72 @@ const tools: Tool[] = [
       },
     },
   },
+  {
+    name: 'pikvm_msd_status',
+    description: 'Read PiKVM mass-storage state (GET /api/msd). Does not change the drive. Returns online, busy, drive, images, parts, free, uploading, and downloading.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        device: {
+          type: 'string',
+          description: 'Device name. Ignored until more than one device exists; the server uses the single configured device.',
+        },
+      },
+    },
+  },
+  {
+    name: 'pikvm_msd_mount',
+    description: 'Select a mass-storage image and, by default, connect the virtual drive. confirmImage must equal image. mode is cdrom or flash. rw is for flash and defaults to false; kvmd may force rw false, and the returned drive is a re-read after the change. On failure the previous drive selection is restored.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        device: {
+          type: 'string',
+          description: 'Device name. Ignored until more than one device exists.',
+        },
+        image: {
+          type: 'string',
+          description: 'Storage image name to select.',
+        },
+        mode: {
+          type: 'string',
+          enum: ['cdrom', 'flash'],
+          description: 'cdrom or flash.',
+        },
+        rw: {
+          type: 'boolean',
+          description: 'Request a writable flash drive. Default false. Flash only; cdrom is reported from the re-read after kvmd applies it.',
+        },
+        confirmImage: {
+          type: 'string',
+          description: 'Must equal image. The mount is refused when it does not.',
+        },
+        connect: {
+          type: 'boolean',
+          description: 'Connect the drive after selecting the image. Default true.',
+        },
+      },
+      required: ['image', 'mode', 'confirmImage'],
+    },
+  },
+  {
+    name: 'pikvm_msd_eject',
+    description: 'Disconnect the virtual drive. expectImage must equal the current drive image name, or an empty string when none is selected. Safe to repeat: a second eject returns alreadyDisconnected.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        device: {
+          type: 'string',
+          description: 'Device name. Ignored until more than one device exists.',
+        },
+        expectImage: {
+          type: 'string',
+          description: 'Current drive image name, or an empty string when no image is selected.',
+        },
+      },
+      required: ['expectImage'],
+    },
+  },
   ...skillTools,
 ];
 
@@ -508,6 +636,11 @@ export function createMcpServer(deps: McpServerDeps): Server {
     // HID arm-gate: refuse physical-input tools when disarmed (HTTP mode).
     if (deps.armGateEnforced && ARM_GATED_TOOLS.has(name)) {
       return disarmedResult(name);
+    }
+
+    // MSD arm-gate: separate from HID. Status stays available.
+    if (deps.msdArmGateEnforced && ARM_MSD_GATED_TOOLS.has(name)) {
+      return msdDisarmedResult(name);
     }
 
     try {
@@ -794,6 +927,43 @@ export function createMcpServer(deps: McpServerDeps): Server {
           } finally {
             deps.lock.release();
           }
+        }
+
+        case 'pikvm_msd_status': {
+          const { client } = resolveDevice(args, deps.pikvm);
+          const state = await client.getMsdState();
+          return jsonText(publicMsdState(state));
+        }
+
+        case 'pikvm_msd_mount': {
+          const resolved = resolveDevice(args, deps.pikvm);
+          const image = requireString(args.image, 'image');
+          const confirmImage = requireString(args.confirmImage, 'confirmImage');
+          const mode = requireEnum(args.mode, ['cdrom', 'flash'] as const, 'mode');
+          const rw = args.rw === undefined ? false : requireBoolean(args.rw, 'rw');
+          const connect = args.connect === undefined ? true : requireBoolean(args.connect, 'connect');
+          const outcome = await mountMsd(resolved.client, {
+            device: resolved.name,
+            image,
+            confirmImage,
+            mode,
+            rw,
+            connect,
+          });
+          if ('error' in outcome) {
+            return {
+              content: [{ type: 'text' as const, text: JSON.stringify(outcome) }],
+              isError: true,
+            };
+          }
+          return jsonText(outcome);
+        }
+
+        case 'pikvm_msd_eject': {
+          const resolved = resolveDevice(args, deps.pikvm);
+          const expectImage = requireText(args.expectImage, 'expectImage');
+          const outcome = await ejectMsd(resolved.client, expectImage, resolved.name);
+          return jsonText(outcome);
         }
 
         default:

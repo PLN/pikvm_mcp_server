@@ -1,6 +1,7 @@
 // Modified 2026-10 by PLN: PIKVM_REQUEST_TIMEOUT_MS (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: MSD upload deadlines (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: cap MSD job at 7 days and idle at 1 hour (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: PIKVM_MCP_ARM_MSD (GPL-3.0; see NOTICE).
 // Env read adapted from dtrukr/pikvm_mcp_server src/config.ts @ d120243 (GPL-3.0).
 
 /**
@@ -57,6 +58,8 @@ export interface HttpConfig {
   bearerToken?: string;
   /** 1 = HID tools armed in HTTP mode; otherwise arm-gate blocks them. */
   armHid: boolean;
+  /** 1 = MSD mount/eject armed in HTTP mode; otherwise those tools are blocked. */
+  armMsd: boolean;
 }
 
 export interface Config {
@@ -112,6 +115,7 @@ export function loadConfig(): Config {
         host: process.env.PIKVM_MCP_HOST || '127.0.0.1',
         bearerToken: process.env.PIKVM_MCP_BEARER,
         armHid: process.env.PIKVM_MCP_ARM_HID === '1',
+        armMsd: process.env.PIKVM_MCP_ARM_MSD === '1',
       }
     : undefined;
 

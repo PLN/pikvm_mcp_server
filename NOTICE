@@ -1,4 +1,5 @@
 Modified 2026-10 by PLN: added this NOTICE (GPL-3.0; see below).
+Modified 2026-10 by PLN: MSD tools, ARM_MSD, and source-error flag (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -197,3 +198,26 @@ No code from another pikvm_mcp_server fork was added for these methods.
   writable follows kvmd v4.227: a name ending in .iso is not writable;
   an image in storage that was not adopted is. Simulated write and
   connect failures use MsdOperationError.
+
+2026-10, by PLN:
+  Added pikvm_msd_status, pikvm_msd_mount, and pikvm_msd_eject.
+  Policy and rollback are in src/msd.ts. Every MSD tool resolves the
+  client through resolveDevice, which returns the single device.
+  PIKVM_MCP_ARM_MSD (default 0) arms mount and eject in HTTP mode.
+  The check is a separate dispatch gate from PIKVM_MCP_ARM_HID, so
+  arming HID does not arm MSD. Status is read-only and stays ungated.
+  stdio does not apply the gate. confirmImage must equal image, and
+  expectImage must equal the current drive image name (or an empty
+  string when none is selected); a mismatch makes no mutating kvmd
+  call. Eject treats MsdDisconnectedError as success with
+  alreadyDisconnected when a re-read shows the drive disconnected.
+  Mount snapshots the drive, disconnects only when that snapshot still
+  matches, then set_params and set_connected. On failure it rolls the
+  snapshot back and returns error, restored, and rollbackError when
+  the rollback itself fails. The mount result is a re-read, so kvmd
+  forcing rw false for cdrom or a non-writable image is visible.
+  A local upload source error is reported from that stream's own
+  error event, with the message "image may be partial; re-read
+  /api/msd". An abort or reset while kvmd is not reading stays
+  PIKVM_MSD_STATE_UNKNOWN. No code from another pikvm_mcp_server fork
+  was added. Mount and eject use the kvmd MSD API already cited above.
