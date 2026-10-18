@@ -23,8 +23,9 @@
  * value is never logged. The mode check is skipped on Windows. Files
  * larger than SECRET_MAX_BYTES are rejected before the body is read.
  *
- * TODO(registry): Phase B item 10's passwordFile should call resolveSecret
- * instead of reading a device password on its own.
+ * A registry passwordFile uses readSecretAtPath, the same reader. The
+ * registry JSON itself is not a secret: readCappedFile does not warn
+ * about the mode.
  */
 
 import {
@@ -116,27 +117,26 @@ function decodeSecretFile(bytes: Buffer, label: string, filePath: string): strin
 }
 
 /**
- * Read a secret file. `label` is the env var name and is the only
- * identifier included in errors, together with the path.
- * The open is non-blocking. Kind, size, and mode come from that fd.
+ * Open a regular file without blocking on a FIFO. The size cap is
+ * checked on the fd before the body is read. `warnMode` is for secrets.
+ * A registry document passes false.
  */
-function readSecretFile(filePath: string, label: string, missingIsUnset: boolean): string | undefined {
+export function readCappedFile(filePath: string, label: string, maxBytes: number, warnMode: boolean): Buffer {
   let fd: number | undefined;
   try {
     try {
       fd = openSync(filePath, SECRET_OPEN_FLAGS);
     } catch (err) {
-      if (missingIsUnset && errorCode(err) === 'ENOENT') return undefined;
       throw new Error(`${label} (${filePath}): cannot read (${errorCode(err)})`);
     }
     const opened = fstatSync(fd);
     if (!opened.isFile()) {
       throw new Error(`${label} (${filePath}): not a regular file`);
     }
-    if (opened.size > SECRET_MAX_BYTES) {
-      throw new Error(`${label} (${filePath}): larger than ${SECRET_MAX_BYTES} bytes`);
+    if (opened.size > maxBytes) {
+      throw new Error(`${label} (${filePath}): larger than ${maxBytes} bytes`);
     }
-    warnLooseMode(label, filePath, opened.mode);
+    if (warnMode) warnLooseMode(label, filePath, opened.mode);
     const buf = Buffer.alloc(opened.size);
     let off = 0;
     while (off < opened.size) {
@@ -144,13 +144,34 @@ function readSecretFile(filePath: string, label: string, missingIsUnset: boolean
       if (n === 0) break;
       off += n;
     }
-    return decodeSecretFile(buf.subarray(0, off), label, filePath);
-  } catch (err) {
-    if (err instanceof Error && err.message.startsWith(`${label} (`)) throw err;
-    throw new Error(`${label} (${filePath}): cannot read (${errorCode(err)})`);
+    return buf.subarray(0, off);
   } finally {
     if (fd !== undefined) closeSync(fd);
   }
+}
+
+function readSecretFile(filePath: string, label: string, missingIsUnset: boolean): string | undefined {
+  let buf: Buffer;
+  try {
+    buf = readCappedFile(filePath, label, SECRET_MAX_BYTES, true);
+  } catch (err) {
+    if (missingIsUnset && err instanceof Error && err.message.endsWith('(ENOENT)')) return undefined;
+    throw err;
+  }
+  return decodeSecretFile(buf, label, filePath);
+}
+
+/** passwordFile and a LoadCredential segment. Errors name `label` and the path, not the value. */
+export function readSecretAtPath(filePath: string, label: string): string {
+  const value = readSecretFile(filePath, label, false);
+  if (value === undefined) {
+    throw new Error(`${label} (${filePath}): cannot read (ENOENT)`);
+  }
+  return value;
+}
+
+export function credentialFilePath(directory: string, credName: string): string {
+  return credentialPath(directory, credName);
 }
 
 /** A present, non-empty variable. "" is unset so the next source can run. */

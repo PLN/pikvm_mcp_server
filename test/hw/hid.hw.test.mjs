@@ -1,4 +1,5 @@
 // Modified 2026-10 by PLN: opt-in HID hardware check (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: HID also needs the device armHid (GPL-3.0; see NOTICE).
 
 /**
  * Types a short string into whatever currently has focus on the target.
@@ -27,6 +28,9 @@ describe('HID hardware', { concurrency: false }, () => {
     }
     const session = await openHardwareSession();
     try {
+      if (session.armHid !== true) {
+        throw new Error(`device ${session.device} armHid is off; the hardware HID check is refused`);
+      }
       for (const delay of [0, 50]) {
         const result = await session.call('pikvm_type', { text: 'hw', delay });
         assert.notEqual(result.isError, true, result.content?.[0]?.text);

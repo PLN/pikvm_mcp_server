@@ -1,4 +1,5 @@
 // Modified 2026-10 by PLN: opt-in MSD hardware cycle (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: MSD also needs the device armMsd (GPL-3.0; see NOTICE).
 
 /**
  * MSD write cycle. Skipped unless PIKVM_HW_TEST_DEVICE is set, and
@@ -39,6 +40,9 @@ describe('MSD hardware cycle', { concurrency: false }, () => {
       const prepared = await prepareHwImage(dir, imageName);
       console.log(`hw: image ${imageName} (${prepared.bytes} bytes)`);
       session = await openHardwareSession({ msd: { localDir: dir } });
+      if (session.armMsd !== true) {
+        throw new Error(`device ${session.device} armMsd is off; the hardware MSD check is refused`);
+      }
       const outcome = await runMsdWriteCycle(session.call, {
         allow,
         imageName,

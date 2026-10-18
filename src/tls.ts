@@ -1,6 +1,7 @@
 // Modified 2026-10 by PLN: TLS verify, pin, and insecure modes (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: classify TLS from the socket, and trust a pinned leaf (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a reset after the certificate stays a transport error (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: one TLS spec per registry device (GPL-3.0; see NOTICE).
 // The pin options follow the design's undici check: ca is the pinned PEM,
 // rejectUnauthorized stays true, and checkServerIdentity compares SPKI
 // sha256. This file is written fresh.
@@ -18,9 +19,7 @@
  * the result is a pin mismatch. insecure leaves certificate checks off.
  *
  * A pin or verify failure is terminal. Nothing retries it as insecure.
- *
- * TODO(registry): Phase B item 10 copies this per device. The only key
- * today is "default".
+ * The registry builds one of these specs per device. `device` is that name.
  */
 
 import crypto from 'node:crypto';

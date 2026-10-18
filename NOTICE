@@ -23,6 +23,7 @@ Modified 2026-10 by PLN: TLS verify, pin, and insecure modes (GPL-3.0; see below
 Modified 2026-10 by PLN: TLS failures follow the socket, and a pinned leaf may be CA-signed (GPL-3.0; see below).
 Modified 2026-10 by PLN: kvmd redirects are not followed (GPL-3.0; see below).
 Modified 2026-10 by PLN: a reset after the certificate stays unreachable (GPL-3.0; see below).
+Modified 2026-10 by PLN: device registry (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -576,3 +577,26 @@ No code from another pikvm_mcp_server fork was added for these methods.
   neither, stays on the transport path and follows the usual unreachable
   retry rules. verify mode does not set allowPartialTrustChain. No code
   from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  PIKVM_DEVICES_FILE or PIKVM_DEVICES names a fleet. The file is read
+  with the same non-blocking regular-file open and 64 KiB cap as a
+  secret, and it is not a secret, so the mode is not warned. Setting
+  both is a startup error. With neither set, PIKVM_HOST and the legacy
+  password and TLS variables are still device default and the tool
+  results are unchanged. If PIKVM_HOST is also set, it is ignored and
+  one stderr line says so. The two sources are not merged.
+  Hosts are normalised to an http(s) origin. That idea is
+  dtrukr/pikvm_mcp_server normalizeHost at 097b529 (GPL-3.0, a fork of
+  KultivatorConsulting/pikvm_mcp_server). The function here is written
+  fresh. There is no IP-range restriction. A password key is rejected.
+  passwordFile uses the secret-file reader. passwordCredential is one
+  path segment under CREDENTIALS_DIRECTORY. Each device has its own
+  client, busy lock, MSD jobs, calibration, and arm flags. The
+  environment arm flags are a ceiling. Job ids stay random 16-byte hex
+  and a read must name the device that created the job. pikvm_devices
+  lists names, origins, TLS mode, and arm state, and does not return
+  passwords or secret paths. pikvm-mcp-server pin accepts a registry
+  name. The hardware suite accepts a registry device only when hwTest
+  is true, and HID or MSD still need the allow flag plus that device's
+  arm. No code from another pikvm_mcp_server fork was copied.

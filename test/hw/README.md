@@ -4,12 +4,13 @@
 <!-- Modified 2026-10 by PLN: restore leftover images and reject fetch bad ports (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: empty secret vars are unset (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: TLS mode check (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: registry hwTest gate (GPL-3.0; see NOTICE) -->
 
 # Hardware suite
 
 Opt-in checks against one PiKVM. `npm test` does not run them, and CI does not call `npm run test:hw`. With `PIKVM_HW_TEST_DEVICE` unset, every test skips and the process does not open a socket.
 
-The device registry is not built yet. The only accepted name is `default`, which is the legacy `PIKVM_HOST` / `PIKVM_USERNAME` / `PIKVM_PASSWORD` device (`resolveDevice`). Any other name fails before a connection, with a message that names Phase B item 10.
+With no registry, the only accepted name is `default`, the legacy `PIKVM_HOST` / `PIKVM_USERNAME` / `PIKVM_PASSWORD` device. Any other name fails before a connection. With `PIKVM_DEVICES_FILE` or `PIKVM_DEVICES` set, `PIKVM_HW_TEST_DEVICE` must name a device in that registry and that device must set `hwTest` true. Otherwise the suite refuses before a connection. HID still needs `PIKVM_HW_TEST_ALLOW_HID=1` and that device's `armHid` (the process ceiling and the device flag). MSD still needs `PIKVM_HW_TEST_ALLOW_MSD` of `1` or `force` and that device's `armMsd`. A device flag cannot arm a ceiling that is off.
 
 ## Prerequisites
 
@@ -36,6 +37,17 @@ export PIKVM_VERIFY_SSL=false
 export PIKVM_HW_TEST_DEVICE=default
 npm run test:hw
 ```
+
+Registry mode uses the device named by `PIKVM_HW_TEST_DEVICE` instead of `PIKVM_HOST`. That device must set `hwTest` true. HID also needs that device's `armHid`, and MSD needs its `armMsd`, on top of the allow flags and the process arm ceiling.
+
+```bash
+export PIKVM_DEVICES_FILE=/etc/pikvm-mcp/devices.json
+export PIKVM_HW_TEST_DEVICE=lab2
+export PIKVM_MCP_ARM_HID=1
+export PIKVM_HW_TEST_ALLOW_HID=1
+```
+
+`lab2` in the registry example is `https://pikvm.example.ts.net` with `hwTest` true. A device without `hwTest` true is refused before a connection.
 
 The password is `loadConfig()`'s `resolveSecret` result, the same helper the server uses. A non-empty `PIKVM_PASSWORD` wins and is used verbatim. An empty `PIKVM_PASSWORD` or `PIKVM_PASSWORD_FILE` is unset. Otherwise `PIKVM_PASSWORD_FILE` is a regular file (one trailing newline removed). Otherwise, when `CREDENTIALS_DIRECTORY` is set, `$CREDENTIALS_DIRECTORY/pikvm-password` is the systemd `LoadCredential` file. A missing credential file leaves the password unset. A missing `PIKVM_PASSWORD_FILE` is an error that names that variable and the path. The value is not logged.
 

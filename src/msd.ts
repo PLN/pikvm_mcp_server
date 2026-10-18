@@ -7,6 +7,7 @@
 // Modified 2026-10 by PLN: redactUrl on MSD errors (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: close the upload file handle once (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: fh.close waits for the in-flight read (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: job reads stay on the device that created them (GPL-3.0; see NOTICE).
 
 /**
  * Policy for MSD status, mount, eject, upload, and remove.
@@ -47,8 +48,9 @@ export interface ResolvedDevice {
 }
 
 /**
- * Until the fleet registry exists, every MSD tool uses the one device.
- * `device` is accepted and ignored so later wiring stays mechanical.
+ * Single-client helper. The server resolves a fleet device instead.
+ * The hardware skip test still checks that `{ device: 'default' }`
+ * returns this client unchanged.
  */
 export function resolveDevice(
   _args: { device?: unknown },
@@ -507,12 +509,18 @@ function pruneJobs(limit: number, ttlMs: number): void {
 export interface JobReadOptions {
   jobLimit?: number;
   jobTtlMs?: number;
+  /**
+   * When set, a job stored for another device is not found.
+   * The id stays a random 16-byte hex value. The miss matches an unknown id.
+   */
+  device?: string;
 }
 
 export function readMsdJob(jobId: string, options: JobReadOptions = {}): MsdJobView | undefined {
   pruneJobs(jobLimitOf(options.jobLimit), jobTtlOf(options.jobTtlMs));
   const job = jobs.get(jobId);
   if (!job) return undefined;
+  if (options.device !== undefined && job.device !== options.device) return undefined;
   const view: MsdJobView = {
     state: job.state,
     bytes: job.bytes,

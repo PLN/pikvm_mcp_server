@@ -10,6 +10,7 @@
 // Modified 2026-10 by PLN: empty secret vars are unset (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: bearer whitespace is HTTP-only (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: TLS verify, pin, and insecure modes (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: device registry (GPL-3.0; see NOTICE).
 // Env read adapted from dtrukr/pikvm_mcp_server src/config.ts @ d120243 (GPL-3.0).
 
 /**
@@ -31,6 +32,7 @@ import {
   parseRequestTimeoutMs,
 } from './request-timeout.js';
 import { resolveSecret } from './secrets.js';
+import { loadDeviceRegistry, type DeviceRegistry } from './registry.js';
 import {
   readPinnedCert,
   type DeviceTls,
@@ -150,8 +152,8 @@ export interface Config {
     password: string;
     verifySsl: boolean;
     /**
-     * Per-device TLS. Only "default" is filled in until the registry.
-     * TODO(registry): Phase B item 10 copies this map per device name.
+     * TLS for the default device. Each registry device has its own
+     * client, built with that device's tls as this field.
      */
     tls: { default: DeviceTls };
     defaultKeymap: string;
@@ -170,6 +172,11 @@ export interface Config {
   msd: MsdConfig;
   /** Present only when PIKVM_MCP_PORT is set (HTTP mode). */
   http?: HttpConfig;
+  /**
+   * Set only when PIKVM_DEVICES_FILE or PIKVM_DEVICES is set.
+   * Absent on the legacy single-device path.
+   */
+  registry?: DeviceRegistry;
 }
 
 /**
@@ -227,18 +234,17 @@ function resolveDefaultTls(host: string): DeviceTls {
   };
 }
 
-export function loadConfig(): Config {
-  const host = process.env.PIKVM_HOST;
-  if (!host) {
-    throw new Error('PIKVM_HOST environment variable is required');
-  }
+interface RuntimeConfig {
+  requestTimeoutMs: number;
+  msdJobTimeoutMs: number;
+  msdIdleTimeoutMs: number;
+  defaultKeymap: string;
+  calibration: Config['calibration'];
+  msd: MsdConfig;
+  http?: HttpConfig;
+}
 
-  const password = resolveSecret({
-    name: 'PIKVM_PASSWORD',
-    credName: 'pikvm-password',
-    required: true,
-  });
-
+function readRuntimeConfig(): RuntimeConfig {
   const requestTimeoutMs = parseRequestTimeoutMs(process.env.PIKVM_REQUEST_TIMEOUT_MS);
   const msdJobTimeoutMs = parseMsdTimeoutMs(
     process.env.PIKVM_MSD_JOB_TIMEOUT_MS,
@@ -271,19 +277,11 @@ export function loadConfig(): Config {
     };
   }
 
-  const deviceTls = resolveDefaultTls(host);
   return {
-    pikvm: {
-      host,
-      username: process.env.PIKVM_USERNAME || 'admin',
-      password,
-      verifySsl: deviceTls.mode === 'verify',
-      tls: { default: deviceTls },
-      defaultKeymap: process.env.PIKVM_DEFAULT_KEYMAP || 'en-us',
-      requestTimeoutMs,
-      msdJobTimeoutMs,
-      msdIdleTimeoutMs,
-    },
+    requestTimeoutMs,
+    msdJobTimeoutMs,
+    msdIdleTimeoutMs,
+    defaultKeymap: process.env.PIKVM_DEFAULT_KEYMAP || 'en-us',
     calibration: {
       rounds: parseInt(process.env.PIKVM_CALIBRATION_ROUNDS || '5', 10),
       verifyRounds: parseInt(process.env.PIKVM_CALIBRATION_VERIFY_ROUNDS || '5', 10),
@@ -301,17 +299,95 @@ export function loadConfig(): Config {
   };
 }
 
-/** A copy safe to log. Password and bearer are replaced. The values are not copied into the result. */
+function pikvmFrom(host: string, username: string, password: string, deviceTls: DeviceTls, runtime: RuntimeConfig): Config['pikvm'] {
+  return {
+    host,
+    username,
+    password,
+    verifySsl: deviceTls.mode === 'verify',
+    tls: { default: deviceTls },
+    defaultKeymap: runtime.defaultKeymap,
+    requestTimeoutMs: runtime.requestTimeoutMs,
+    msdJobTimeoutMs: runtime.msdJobTimeoutMs,
+    msdIdleTimeoutMs: runtime.msdIdleTimeoutMs,
+  };
+}
+
+/** Legacy PIKVM_HOST path. Unchanged when no registry is set. */
+function loadLegacyConfig(): Config {
+  const host = process.env.PIKVM_HOST;
+  if (!host) {
+    throw new Error('PIKVM_HOST environment variable is required');
+  }
+
+  const password = resolveSecret({
+    name: 'PIKVM_PASSWORD',
+    credName: 'pikvm-password',
+    required: true,
+  });
+
+  const runtime = readRuntimeConfig();
+  const deviceTls = resolveDefaultTls(host);
+  return {
+    pikvm: pikvmFrom(host, process.env.PIKVM_USERNAME || 'admin', password, deviceTls, runtime),
+    calibration: runtime.calibration,
+    msd: runtime.msd,
+    http: runtime.http,
+  };
+}
+
+function loadConfigFromRegistry(registry: DeviceRegistry): Config {
+  const runtime = readRuntimeConfig();
+  const device = registry.devices.get(registry.defaultName);
+  if (!device) {
+    throw new Error(`registry default ${JSON.stringify(registry.defaultName)} is not a device`);
+  }
+  return {
+    pikvm: pikvmFrom(device.host, device.username, device.password, device.tls, runtime),
+    calibration: runtime.calibration,
+    msd: runtime.msd,
+    http: runtime.http,
+    registry,
+  };
+}
+
+export function loadConfig(): Config {
+  const registry = loadDeviceRegistry();
+  if (registry) {
+    if (process.env.PIKVM_HOST !== undefined && process.env.PIKVM_HOST !== '') {
+      console.error('PIKVM_HOST was ignored because the device registry is set');
+    }
+    return loadConfigFromRegistry(registry);
+  }
+  return loadLegacyConfig();
+}
+
+/** A copy safe to log. Passwords, bearer, and pinned PEMs are replaced. */
 export function redactConfig(config: Config): Config {
   const copy: Config = {
     ...config,
-    pikvm: { ...config.pikvm, password: '[REDACTED]' },
+    pikvm: {
+      ...config.pikvm,
+      password: '[REDACTED]',
+      tls: { default: { ...config.pikvm.tls.default, certPem: undefined } },
+    },
   };
   if (config.http) {
     copy.http = {
       ...config.http,
       bearerToken: config.http.bearerToken === undefined ? undefined : '[REDACTED]',
     };
+  }
+  if (config.registry) {
+    const devices = new Map(config.registry.devices);
+    for (const [name, device] of config.registry.devices) {
+      devices.set(name, {
+        ...device,
+        password: '[REDACTED]',
+        tls: { ...device.tls, certPem: undefined },
+      });
+    }
+    copy.registry = { defaultName: config.registry.defaultName, devices };
   }
   return copy;
 }

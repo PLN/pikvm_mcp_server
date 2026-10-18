@@ -1,9 +1,13 @@
 // Modified 2026-10 by PLN: pikvm-mcp-server pin (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a corrupt pin file does not stop a re-pin (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: pin a registry device (GPL-3.0; see NOTICE).
 
 /**
  * `pikvm-mcp-server pin <device>` prints the leaf certificate and, after
- * confirmation, writes it. Only "default" exists until the device registry.
+ * confirmation, writes it. With no registry, only "default" exists.
+ * A registry name uses that device's host and writes tls.certFile, or
+ * --out. The registry is loaded so password files are resolved, and
+ * this command still sends no credential.
  *
  * The probe is one TLS handshake with verification disabled for that
  * socket only. It sends no HTTP request and no credential. A pin failure
@@ -20,6 +24,7 @@
  */
 
 import { existsSync } from 'node:fs';
+import { loadDeviceRegistry } from './registry.js';
 import {
   probeLeafCertificate,
   readPinnedCert,
@@ -74,16 +79,32 @@ export async function pinCommand(args: string[]): Promise<void> {
   if (device === undefined) {
     throw new Error('usage: pikvm-mcp-server pin <device> [--yes] [--out path]');
   }
-  if (device !== 'default') {
-    throw new Error('only device "default" is supported until the registry (Phase B item 10)');
+  const registry = loadDeviceRegistry(process.env, { requirePinnedCert: false });
+  let host: string;
+  let dest: string | undefined;
+  if (!registry) {
+    if (device !== 'default') {
+      throw new Error('only device "default" is supported until the registry (Phase B item 10)');
+    }
+    dest = out ?? (process.env.PIKVM_TLS_CERT_FILE || undefined);
+    if (!dest) {
+      throw new Error('set PIKVM_TLS_CERT_FILE or pass --out');
+    }
+    const legacyHost = process.env.PIKVM_HOST;
+    if (!legacyHost) throw new Error('PIKVM_HOST environment variable is required');
+    host = legacyHost;
+  } else {
+    const target = registry.devices.get(device);
+    if (!target) {
+      const known = [...registry.devices.keys()].sort().join(', ');
+      throw new Error(`unknown device ${JSON.stringify(device)}. Known devices: ${known}`);
+    }
+    host = target.host;
+    dest = out ?? target.tls.certFile;
+    if (!dest) {
+      throw new Error(`device ${device}: set tls.certFile or pass --out`);
+    }
   }
-
-  const dest = out ?? (process.env.PIKVM_TLS_CERT_FILE || undefined);
-  if (!dest) {
-    throw new Error('set PIKVM_TLS_CERT_FILE or pass --out');
-  }
-  const host = process.env.PIKVM_HOST;
-  if (!host) throw new Error('PIKVM_HOST environment variable is required');
 
   const cert = await probeLeafCertificate(host);
   printCertificate(cert);
