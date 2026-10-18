@@ -37,7 +37,7 @@ describe('MSD hardware cycle', { concurrency: false }, () => {
     let session;
     try {
       const prepared = await prepareHwImage(dir, imageName);
-      console.log(`hw: image ${imageName} via ${prepared.generator} (${prepared.bytes} bytes)`);
+      console.log(`hw: image ${imageName} (${prepared.bytes} bytes)`);
       session = await openHardwareSession({ msd: { localDir: dir } });
       const outcome = await runMsdWriteCycle(session.call, {
         allow,
@@ -45,6 +45,7 @@ describe('MSD hardware cycle', { concurrency: false }, () => {
         fetchUrl: fetchUrl || undefined,
         fetchImageName,
         allowlist: session.config.msd.urlAllow,
+        client: session.pikvm,
       });
       if (outcome.skipped) {
         t.skip(outcome.reason);

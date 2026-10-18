@@ -1,11 +1,12 @@
 // Modified 2026-10 by PLN: hardware suite MSD cycle and cleanup (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: cleanup deletes only this run's image names (GPL-3.0; see NOTICE).
 
 /**
  * Upload, mount, eject, and remove one mcp-hwtest image through the tools.
  * The finally block disconnects a drive this cycle connected, removes
- * every storage name that starts with mcp-hwtest-, and remounts the
- * snapshot image when that image was connected. Names that do not have
- * that prefix are left alone. A forced failure still runs the finally block.
+ * only the image names this run created, and restores the snapshot.
+ * Any other mcp-hwtest-* name is logged and left in place. A forced
+ * failure still runs the finally block.
  */
 
 import { inspectFetchUrl } from '../../dist/url-policy.js';
@@ -55,7 +56,7 @@ async function pollJob(call, jobId, timeoutMs) {
   }
 }
 
-async function cleanup(call, snap, log) {
+async function cleanup(call, snap, created, client, log) {
   const errors = [];
   const note = (err) => {
     errors.push(err instanceof Error ? err : new Error(String(err)));
@@ -82,7 +83,7 @@ async function cleanup(call, snap, log) {
   }
   const names = Object.keys(status?.images ?? {});
   for (const name of names) {
-    if (!isHwTestImageName(name)) continue;
+    if (!created.has(name)) continue;
     try {
       await callJson(call, 'pikvm_msd_remove', { image: name, confirmImage: name });
       log(`hw: cleanup removed ${name}`);
@@ -90,13 +91,15 @@ async function cleanup(call, snap, log) {
       note(err);
     }
   }
+  const mode = snap.cdrom ? 'cdrom' : 'flash';
+  const rw = snap.cdrom ? false : snap.rw;
   if (snap.image && !isHwTestImageName(snap.image)) {
     try {
       await callJson(call, 'pikvm_msd_mount', {
         image: snap.image,
         confirmImage: snap.image,
-        mode: snap.cdrom ? 'cdrom' : 'flash',
-        rw: snap.cdrom ? false : snap.rw,
+        mode,
+        rw,
         connect: snap.connected,
       });
       log(
@@ -106,6 +109,17 @@ async function cleanup(call, snap, log) {
     } catch (err) {
       note(err);
     }
+  } else if (!snap.image) {
+    if (!client) {
+      note(new Error('cleanup has no client to restore cdrom and rw'));
+    } else {
+      try {
+        await client.msdSetParams({ cdrom: snap.cdrom, rw });
+        log(`hw: cleanup restored cdrom=${snap.cdrom} rw=${snap.rw}`);
+      } catch (err) {
+        note(err);
+      }
+    }
   }
   let finalStatus;
   try {
@@ -113,7 +127,9 @@ async function cleanup(call, snap, log) {
   } catch (err) {
     note(err);
   }
-  const leftovers = Object.keys(finalStatus?.images ?? {}).filter(isHwTestImageName);
+  const leftovers = Object.keys(finalStatus?.images ?? {}).filter(
+    (name) => isHwTestImageName(name) && !created.has(name),
+  );
   if (leftovers.length === 0) log('hw: no mcp-hwtest images left');
   else log(`hw: leftover mcp-hwtest images: ${leftovers.join(', ')}`);
   for (const err of errors) log(`hw: cleanup error: ${err.message}`);
@@ -143,6 +159,9 @@ export async function runMsdWriteCycle(call, options) {
         + 'PIKVM_HW_TEST_ALLOW_MSD=force overrides this and is dangerous',
     };
   }
+  const created = new Set();
+  if (options.imageName) created.add(options.imageName);
+  if (options.fetchImageName) created.add(options.fetchImageName);
   let failure;
   let cleaned;
   try {
@@ -161,8 +180,11 @@ export async function runMsdWriteCycle(call, options) {
       mode: 'cdrom',
       rw: false,
       connect: true,
-      expectImage: snap.image,
     };
+    // Only the force path, which already disconnected, names the previous
+    // image. Omitting expectImage makes a drive connected after the
+    // snapshot a refusal instead of a disconnect.
+    if (snap.connected) cdrom.expectImage = snap.image;
     await callJson(call, 'pikvm_msd_mount', cdrom);
     if (options.failAfter === 'mount-cdrom') {
       throw new Error('forced failure');
@@ -208,7 +230,7 @@ export async function runMsdWriteCycle(call, options) {
   } catch (err) {
     failure = err instanceof Error ? err : new Error(String(err));
   } finally {
-    cleaned = await cleanup(call, snap, log);
+    cleaned = await cleanup(call, snap, created, options.client, log);
   }
   if (cleaned.errors.length > 0) {
     const summary = cleaned.errors.map((err) => err.message).join('; ');
