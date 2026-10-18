@@ -12,7 +12,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 import sharp from 'sharp';
 import { loadConfig } from '../dist/config.js';
-import { buildFleet, closeFleet } from '../dist/devices.js';
+import { buildFleet, closeFleet, startOcrProbes } from '../dist/devices.js';
 import { BusyLock } from '../dist/pikvm/lock.js';
 import { PiKVMClient, pixelToNormalized } from '../dist/pikvm/client.js';
 import { createMcpServer } from '../dist/server.js';
@@ -37,6 +37,7 @@ const ENV_KEYS = [
   'PIKVM_SCREENSHOT_MAX_WIDTH',
   'PIKVM_SCREENSHOT_MAX_HEIGHT',
   'PIKVM_SCREENSHOT_QUALITY',
+  'PIKVM_OCR_TIMEOUT_MS',
   'CREDENTIALS_DIRECTORY',
 ];
 
@@ -862,6 +863,279 @@ test('screenshot, auto_calibrate, then click keeps the preview frame', { timeout
       assert.equal(echo.scaleX, 2);
       assert.deepEqual(moveTarget(hidMoves(mock).at(-1)), { x: 17, y: 30 });
       assert.notDeepEqual(moveTarget(hidMoves(mock).at(-1)), { x: -16376, y: -16369 });
+    } finally {
+      await session.close();
+    }
+  } finally {
+    await mock.close();
+  }
+});
+
+function ocrGets(mock) {
+  return mock.calls.filter((call) => call.path === '/api/streamer/ocr');
+}
+
+function ocrSnapshots(mock) {
+  return mock.calls.filter((call) => call.path === '/api/streamer/snapshot' && call.query.includes('ocr=1'));
+}
+
+test('a slow OCR snapshot is one kvmd request', async () => {
+  const mock = await startKvmdMock({
+    ocr: { enabled: true, langs: ['eng'] },
+    ocrDelayMs: 800,
+  });
+  const client = new PiKVMClient({
+    host: mock.url,
+    username: 'admin',
+    password: 'testpw',
+    verifySsl: false,
+    ocrTimeoutMs: 200,
+  });
+  try {
+    await client.probeOcr('lab1');
+    assert.equal(client.ocrState().status, 'enabled');
+    const started = Date.now();
+    await assert.rejects(() => client.readText(), (err) => {
+      assert.equal(err.type, 'PIKVM_TIMEOUT');
+      return true;
+    });
+    assert.equal(ocrSnapshots(mock).length, 1);
+    assert.ok(Date.now() - started < 1000, 'a timeout must not be retried');
+  } finally {
+    await client.close();
+    await mock.close();
+  }
+});
+
+test('an OCR probe does not retry, and unknown is probed again', async () => {
+  const mock = await startKvmdMock({
+    routes: {
+      'GET /api/streamer/ocr': {
+        status: 503,
+        failTimes: 1,
+        then: {
+          status: 200,
+          body: {
+            ok: true,
+            result: { ocr: { enabled: true, langs: { available: ['eng'], default: ['eng'] } } },
+          },
+        },
+      },
+    },
+  });
+  const client = new PiKVMClient({
+    host: mock.url,
+    username: 'admin',
+    password: 'testpw',
+    verifySsl: false,
+  });
+  try {
+    const first = await client.probeOcr('lab1');
+    assert.equal(first.status, 'unknown');
+    assert.equal(ocrGets(mock).length, 1);
+    const second = await client.probeOcr('lab1');
+    assert.equal(second.status, 'enabled');
+    assert.equal(ocrGets(mock).length, 2);
+    const third = await client.probeOcr('lab1');
+    assert.equal(third.status, 'enabled');
+    assert.equal(ocrGets(mock).length, 2);
+  } finally {
+    await client.close();
+    await mock.close();
+  }
+});
+
+test('OCR probes run together, and a disabled answer is cached', async () => {
+  const slow = await startKvmdMock({
+    routes: {
+      'GET /api/streamer/ocr': {
+        status: 200,
+        delayMs: 400,
+        body: {
+          ok: true,
+          result: { ocr: { enabled: true, langs: { available: ['eng'], default: ['eng'] } } },
+        },
+      },
+    },
+  });
+  const fast = await startKvmdMock({ ocr: { enabled: false, langs: [] } });
+  const dir = mkdtempSync(join(tmpdir(), 'pikvm-ocr-probe-'));
+  try {
+    const left = new PiKVMClient({
+      host: slow.url,
+      username: 'admin',
+      password: 'testpw',
+      verifySsl: false,
+    });
+    const right = new PiKVMClient({
+      host: fast.url,
+      username: 'admin',
+      password: 'testpw',
+      verifySsl: false,
+    });
+    try {
+      const started = Date.now();
+      startOcrProbes([
+        { name: 'slow', client: left },
+        { name: 'fast', client: right },
+      ]);
+      await waitUntil(
+        () => ocrGets(slow).length > 0 && ocrGets(fast).length > 0,
+        250,
+      );
+      assert.ok(Date.now() - started < 250);
+      await waitUntil(() => left.ocrState().status === 'enabled' && right.ocrState().status === 'disabled');
+    } finally {
+      await left.close();
+      await right.close();
+    }
+
+    const passwordFile = join(dir, 'pw');
+    writeFileSync(passwordFile, 'testpw\n', { mode: 0o600 });
+    const config = withEnv({
+      PIKVM_DEVICES: JSON.stringify({
+        default: 'lab1',
+        devices: {
+          lab1: {
+            host: fast.url,
+            username: 'admin',
+            passwordFile,
+            tls: { mode: 'insecure' },
+          },
+          lab2: {
+            host: slow.url,
+            username: 'admin',
+            passwordFile,
+            tls: { mode: 'insecure' },
+          },
+        },
+      }),
+    }, () => loadConfig());
+    const fleet = buildFleet(config, { hid: true, msd: true });
+    const srv = await listen(() => createMcpServer({
+      pikvm: fleet.devices.get('lab1').client,
+      lock: fleet.devices.get('lab1').lock,
+      fleet,
+      calibrationConfig,
+      armGateEnforced: false,
+    }));
+    try {
+      const sessionId = await openSession(srv.base);
+      const listed = await rpc(srv.base, sessionId, 'tools/list', {});
+      assert.equal(listed.result.tools.some((tool) => tool.name === 'pikvm_read_text'), true);
+      fast.calls.length = 0;
+      const blocked = await rpc(srv.base, sessionId, 'tools/call', {
+        name: 'pikvm_read_text',
+        arguments: { device: 'lab1' },
+      });
+      assert.equal(blocked.result.isError, true);
+      assert.match(blocked.result.content[0].text, /PIKVM_OCR_UNAVAILABLE/);
+      assert.equal(ocrSnapshots(fast).length, 0);
+      assert.equal(ocrGets(fast).length, 1);
+      fast.calls.length = 0;
+      const again = await rpc(srv.base, sessionId, 'tools/call', {
+        name: 'pikvm_read_text',
+        arguments: { device: 'lab1' },
+      });
+      assert.match(again.result.content[0].text, /PIKVM_OCR_UNAVAILABLE/);
+      assert.equal(ocrGets(fast).length, 0);
+      assert.equal(ocrSnapshots(fast).length, 0);
+    } finally {
+      await srv.close();
+      await closeFleet(fleet);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    await slow.close();
+    await fast.close();
+  }
+});
+
+test('an OCR box is preview pixels, and text is capped', async () => {
+  const big = 'a'.repeat(70 * 1024);
+  const mock = await startKvmdMock({
+    ocr: { enabled: true, langs: ['eng'] },
+    ocrText: big,
+  });
+  try {
+    assert.throws(
+      () => withEnv({
+        PIKVM_HOST: 'http://127.0.0.1:9',
+        PIKVM_PASSWORD: 'testpw',
+        PIKVM_TLS_MODE: 'insecure',
+        PIKVM_OCR_TIMEOUT_MS: '0',
+      }, () => loadConfig()),
+      /PIKVM_OCR_TIMEOUT_MS/,
+    );
+    assert.equal(withEnv({
+      PIKVM_HOST: 'http://127.0.0.1:9',
+      PIKVM_PASSWORD: 'testpw',
+      PIKVM_TLS_MODE: 'insecure',
+    }, () => loadConfig()).pikvm.ocrTimeoutMs, 30000);
+
+    const session = await startLegacy(mock);
+    try {
+      await session.pikvm.probeOcr('default');
+      const plain = await rpc(session.srv.base, session.sessionId, 'tools/call', {
+        name: 'pikvm_read_text',
+        arguments: { langs: 'eng', left: 1, top: 2, right: 3, bottom: 4 },
+      });
+      assert.match(plain.result.content[0].text, /\[truncated\]/);
+      assert.ok(Buffer.byteLength(plain.result.content[0].text) <= 64 * 1024);
+      assert.equal(
+        ocrSnapshots(mock).at(-1).query,
+        '?ocr=1&ocr_langs=eng&ocr_left=1&ocr_top=2&ocr_right=3&ocr_bottom=4',
+      );
+
+      const shot = await rpc(session.srv.base, session.sessionId, 'tools/call', {
+        name: 'pikvm_screenshot',
+        arguments: {},
+      });
+      const frameId = metadataOf(shot.result).frameId;
+      mock.calls.length = 0;
+      const scaled = await rpc(session.srv.base, session.sessionId, 'tools/call', {
+        name: 'pikvm_read_text',
+        arguments: { langs: 'eng', left: 1, top: 2, right: 3, bottom: 4 },
+      });
+      assert.notEqual(scaled.result.isError, true, scaled.result.content[0].text);
+      assert.equal(
+        ocrSnapshots(mock).at(-1).query,
+        '?ocr=1&ocr_langs=eng&ocr_left=2&ocr_top=4&ocr_right=6&ocr_bottom=8',
+      );
+
+      const cropped = await rpc(session.srv.base, session.sessionId, 'tools/call', {
+        name: 'pikvm_screenshot',
+        arguments: { region: { x: 10, y: 20, width: 100, height: 80 } },
+      });
+      const cropId = metadataOf(cropped.result).frameId;
+      mock.calls.length = 0;
+      const inCrop = await rpc(session.srv.base, session.sessionId, 'tools/call', {
+        name: 'pikvm_read_text',
+        arguments: { langs: 'eng', left: 1, top: 2, right: 3, bottom: 4, frameId: cropId },
+      });
+      assert.notEqual(inCrop.result.isError, true, inCrop.result.content[0].text);
+      assert.equal(
+        ocrSnapshots(mock).at(-1).query,
+        '?ocr=1&ocr_langs=eng&ocr_left=22&ocr_top=44&ocr_right=26&ocr_bottom=48',
+      );
+
+      mock.calls.length = 0;
+      const outside = await rpc(session.srv.base, session.sessionId, 'tools/call', {
+        name: 'pikvm_read_text',
+        arguments: { langs: 'eng', left: 0, top: 0, right: 1000, bottom: 10, frameId },
+      });
+      assert.equal(outside.result.isError, true);
+      assert.match(outside.result.content[0].text, /outside the frame/);
+      assert.equal(ocrSnapshots(mock).length, 0);
+
+      mock.calls.length = 0;
+      const missing = await rpc(session.srv.base, session.sessionId, 'tools/call', {
+        name: 'pikvm_read_text',
+        arguments: { frameId: '00000000-0000-4000-8000-000000000000' },
+      });
+      assert.equal(missing.result.isError, true);
+      assert.match(missing.result.content[0].text, /PIKVM_UNKNOWN_FRAME/);
+      assert.equal(ocrSnapshots(mock).length, 0);
     } finally {
       await session.close();
     }

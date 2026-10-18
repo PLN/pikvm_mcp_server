@@ -677,6 +677,8 @@ export async function startKvmdMock(options = {}) {
     if (req.method === 'GET' && u.pathname === '/api/streamer/snapshot') {
       const ocr = u.searchParams.get('ocr');
       if (ocr === '1' || ocr === 'true') {
+        if (options.ocrDelayMs) await waitOrClose(req, options.ocrDelayMs);
+        if (req.destroyed || res.writableEnded || res.destroyed) return;
         if (typeof options.ocrError === 'string') {
           res.writeHead(500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({

@@ -13,6 +13,7 @@
 // Modified 2026-10 by PLN: redactUrl on kvmd error text (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: screenshot preview, crop, and OCR (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: click frames stay on the full preview (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: OCR is not retried after it is sent (GPL-3.0; see NOTICE).
 // AbortSignal.timeout and PIKVM_UNREACHABLE / PIKVM_AUTH_FAILED no-retry codes
 // adapted from dtrukr/pikvm_mcp_server src/pikvm/client.ts @ d120243 (GPL-3.0).
 // Snapshot HTTP 503 retry-once adapted from dvaerum/pikvm_mcp_server
@@ -84,7 +85,11 @@ import { capKvmdField, redactSecrets } from '../redact.js';
 import { redactError, redactUrl } from '../url-policy.js';
 import {
   assertRegionInside,
+  capOcrText,
   OCR_PROBE_TIMEOUT_MS,
+  OCR_TIMEOUT_DEFAULT_MS,
+  OCR_TIMEOUT_MAX_MS,
+  ocrBoxToSource,
   parseOcrState,
   UnknownFrameError,
   type OcrBox,
@@ -123,6 +128,8 @@ export interface PiKVMConfig {
    * Default 60 seconds. The wait for response headers uses the job ceiling.
    */
   msdIdleTimeoutMs?: number;
+  /** One OCR snapshot. Default 30000. A timeout is not retried. */
+  ocrTimeoutMs?: number;
 }
 
 export interface TypeOptions {
@@ -267,12 +274,19 @@ export class KvmdError extends Error {
   readonly type: string;
   readonly endpoint: string;
 
-  constructor(status: number, type: string, message: string, endpoint: string) {
+  /**
+   * True only when nothing was written. OCR may retry that case once.
+   * A timeout, an HTTP response, and any other failure leave this false.
+   */
+  readonly preSend: boolean;
+
+  constructor(status: number, type: string, message: string, endpoint: string, preSend = false) {
     super(message);
     this.name = 'KvmdError';
     this.status = status;
     this.type = type;
     this.endpoint = endpoint;
+    this.preSend = preSend;
   }
 }
 
@@ -478,7 +492,7 @@ function transportError(err: unknown, endpoint: string, hid: boolean, device = '
   // A connect timeout or DNS failure can sit under a TimeoutError.
   // Nothing was sent, so this stays unreachable rather than a timeout.
   if (isPreSendFailure(err)) {
-    return new KvmdError(0, 'PIKVM_UNREACHABLE', 'kvmd network error', endpoint);
+    return new KvmdError(0, 'PIKVM_UNREACHABLE', 'kvmd network error', endpoint, true);
   }
   if (isTimeoutError(err)) {
     if (hid) {
@@ -824,6 +838,7 @@ interface ResolvedPiKVMConfig extends PiKVMConfig {
   requestTimeoutMs: number;
   msdJobTimeoutMs: number;
   msdIdleTimeoutMs: number;
+  ocrTimeoutMs: number;
   tls: { default: DeviceTls };
 }
 
@@ -848,8 +863,12 @@ export class PiKVMClient {
       requestTimeoutMs: 5000,
       msdJobTimeoutMs: MSD_JOB_TIMEOUT_DEFAULT_MS,
       msdIdleTimeoutMs: MSD_IDLE_TIMEOUT_DEFAULT_MS,
+      ocrTimeoutMs: OCR_TIMEOUT_DEFAULT_MS,
       ...config,
     };
+    if (!Number.isInteger(base.ocrTimeoutMs) || base.ocrTimeoutMs < 1 || base.ocrTimeoutMs > OCR_TIMEOUT_MAX_MS) {
+      throw new Error(`PIKVM_OCR_TIMEOUT_MS must be an integer from 1 to ${OCR_TIMEOUT_MAX_MS}`);
+    }
     base.requestTimeoutMs = clampRequestTimeoutMs(base.requestTimeoutMs);
     base.msdJobTimeoutMs = normalizeMsdTimeoutMs(
       base.msdJobTimeoutMs,
@@ -1267,19 +1286,39 @@ export class PiKVMClient {
   }
 
   /**
-   * GET /streamer/ocr. A failure is unknown and is logged redacted.
-   * The probe uses this client's TLS mode and a short timeout.
+   * One OCR GET. A timeout is not retried. A response means the request
+   * was sent, so HTTP failures are not retried either. Only a pre-send
+   * PIKVM_UNREACHABLE is tried once more.
+   */
+  private async requestOcr<T>(path: string): Promise<T> {
+    try {
+      return await this.requestOnce<T>('GET', path, undefined, undefined, this.config.ocrTimeoutMs);
+    } catch (err) {
+      if (err instanceof KvmdError && err.preSend && err.type === 'PIKVM_UNREACHABLE') {
+        return this.requestOnce<T>('GET', path, undefined, undefined, this.config.ocrTimeoutMs);
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * GET /streamer/ocr. A definite enabled or disabled answer is cached.
+   * A failure stays unknown and is logged redacted. The probe uses this
+   * client's TLS mode, a short timeout, and no retry.
    */
   async probeOcr(deviceName = 'default'): Promise<OcrState> {
+    if (this.ocr.status === 'enabled' || this.ocr.status === 'disabled') return this.ocr;
     try {
-      const body = await this.request<unknown>(
+      const body = await this.requestOnce<unknown>(
         'GET',
         '/streamer/ocr',
         undefined,
         undefined,
         OCR_PROBE_TIMEOUT_MS,
       );
-      this.ocr = parseOcrState(body);
+      const parsed = parseOcrState(body);
+      if (parsed.status === 'enabled' || parsed.status === 'disabled') this.ocr = parsed;
+      else this.ocr = { status: 'unknown', langs: [] };
     } catch (err) {
       this.ocr = { status: 'unknown', langs: [] };
       const copied = redactError(err);
@@ -1289,25 +1328,36 @@ export class PiKVMClient {
   }
 
   /**
-   * OCR passthrough. kvmd returns text/plain. This does not send preview
-   * parameters. Callers check OCR state before calling.
+   * OCR passthrough. The box is in preview-frame pixels and is converted
+   * to full resolution with that frame's scale and origin. kvmd returns
+   * text/plain. This does not send preview parameters. A timeout is not
+   * retried. Callers check OCR state before calling.
    */
-  async readText(options?: { langs?: string[]; box?: OcrBox }): Promise<string> {
+  async readText(options?: { langs?: string[]; box?: OcrBox; frameId?: string }): Promise<string> {
+    const described = this.describeFrame(options?.frameId);
+    let box = options?.box;
+    if (box) {
+      const source = await this.getResolution(true);
+      box = ocrBoxToSource(box, described.frame, source);
+    }
     const params = new URLSearchParams();
     params.set('ocr', '1');
     if (options?.langs && options.langs.length > 0) params.set('ocr_langs', options.langs.join(','));
-    if (options?.box) {
-      params.set('ocr_left', String(options.box.left));
-      params.set('ocr_top', String(options.box.top));
-      params.set('ocr_right', String(options.box.right));
-      params.set('ocr_bottom', String(options.box.bottom));
+    if (box) {
+      params.set('ocr_left', String(box.left));
+      params.set('ocr_top', String(box.top));
+      params.set('ocr_right', String(box.right));
+      params.set('ocr_bottom', String(box.bottom));
     }
-    const body = await this.request<unknown>('GET', `/streamer/snapshot?${params}`);
-    if (typeof body === 'string') return body;
-    if (body !== null && typeof body === 'object' && typeof (body as { result?: unknown }).result === 'string') {
-      return (body as { result: string }).result;
+    const body = await this.requestOcr<unknown>(`/streamer/snapshot?${params}`);
+    let text: string;
+    if (typeof body === 'string') text = body;
+    else if (body !== null && typeof body === 'object' && typeof (body as { result?: unknown }).result === 'string') {
+      text = (body as { result: string }).result;
+    } else {
+      throw new Error('OCR response was not text');
     }
-    throw new Error('OCR response was not text');
+    return capOcrText(text);
   }
 
   /**

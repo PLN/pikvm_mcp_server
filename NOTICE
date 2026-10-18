@@ -31,6 +31,7 @@ Modified 2026-10 by PLN: redact a non-Error cause, and one host across schemes (
 Modified 2026-10 by PLN: a throwing getter and a deep cause stay redacted (GPL-3.0; see below).
 Modified 2026-10 by PLN: screenshot defaults, local crop, and optional OCR (GPL-3.0; see below).
 Modified 2026-10 by PLN: click frames stay on the full preview (GPL-3.0; see below).
+Modified 2026-10 by PLN: OCR is not retried after it is sent (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -681,3 +682,16 @@ No code from another pikvm_mcp_server fork was added for these methods.
   other-device id is PIKVM_UNKNOWN_FRAME and sends no HID event.
   The tool result echoes frameId or default, width, height, scale,
   and origin. No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  PIKVM_OCR_TIMEOUT_MS defaults to 30 seconds. An OCR snapshot is not
+  retried after a timeout or after the request was sent. A pre-send
+  unreachable error is retried once. The OCR probe runs in parallel
+  after listen, with no retry. A definite enabled or disabled answer
+  is cached. Unknown is probed again on pikvm_read_text. The tool
+  stays listed while any device is enabled or unknown, and a disabled
+  device returns PIKVM_OCR_UNAVAILABLE without fetching an image.
+  The OCR box is in preview-frame pixels and is converted to full
+  resolution with that frame's scale and origin. Returned text is
+  capped at 64 KiB and ends with [truncated] when it is cut.
+  No code from another pikvm_mcp_server fork was copied.

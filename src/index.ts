@@ -8,6 +8,7 @@
 // Modified 2026-10 by PLN: device registry (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: fatal errors go through redactUrl (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: probe OCR at startup (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: OCR probes start after listen (GPL-3.0; see NOTICE).
 /**
  * PiKVM MCP Server
  *
@@ -23,18 +24,12 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { PiKVMClient } from './pikvm/client.js';
 import { loadConfig, type Config } from './config.js';
 import { BusyLock } from './pikvm/lock.js';
-import { buildFleet } from './devices.js';
+import { buildFleet, startOcrProbes } from './devices.js';
 import { createMcpServer, type McpServerDeps } from './server.js';
 import { startHttpServer } from './http.js';
 import { pinCommand } from './pin.js';
 import { inspect } from 'node:util';
 import { redactUrl } from './url-policy.js';
-
-async function probeFleet(devices: Iterable<{ name: string; client: PiKVMClient }>): Promise<void> {
-  for (const device of devices) {
-    await device.client.probeOcr(device.name);
-  }
-}
 
 async function listen(config: Config, deps: McpServerDeps): Promise<void> {
   if (config.http) {
@@ -80,7 +75,6 @@ async function main() {
         console.error(`Warning: Could not authenticate with PiKVM device ${device.name}. Check credentials.`);
       }
     }
-    await probeFleet(fleet.devices.values());
     const fallback = fleet.devices.get(fleet.defaultName);
     if (!fallback) {
       throw new Error(`registry default ${JSON.stringify(fleet.defaultName)} is not a device`);
@@ -95,6 +89,7 @@ async function main() {
       msd: config.msd,
       screenshot: config.screenshot,
     });
+    startOcrProbes(fleet.devices.values());
     return;
   }
 
@@ -108,8 +103,6 @@ async function main() {
     console.error('Warning: Could not authenticate with PiKVM. Check credentials.');
   }
 
-  await pikvm.probeOcr('default');
-
   const armGateEnforced = config.http ? !config.http.armHid : false;
   const msdArmGateEnforced = config.http ? !config.http.armMsd : false;
   await listen(config, {
@@ -121,6 +114,7 @@ async function main() {
     msd: config.msd,
     screenshot: config.screenshot,
   });
+  startOcrProbes([{ name: 'default', client: pikvm }]);
 }
 
 const started = process.argv[2] === 'pin'

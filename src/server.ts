@@ -11,6 +11,7 @@
 // Modified 2026-10 by PLN: pikvm_devices lists an origin (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: screenshot metadata, crop, and optional OCR (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: click frames and frameId (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: OCR stays listed until a device says disabled (GPL-3.0; see NOTICE).
 
 /**
  * MCP server factory for PiKVM tools
@@ -478,7 +479,7 @@ const tools: Tool[] = [
   },
   {
     name: 'pikvm_read_text',
-    description: 'Read text from the PiKVM screen with kvmd OCR (GET /streamer/snapshot?ocr=1). Registered only when at least one device reports OCR enabled. Slow on small boards. langs must be a language that device reported. left, top, right, and bottom are an optional box in image pixels.',
+    description: 'Read text from the PiKVM screen with kvmd OCR (GET /streamer/snapshot?ocr=1). Listed while any device is enabled or not yet probed. A disabled device returns PIKVM_OCR_UNAVAILABLE and does not fetch an image. Slow on small boards. langs must be a language that device reported. left, top, right, and bottom are an optional box in preview-frame pixels (the default click frame, or frameId). They are converted to full resolution for kvmd. Text is capped at 64 KiB.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -486,10 +487,14 @@ const tools: Tool[] = [
           type: 'string',
           description: 'Comma-separated OCR languages, each one reported by the device. Omitted uses the kvmd default.',
         },
-        left: { type: 'number', description: 'Left edge of the OCR box in image pixels.' },
-        top: { type: 'number', description: 'Top edge of the OCR box in image pixels.' },
-        right: { type: 'number', description: 'Right edge of the OCR box in image pixels.' },
-        bottom: { type: 'number', description: 'Bottom edge of the OCR box in image pixels.' },
+        left: { type: 'number', description: 'Left edge of the OCR box in preview-frame pixels.' },
+        top: { type: 'number', description: 'Top edge of the OCR box in preview-frame pixels.' },
+        right: { type: 'number', description: 'Right edge of the OCR box in preview-frame pixels.' },
+        bottom: { type: 'number', description: 'Bottom edge of the OCR box in preview-frame pixels.' },
+        frameId: {
+          type: 'string',
+          description: 'Capture whose pixels the box is in. Omitted uses the default click frame. Unknown sends no OCR request.',
+        },
       },
     },
   },
@@ -962,7 +967,13 @@ export function createMcpServer(deps: McpServerDeps): Server {
       if (tool.name === 'pikvm_msd_upload' && !uploadReady) return false;
       if (tool.name === 'pikvm_msd_fetch_url' && !fetchReady) return false;
       if (tool.name === 'pikvm_read_text') {
-        return [...fleet.devices.values()].some((device) => device.client.ocrState().status === 'enabled');
+        // Probes run after listen, so startup sees unknown. Hide the tool
+        // only once every device has reported disabled. A call still
+        // returns PIKVM_OCR_UNAVAILABLE when that device is disabled.
+        return [...fleet.devices.values()].some((device) => {
+          const status = device.client.ocrState().status;
+          return status === 'enabled' || status === 'unknown';
+        });
       }
       return true;
     });
@@ -1068,7 +1079,10 @@ export function createMcpServer(deps: McpServerDeps): Server {
         }
 
         case 'pikvm_read_text': {
-          const ocr = deviceClient.ocrState();
+          let ocr = deviceClient.ocrState();
+          if (ocr.status === 'unknown') {
+            ocr = await deviceClient.probeOcr(active.name);
+          }
           if (ocr.status !== 'enabled') {
             throw new OcrUnavailableError(active.name);
           }
@@ -1079,7 +1093,8 @@ export function createMcpServer(deps: McpServerDeps): Server {
             right: args.right,
             bottom: args.bottom,
           });
-          const text = await deviceClient.readText({ langs, box });
+          const frameId = parseFrameId(args.frameId);
+          const text = await deviceClient.readText({ langs, box, frameId });
           return {
             content: [{ type: 'text', text }],
           };

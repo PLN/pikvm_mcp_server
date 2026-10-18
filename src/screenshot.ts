@@ -1,5 +1,6 @@
 // Modified 2026-10 by PLN: screenshot defaults, crop bounds, and OCR state (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: unknown click frame error (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: OCR timeout, frame box, and text cap (GPL-3.0; see NOTICE).
 
 /**
  * Preview defaults, crop checks, and OCR state for one device.
@@ -13,6 +14,12 @@ export const SCREENSHOT_DEFAULT_MAX_HEIGHT = 600;
 export const SCREENSHOT_DEFAULT_QUALITY = 70;
 export const SCREENSHOT_DIMENSION_MAX = 10000;
 export const OCR_PROBE_TIMEOUT_MS = 2000;
+/** One OCR snapshot. A timeout is not retried. */
+export const OCR_TIMEOUT_DEFAULT_MS = 30000;
+export const OCR_TIMEOUT_MAX_MS = 600000;
+/** Returned OCR text, including the truncation marker. */
+export const OCR_TEXT_MAX_BYTES = 64 * 1024;
+const OCR_TRUNCATION_MARKER = '\n[truncated]';
 
 export interface ScreenshotSettings {
   maxWidth: number;
@@ -217,7 +224,7 @@ export function parseOcrLangs(raw: unknown, available: readonly string[], device
   return langs;
 }
 
-/** OCR box in image pixels. Omitted means the whole image. */
+/** OCR box in preview-frame pixels. Omitted means the whole image. */
 export function parseOcrBox(args: {
   left?: unknown;
   top?: unknown;
@@ -237,6 +244,63 @@ export function parseOcrBox(args: {
     throw new Error('OCR box must have right greater than left and bottom greater than top');
   }
   return { left, top, right, bottom };
+}
+
+/**
+ * kvmd crops the source image, so the box it receives is full resolution.
+ * The tool accepts preview-frame pixels. `frame` is the default full
+ * preview, or the capture named by frameId. Null means no capture yet:
+ * the box is already in source pixels.
+ * The converted box is clamped to the source. A box outside the frame,
+ * or one that does not survive clamping, is an error.
+ */
+export function ocrBoxToSource(
+  box: OcrBox,
+  frame: { width: number; height: number; scaleX: number; scaleY: number; originX: number; originY: number } | null,
+  source: { width: number; height: number },
+): OcrBox {
+  if (frame && (box.right > frame.width || box.bottom > frame.height)) {
+    throw new Error(`OCR box is outside the frame (${frame.width}x${frame.height})`);
+  }
+  if (!frame && (box.right > source.width || box.bottom > source.height)) {
+    throw new Error(`OCR box is outside the source image (${source.width}x${source.height})`);
+  }
+  const scaleX = frame?.scaleX ?? 1;
+  const scaleY = frame?.scaleY ?? 1;
+  const originX = frame?.originX ?? 0;
+  const originY = frame?.originY ?? 0;
+  const left = Math.min(source.width, Math.max(0, Math.round((box.left + originX) * scaleX)));
+  const top = Math.min(source.height, Math.max(0, Math.round((box.top + originY) * scaleY)));
+  const right = Math.min(source.width, Math.max(0, Math.round((box.right + originX) * scaleX)));
+  const bottom = Math.min(source.height, Math.max(0, Math.round((box.bottom + originY) * scaleY)));
+  if (right <= left || bottom <= top) {
+    throw new Error(`OCR box is outside the source image (${source.width}x${source.height})`);
+  }
+  return { left, top, right, bottom };
+}
+
+/** Keep OCR text at or under 64 KiB. A longer value ends with a marker. */
+export function capOcrText(text: string): string {
+  const bytes = Buffer.from(text);
+  if (bytes.length <= OCR_TEXT_MAX_BYTES) return text;
+  const marker = Buffer.from(OCR_TRUNCATION_MARKER);
+  let end = OCR_TEXT_MAX_BYTES - marker.length;
+  if (end < 0) end = 0;
+  while (end > 0 && (bytes[end] & 0xc0) === 0x80) end -= 1;
+  return `${bytes.subarray(0, end).toString('utf8')}${OCR_TRUNCATION_MARKER}`;
+}
+
+/** PIKVM_OCR_TIMEOUT_MS. Unset uses 30s. Anything else must be 1..600000. */
+export function parseOcrTimeoutMs(raw: string | undefined): number {
+  if (raw === undefined || raw === '') return OCR_TIMEOUT_DEFAULT_MS;
+  if (!/^[1-9]\d*$/.test(raw)) {
+    throw new Error(`PIKVM_OCR_TIMEOUT_MS must be an integer from 1 to ${OCR_TIMEOUT_MAX_MS}`);
+  }
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 1 || value > OCR_TIMEOUT_MAX_MS) {
+    throw new Error(`PIKVM_OCR_TIMEOUT_MS must be an integer from 1 to ${OCR_TIMEOUT_MAX_MS}`);
+  }
+  return value;
 }
 
 function stringList(value: unknown): string[] {
