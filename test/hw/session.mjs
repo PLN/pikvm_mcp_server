@@ -1,4 +1,5 @@
 // Modified 2026-10 by PLN: hardware suite tool session (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: password via resolveSecret (GPL-3.0; see NOTICE).
 
 /**
  * In-process MCP HTTP session aimed at one PiKVMClient.
@@ -105,6 +106,8 @@ export async function openHardwareSession(overrides = {}) {
   if (requested.skip) {
     throw new Error('PIKVM_HW_TEST_DEVICE is unset');
   }
+  // Password and, when HTTP is configured, the bearer come from loadConfig's
+  // resolveSecret, so PIKVM_PASSWORD_FILE and CREDENTIALS_DIRECTORY work here.
   const config = loadConfig();
   const pikvm = new PiKVMClient(config.pikvm);
   const resolved = resolveDevice({ device: requested.name }, pikvm);

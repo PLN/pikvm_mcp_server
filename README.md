@@ -12,6 +12,7 @@
 <!-- Modified 2026-10 by PLN: connect timeout and DNS map to unreachable (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: pikvm_type delay is milliseconds (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: opt-in hardware suite (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: password and bearer secret files (GPL-3.0; see NOTICE) -->
 
 # PiKVM MCP Server
 
@@ -94,6 +95,30 @@ PIKVM_MSD_JOB_TIMEOUT_MS=21600000
 PIKVM_MSD_IDLE_TIMEOUT_MS=60000
 ```
 
+## Secrets
+
+`PIKVM_PASSWORD` and `PIKVM_MCP_BEARER` are resolved in this order: the direct environment variable, then `<NAME>_FILE`, then `$CREDENTIALS_DIRECTORY/<credential>` when `CREDENTIALS_DIRECTORY` is set. The credential names are `pikvm-password` and `pikvm-mcp-bearer`. A device registry `passwordFile` is not implemented yet (Phase B item 10); the same helper is what that will call.
+
+| Variable | Role |
+| --- | --- |
+| `PIKVM_PASSWORD` | kvmd password. Wins over the file and the credential. |
+| `PIKVM_PASSWORD_FILE` | Path of a regular file holding the password. |
+| `PIKVM_MCP_BEARER` | HTTP bearer. Wins over the file and the credential. Required only when `PIKVM_MCP_PORT` is set. |
+| `PIKVM_MCP_BEARER_FILE` | Path of a regular file holding the bearer. |
+| `CREDENTIALS_DIRECTORY` | systemd `LoadCredential` directory. Consulted only when it is set, and only for a secret that was not set above. A missing credential file means that secret is unset. |
+
+A file has exactly one trailing newline removed (`\n` or `\r\n`). Other whitespace, including a trailing space or a second newline, stays. An empty result after that strip is a startup error. Symlinks are followed, and the target must be a regular file: a directory, FIFO, socket, or device is rejected. A mode with any group or other bits (looser than `0600`) is warned on stderr, with the variable name, the path, and the mode, never the value. That mode check is skipped on Windows. A file larger than 64 KiB is rejected before the body is read. A missing or unreadable `*_FILE` is a startup error that names the variable and the path. If the direct variable and `*_FILE` are both set, the direct variable wins and one stderr line says the file variable was ignored. None of these messages include the secret.
+
+```ini
+# /etc/systemd/system/pikvm-mcp.service.d/credentials.conf
+[Service]
+LoadCredential=pikvm-password:/etc/pikvm/password
+LoadCredential=pikvm-mcp-bearer:/etc/pikvm/bearer
+Environment=PIKVM_HOST=https://pikvm.example.ts.net
+Environment=PIKVM_MCP_PORT=8675
+Environment=PIKVM_MCP_NO_DOTENV=1
+```
+
 `PIKVM_REQUEST_TIMEOUT_MS` is the abort deadline, in milliseconds, for one ordinary kvmd call. It must be a string of digits from 1 to 600000 (default 5000). `5000abc`, `1e3`, ` 5000 `, `5.5`, and `0` use the default. A value above 600000 is clamped to 600000. An idempotent GET that fails with a network error, a timeout, HTTP 502, or HTTP 503 is tried up to 3 times (backoff 250 ms, then 500 ms, plus a little jitter). POST is not retried. HTTP 500 and 504 are not retried. `GET /streamer/snapshot` retries HTTP 503 once after a 1500 ms grace period, for the ustreamer idle-stop race. That extra try does not use up one of the three attempts, so a snapshot can make at most 4 calls.
 
 `PIKVM_MSD_JOB_TIMEOUT_MS` (default 21600000, six hours) is the wall-clock ceiling for an MSD image upload or URL download. `PIKVM_MSD_IDLE_TIMEOUT_MS` (default 60000) is how long the upload body or the progress stream may sit still. Those two calls do not use `PIKVM_REQUEST_TIMEOUT_MS`, because kvmd does not answer an upload until it has read the body. A value that is not a string of digits, or 0, uses the default. The job ceiling is clamped to 7 days (604800000) and the idle gap to 1 hour (3600000). They are not clamped to the ten-minute ordinary-call cap. `write_remote` `timeout=` is a separate connect timeout (`PIKVM_MSD_URL_CONNECT_TIMEOUT_SEC`, default 30 seconds). It is not this job ceiling.
@@ -131,6 +156,8 @@ PIKVM_MCP_NO_DOTENV=0
   mode **refuses to start** without it; missing/incorrect tokens get `401` +
   `WWW-Authenticate: Bearer`. Comparison is constant-time (sha256 digests +
   `crypto.timingSafeEqual`), and the token is never written to logs.
+  `PIKVM_MCP_BEARER_FILE` or `CREDENTIALS_DIRECTORY/pikvm-mcp-bearer` can
+  supply it instead. See Secrets above.
 - **`PIKVM_MCP_ARM_HID`** — the HID arm-gate. HTTP mode defaults to
   **disarmed**: every HID-mutating tool (`pikvm_type`, `pikvm_key`,
   `pikvm_shortcut`, `pikvm_mouse_move`, `pikvm_mouse_click`,

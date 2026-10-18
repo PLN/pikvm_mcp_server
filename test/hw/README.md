@@ -1,5 +1,6 @@
 <!-- Modified 2026-10 by PLN: opt-in hardware suite (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: 1 MiB ISO, leftover names, closed port 65000 (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: password via resolveSecret (GPL-3.0; see NOTICE) -->
 
 # Hardware suite
 
@@ -32,6 +33,16 @@ export PIKVM_VERIFY_SSL=false
 export PIKVM_HW_TEST_DEVICE=default
 npm run test:hw
 ```
+
+The password is `loadConfig()`'s `resolveSecret` result, the same helper the server uses. `PIKVM_PASSWORD` wins. Otherwise `PIKVM_PASSWORD_FILE` is a regular file (one trailing newline removed). Otherwise, when `CREDENTIALS_DIRECTORY` is set, `$CREDENTIALS_DIRECTORY/pikvm-password` is the systemd `LoadCredential` file. A missing credential file leaves the password unset. A missing `PIKVM_PASSWORD_FILE` is an error that names that variable and the path. The value is not logged.
+
+| Variable | Role |
+| --- | --- |
+| `PIKVM_PASSWORD` | kvmd password. Wins over the file and the credential. |
+| `PIKVM_PASSWORD_FILE` | Path of a regular file holding the password. |
+| `PIKVM_MCP_BEARER` | Not required for this suite. The server uses it only for HTTP mode. |
+| `PIKVM_MCP_BEARER_FILE` | Path of a regular file holding that bearer. |
+| `CREDENTIALS_DIRECTORY` | systemd directory. Credential names are `pikvm-password` and `pikvm-mcp-bearer`. |
 
 `PIKVM_VERIFY_SSL` is the TLS switch that exists today. It is verified only when the value is the string `true`. Any other value, including unset, leaves `verifySsl` false (`rejectUnauthorized: false`).
 
