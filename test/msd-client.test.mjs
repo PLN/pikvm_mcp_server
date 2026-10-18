@@ -1,6 +1,7 @@
 // Modified 2026-10 by PLN: MSD client tests (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: MSD deadline caps and upload error codes (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: source-error flag and partial-image message (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: premature close on the raw length server (GPL-3.0; see NOTICE).
 
 /**
  * Plain kvmd MSD client methods against the mock. No MCP tools.
@@ -13,7 +14,7 @@ import http from 'node:http';
 import { Readable } from 'node:stream';
 import { Agent, request } from 'undici';
 import { KvmdError, PiKVMClient } from '../dist/pikvm/client.js';
-import { startKvmdMock } from './kvmd-mock.mjs';
+import { handleClientAbort, startKvmdMock } from './kvmd-mock.mjs';
 
 function makeClient(mock, extra = {}) {
   return new PiKVMClient({
@@ -56,6 +57,7 @@ async function waitFor(fn, ms = 1000) {
 
 function listen(handler) {
   const server = http.createServer(handler);
+  handleClientAbort(server);
   return new Promise((resolve) => {
     server.listen(0, '127.0.0.1', () => {
       const { port } = server.address();

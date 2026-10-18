@@ -8,6 +8,7 @@ Modified 2026-10 by PLN: metadata embeddings, connect timeout, and fetch cleanup
 Modified 2026-10 by PLN: deny local NAT64 and non-global wrapped IPv4 (GPL-3.0; see below).
 Modified 2026-10 by PLN: normalized fetch host and named allowlist errors (GPL-3.0; see below).
 Modified 2026-10 by PLN: ignore EBADF when a mock socket is already closed (GPL-3.0; see below).
+Modified 2026-10 by PLN: handle a short-body clientError on the mock (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -341,3 +342,11 @@ No code from another pikvm_mcp_server fork was added for these methods.
   idle timeout and is not clamped to it. The kvmd test mock ignores
   EBADF on a socket that is already closed. No code from another
   pikvm_mcp_server fork was added.
+
+2026-10, by PLN:
+  A body shorter than Content-Length makes the mock parser emit
+  HPE_INVALID_EOF_STATE from socketOnEnd. The mock handles that
+  clientError and destroys the socket without rethrowing it. EBADF is
+  ignored only while closeAllConnections runs. Any other socket error
+  at that point is emitted again when nothing else is listening. No
+  code from another pikvm_mcp_server fork was added.
