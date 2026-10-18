@@ -6,6 +6,7 @@
 // Modified 2026-10 by PLN: write_remote timeout is the connect timeout (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: connect timeout and DNS map to unreachable (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: pikvm_type delay is milliseconds (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: header and body timeouts stay timeouts (GPL-3.0; see NOTICE).
 // AbortSignal.timeout and PIKVM_UNREACHABLE / PIKVM_AUTH_FAILED no-retry codes
 // adapted from dtrukr/pikvm_mcp_server src/pikvm/client.ts @ d120243 (GPL-3.0).
 // Snapshot HTTP 503 retry-once adapted from dvaerum/pikvm_mcp_server
@@ -435,10 +436,6 @@ const SOURCE_READ_MESSAGE = 'image may be partial; re-read /api/msd';
 
 function isSourceReadError(err: unknown): boolean {
   return errorCodes(err).includes('EIO') || errorCodes(err).includes('PIKVM_SOURCE_READ_ERROR');
-}
-
-function isConnectTimeout(err: unknown): boolean {
-  return errorCodes(err).includes('UND_ERR_CONNECT_TIMEOUT');
 }
 
 function msdStateUnknown(status: number, endpoint: string): KvmdError {
@@ -1624,7 +1621,7 @@ export class PiKVMClient {
     if (isSourceReadError(err)) {
       return new KvmdError(0, 'PIKVM_SOURCE_READ_ERROR', SOURCE_READ_MESSAGE, endpoint);
     }
-    const beforeSend = isPreSendFailure(err) || isConnectTimeout(err);
+    const beforeSend = isPreSendFailure(err);
     if (!beforeSend && (isTimeoutError(err) || failedAfterSend(err))) {
       return msdStateUnknown(0, endpoint);
     }

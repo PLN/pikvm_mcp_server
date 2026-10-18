@@ -13,6 +13,7 @@ Modified 2026-10 by PLN: abort tests reject a raw-fd upload read (GPL-3.0; see b
 Modified 2026-10 by PLN: connect timeout and DNS map to unreachable (GPL-3.0; see below).
 Modified 2026-10 by PLN: pikvm_type delay is milliseconds (GPL-3.0; see below).
 Modified 2026-10 by PLN: opt-in hardware suite (GPL-3.0; see below).
+Modified 2026-10 by PLN: header and body timeouts stay timeouts (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -420,3 +421,13 @@ No code from another pikvm_mcp_server fork was added for these methods.
   the kvmd mock and checks that cleanup restores the snapshot.
   package.json gained the test:hw script. No code from another
   pikvm_mcp_server fork was added.
+
+2026-10, by PLN:
+  Removed isConnectTimeout. UND_ERR_CONNECT_TIMEOUT is already in the
+  pre-send set, and that set is read from the error and from each
+  cause, so the extra check on the MSD path did not change the result.
+  A coded UND_ERR_HEADERS_TIMEOUT or UND_ERR_BODY_TIMEOUT stays
+  PIKVM_TIMEOUT. A connect timeout nested under a TimeoutError stays
+  PIKVM_UNREACHABLE, because a pre-send failure is classified before
+  the timeout check. No code from another pikvm_mcp_server fork was
+  added.
