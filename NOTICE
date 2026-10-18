@@ -9,6 +9,7 @@ Modified 2026-10 by PLN: deny local NAT64 and non-global wrapped IPv4 (GPL-3.0; 
 Modified 2026-10 by PLN: normalized fetch host and named allowlist errors (GPL-3.0; see below).
 Modified 2026-10 by PLN: ignore EBADF when a mock socket is already closed (GPL-3.0; see below).
 Modified 2026-10 by PLN: handle a short-body clientError on the mock (GPL-3.0; see below).
+Modified 2026-10 by PLN: close the upload file handle once (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -350,3 +351,22 @@ No code from another pikvm_mcp_server fork was added for these methods.
   ignored only while closeAllConnections runs. Any other socket error
   at that point is emitted again when nothing else is listening. No
   code from another pikvm_mcp_server fork was added.
+
+2026-10, by PLN:
+  The upload stream was fs.createReadStream with the numeric
+  FileHandle descriptor and autoClose false. destroy() still closes
+  a numeric descriptor. closeUpload then called fh.close() on that
+  same descriptor. After a mid-read abort the second close threw
+  EBADF: bad file descriptor, close. Nothing handled it, so the
+  process exited. When the descriptor number had been reused, that
+  second close applied to some other file or socket.
+  The upload now reads through FileHandle.createReadStream with
+  autoClose false, start 0, and end size - 1. The stream holds one
+  ref on the handle. destroy() releases it and closes the descriptor
+  once. A later fh.close() does nothing once the descriptor is
+  closed, and it is the only close when the stream was never created.
+  A connection reset, an idle timeout, and a source read error each
+  take that path. hashFd still uses positioned FileHandle.read and
+  does not open a stream. No other path passes a raw fd to
+  createReadStream.
+  No code from another pikvm_mcp_server fork was added.
