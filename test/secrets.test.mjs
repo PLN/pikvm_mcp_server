@@ -1,4 +1,5 @@
 // Modified 2026-10 by PLN: password and bearer secret files (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: empty secret vars are unset (GPL-3.0; see NOTICE).
 
 /**
  * resolveSecret order and file rules. Temp directories are removed.
@@ -118,7 +119,74 @@ describe('resolveSecret', () => {
         required: true,
         env: { PIKVM_PASSWORD: 'env-secret\r\n' },
       });
-      assert.equal(fromEnv, 'env-secret');
+      assert.equal(fromEnv, 'env-secret\r\n');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('an empty direct value falls through to the file and then the credential', async () => {
+    const dir = await tempDir();
+    try {
+      const filePath = join(dir, 'from-file');
+      writeFileSync(filePath, 'from-file-secret\n', { mode: 0o600 });
+      const fromFile = resolveSecret({
+        name: 'PIKVM_PASSWORD',
+        credName: 'pikvm-password',
+        required: true,
+        env: { PIKVM_PASSWORD: '', PIKVM_PASSWORD_FILE: filePath },
+      });
+      assert.equal(fromFile, 'from-file-secret');
+
+      const credDir = join(dir, 'creds');
+      mkdirSync(credDir);
+      writeFileSync(join(credDir, 'pikvm-password'), 'from-cred-secret\n', { mode: 0o600 });
+      const fromCred = resolveSecret({
+        name: 'PIKVM_PASSWORD',
+        credName: 'pikvm-password',
+        required: true,
+        env: {
+          PIKVM_PASSWORD: '',
+          PIKVM_PASSWORD_FILE: '',
+          CREDENTIALS_DIRECTORY: credDir,
+        },
+      });
+      assert.equal(fromCred, 'from-cred-secret');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('a leading BOM is removed and a NUL byte is rejected', async () => {
+    const dir = await tempDir();
+    try {
+      const bom = join(dir, 'bom');
+      writeFileSync(bom, Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('secret\n')]), { mode: 0o600 });
+      assert.equal(resolveSecret({
+        name: 'PIKVM_PASSWORD',
+        credName: 'pikvm-password',
+        required: true,
+        env: { PIKVM_PASSWORD_FILE: bom },
+      }), 'secret');
+
+      const nul = join(dir, 'nul');
+      writeFileSync(nul, 'alpha\0omega\n', { mode: 0o600 });
+      assert.throws(
+        () => resolveSecret({
+          name: 'PIKVM_PASSWORD',
+          credName: 'pikvm-password',
+          required: true,
+          env: { PIKVM_PASSWORD_FILE: nul },
+        }),
+        (err) => {
+          assert.match(err.message, /PIKVM_PASSWORD_FILE/);
+          assert.match(err.message, /NUL/);
+          assert.equal(err.message.includes(nul), true);
+          assert.equal(err.message.includes('alpha'), false);
+          assert.equal(err.message.includes('omega'), false);
+          return true;
+        },
+      );
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -238,6 +306,44 @@ describe('resolveSecret', () => {
     }
   });
 
+  test('opening a FIFO does not block', async () => {
+    if (process.platform === 'win32') return;
+    const dir = await tempDir();
+    const fifo = join(dir, 'fifo');
+    const script = join(dir, 'open-fifo.mjs');
+    try {
+      execFileSync('mkfifo', [fifo]);
+      await writeFile(script, `
+        import { resolveSecret } from ${JSON.stringify(join(REPO, 'dist/secrets.js'))};
+        try {
+          resolveSecret({
+            name: 'PIKVM_PASSWORD',
+            credName: 'pikvm-password',
+            required: true,
+            env: { PIKVM_PASSWORD_FILE: ${JSON.stringify(fifo)} },
+          });
+          process.exit(2);
+        } catch (err) {
+          process.exit(String(err && err.message).includes('not a regular file') ? 0 : 3);
+        }
+      `);
+      const child = spawn(process.execPath, [script], { stdio: 'ignore' });
+      const code = await new Promise((resolve) => {
+        const timer = setTimeout(() => {
+          child.kill('SIGKILL');
+          resolve('blocked');
+        }, 1000);
+        child.once('exit', (exitCode) => {
+          clearTimeout(timer);
+          resolve(exitCode);
+        });
+      });
+      assert.equal(code, 0);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   test('mode 0644 warns and 0600 does not', async () => {
     if (process.platform === 'win32') return;
     const dir = await tempDir();
@@ -341,6 +447,24 @@ describe('loadConfig secrets', () => {
       }
     }
   }
+
+  test('a bearer with surrounding whitespace is rejected by name only', () => {
+    const token = ' bearer-with-space ';
+    assert.throws(
+      () => withProcessEnv({
+        PIKVM_HOST: 'https://pikvm.example.ts.net',
+        PIKVM_PASSWORD: 'testpw',
+        PIKVM_MCP_BEARER: token,
+      }, () => loadConfig()),
+      (err) => {
+        assert.match(err.message, /PIKVM_MCP_BEARER/);
+        assert.match(err.message, /whitespace/);
+        assert.equal(err.message.includes(token.trim()), false);
+        assert.equal(err.message.includes('bearer-with-space'), false);
+        return true;
+      },
+    );
+  });
 
   test('redactConfig hides the password and the bearer', async () => {
     const dir = await tempDir();

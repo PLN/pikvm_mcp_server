@@ -8,16 +8,20 @@
  *
  * Order, per secret: the direct env var, then <NAME>_FILE, then
  * $CREDENTIALS_DIRECTORY/<credName> when CREDENTIALS_DIRECTORY is set.
- * A missing credential file in that directory means the secret is unset,
- * not a read error. A missing <NAME>_FILE is an error.
+ * An empty direct value and an empty <NAME>_FILE are unset, so the next
+ * source is tried. A missing credential file means unset, not a read error.
+ * A missing <NAME>_FILE path is an error.
  *
- * File bytes: exactly one trailing newline is removed, either LF or CRLF.
- * No other whitespace is removed. An empty result after that is an error.
- * Symlinks are followed. The target must be a regular file, so a directory,
- * FIFO, socket, or device is rejected. A mode with any group or other bits
- * (looser than 0600) is warned on stderr. The value is never logged. The
- * mode check is skipped on Windows. Files larger than SECRET_MAX_BYTES
- * are rejected before the body is read.
+ * Direct env values are kept verbatim, including a trailing newline.
+ * File bytes lose one trailing newline (LF or CRLF) and a leading UTF-8
+ * BOM. No other whitespace is removed. Empty file content is an error.
+ * A NUL byte in the file is an error that names the variable and the path.
+ * The file is opened O_RDONLY|O_NONBLOCK and then fstat'd, so a FIFO does
+ * not block. Symlinks are followed. The opened target must be a regular
+ * file, so a directory, FIFO, socket, or device is rejected. A mode with
+ * any group or other bits (looser than 0600) is warned on stderr. The
+ * value is never logged. The mode check is skipped on Windows. Files
+ * larger than SECRET_MAX_BYTES are rejected before the body is read.
  *
  * TODO(registry): Phase B item 10's passwordFile should call resolveSecret
  * instead of reading a device password on its own.
@@ -25,15 +29,18 @@
 
 import {
   closeSync,
+  constants,
   fstatSync,
   openSync,
   readSync,
-  statSync,
 } from 'node:fs';
 import path from 'node:path';
 
 /** A wrong path must not be read into memory. */
 export const SECRET_MAX_BYTES = 64 * 1024;
+
+/** Follow symlinks. O_NONBLOCK so a FIFO open returns instead of waiting. */
+const SECRET_OPEN_FLAGS = constants.O_RDONLY | (constants.O_NONBLOCK ?? 0);
 
 export interface ResolveSecretSpec {
   /** Env var that holds the secret directly, such as PIKVM_PASSWORD. */
@@ -93,28 +100,35 @@ function warnLooseMode(label: string, filePath: string, mode: number): void {
   console.error(`${label} (${filePath}) is mode ${octal}; group or other bits are set`);
 }
 
+function decodeSecretFile(bytes: Buffer, label: string, filePath: string): string {
+  let body = bytes;
+  if (body.length >= 3 && body[0] === 0xef && body[1] === 0xbb && body[2] === 0xbf) {
+    body = body.subarray(3);
+  }
+  if (body.includes(0)) {
+    throw new Error(`${label} (${filePath}): contains a NUL byte`);
+  }
+  const text = stripOneTrailingNewline(body.toString('utf8'));
+  if (text.length === 0) {
+    throw new Error(`${label} (${filePath}): empty`);
+  }
+  return text;
+}
+
 /**
  * Read a secret file. `label` is the env var name and is the only
  * identifier included in errors, together with the path.
+ * The open is non-blocking. Kind, size, and mode come from that fd.
  */
 function readSecretFile(filePath: string, label: string, missingIsUnset: boolean): string | undefined {
-  let st;
-  try {
-    st = statSync(filePath);
-  } catch (err) {
-    if (missingIsUnset && errorCode(err) === 'ENOENT') return undefined;
-    throw new Error(`${label} (${filePath}): cannot read (${errorCode(err)})`);
-  }
-  if (!st.isFile()) {
-    throw new Error(`${label} (${filePath}): not a regular file`);
-  }
-  if (st.size > SECRET_MAX_BYTES) {
-    throw new Error(`${label} (${filePath}): larger than ${SECRET_MAX_BYTES} bytes`);
-  }
-  warnLooseMode(label, filePath, st.mode);
   let fd: number | undefined;
   try {
-    fd = openSync(filePath, 'r');
+    try {
+      fd = openSync(filePath, SECRET_OPEN_FLAGS);
+    } catch (err) {
+      if (missingIsUnset && errorCode(err) === 'ENOENT') return undefined;
+      throw new Error(`${label} (${filePath}): cannot read (${errorCode(err)})`);
+    }
     const opened = fstatSync(fd);
     if (!opened.isFile()) {
       throw new Error(`${label} (${filePath}): not a regular file`);
@@ -122,6 +136,7 @@ function readSecretFile(filePath: string, label: string, missingIsUnset: boolean
     if (opened.size > SECRET_MAX_BYTES) {
       throw new Error(`${label} (${filePath}): larger than ${SECRET_MAX_BYTES} bytes`);
     }
+    warnLooseMode(label, filePath, opened.mode);
     const buf = Buffer.alloc(opened.size);
     let off = 0;
     while (off < opened.size) {
@@ -129,11 +144,7 @@ function readSecretFile(filePath: string, label: string, missingIsUnset: boolean
       if (n === 0) break;
       off += n;
     }
-    const text = stripOneTrailingNewline(buf.subarray(0, off).toString('utf8'));
-    if (text.length === 0) {
-      throw new Error(`${label} (${filePath}): empty`);
-    }
-    return text;
+    return decodeSecretFile(buf.subarray(0, off), label, filePath);
   } catch (err) {
     if (err instanceof Error && err.message.startsWith(`${label} (`)) throw err;
     throw new Error(`${label} (${filePath}): cannot read (${errorCode(err)})`);
@@ -142,12 +153,12 @@ function readSecretFile(filePath: string, label: string, missingIsUnset: boolean
   }
 }
 
-function directValue(raw: string, name: string): string {
-  const text = stripOneTrailingNewline(raw);
-  if (text.length === 0) {
-    throw new Error(`${name} is empty`);
-  }
-  return text;
+/** A present, non-empty variable. "" is unset so the next source can run. */
+function presentEnv(env: NodeJS.ProcessEnv, key: string): string | undefined {
+  if (!Object.prototype.hasOwnProperty.call(env, key)) return undefined;
+  const value = env[key];
+  if (value === undefined || value === '') return undefined;
+  return value;
 }
 
 export function resolveSecret(spec: RequiredSecret): string;
@@ -158,18 +169,16 @@ export function resolveSecret(spec: ResolveSecretSpec): string | undefined {
   const fileVar = `${name}_FILE`;
   assertCredName(spec.credName);
 
-  if (Object.prototype.hasOwnProperty.call(env, name) && env[name] !== undefined) {
-    if (Object.prototype.hasOwnProperty.call(env, fileVar) && env[fileVar] !== undefined && env[fileVar] !== '') {
+  const direct = presentEnv(env, name);
+  const filePath = presentEnv(env, fileVar);
+  if (direct !== undefined) {
+    if (filePath !== undefined) {
       console.error(`${fileVar} is set and was ignored because ${name} is set`);
     }
-    return directValue(env[name] ?? '', name);
+    return direct;
   }
 
-  if (Object.prototype.hasOwnProperty.call(env, fileVar) && env[fileVar] !== undefined) {
-    const filePath = env[fileVar] ?? '';
-    if (filePath === '') {
-      throw new Error(`${fileVar} is set but empty`);
-    }
+  if (filePath !== undefined) {
     const fromFile = readSecretFile(filePath, fileVar, false);
     if (fromFile === undefined) {
       throw new Error(`${fileVar} (${filePath}): cannot read (ENOENT)`);

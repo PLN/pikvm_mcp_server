@@ -13,6 +13,7 @@
 <!-- Modified 2026-10 by PLN: pikvm_type delay is milliseconds (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: opt-in hardware suite (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: password and bearer secret files (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: empty secret vars are unset (GPL-3.0; see NOTICE) -->
 
 # PiKVM MCP Server
 
@@ -101,13 +102,13 @@ PIKVM_MSD_IDLE_TIMEOUT_MS=60000
 
 | Variable | Role |
 | --- | --- |
-| `PIKVM_PASSWORD` | kvmd password. Wins over the file and the credential. |
-| `PIKVM_PASSWORD_FILE` | Path of a regular file holding the password. |
-| `PIKVM_MCP_BEARER` | HTTP bearer. Wins over the file and the credential. Required only when `PIKVM_MCP_PORT` is set. |
-| `PIKVM_MCP_BEARER_FILE` | Path of a regular file holding the bearer. |
+| `PIKVM_PASSWORD` | kvmd password. A non-empty value wins over the file and the credential. An empty value is unset. |
+| `PIKVM_PASSWORD_FILE` | Path of a regular file holding the password. An empty value is unset. |
+| `PIKVM_MCP_BEARER` | HTTP bearer. A non-empty value wins over the file and the credential. An empty value is unset. Required only when `PIKVM_MCP_PORT` is set. |
+| `PIKVM_MCP_BEARER_FILE` | Path of a regular file holding the bearer. An empty value is unset. |
 | `CREDENTIALS_DIRECTORY` | systemd `LoadCredential` directory. Consulted only when it is set, and only for a secret that was not set above. A missing credential file means that secret is unset. |
 
-A file has exactly one trailing newline removed (`\n` or `\r\n`). Other whitespace, including a trailing space or a second newline, stays. An empty result after that strip is a startup error. Symlinks are followed, and the target must be a regular file: a directory, FIFO, socket, or device is rejected. A mode with any group or other bits (looser than `0600`) is warned on stderr, with the variable name, the path, and the mode, never the value. That mode check is skipped on Windows. A file larger than 64 KiB is rejected before the body is read. A missing or unreadable `*_FILE` is a startup error that names the variable and the path. If the direct variable and `*_FILE` are both set, the direct variable wins and one stderr line says the file variable was ignored. None of these messages include the secret.
+A direct value is used verbatim, including a trailing newline. Only file bytes lose exactly one trailing newline (`\n` or `\r\n`) and a leading UTF-8 BOM. Other whitespace, including a trailing space or a second newline, stays. Empty file content is a startup error. A NUL byte in a file is an error that names the variable and the path. An empty direct value and an empty `*_FILE` are unset and fall through. Symlinks are followed. The file is opened non-blocking and the opened target must be a regular file: a directory, FIFO, socket, or device is rejected, and a FIFO open does not wait. A mode with any group or other bits (looser than `0600`) is warned on stderr, with the variable name, the path, and the mode, never the value. That mode check is skipped on Windows. A file larger than 64 KiB is rejected before the body is read. A missing or unreadable `*_FILE` is a startup error that names the variable and the path. If the direct variable and `*_FILE` are both non-empty, the direct variable wins and one stderr line says the file variable was ignored. A bearer with leading or trailing whitespace is rejected at startup; the error names `PIKVM_MCP_BEARER` and not the value. None of these messages include the secret.
 
 ```ini
 # /etc/systemd/system/pikvm-mcp.service.d/credentials.conf
@@ -153,7 +154,11 @@ PIKVM_MCP_NO_DOTENV=0
   the proxy actually uses.
 - **`PIKVM_MCP_BEARER`** — required token for every `/mcp` request
   (`Authorization: Bearer <token>`), on POST, GET, and DELETE alike. HTTP
-  mode **refuses to start** without it; missing/incorrect tokens get `401` +
+  mode **refuses to start** without it. The refusal names `PIKVM_MCP_BEARER`,
+  `PIKVM_MCP_BEARER_FILE`, and `CREDENTIALS_DIRECTORY/pikvm-mcp-bearer`.
+  An empty `PIKVM_MCP_BEARER` does not stop stdio mode. Leading or trailing
+  whitespace on the configured bearer is rejected at startup, by name only.
+  Missing or incorrect tokens get `401` +
   `WWW-Authenticate: Bearer`. Comparison is constant-time (sha256 digests +
   `crypto.timingSafeEqual`), and the token is never written to logs.
   `PIKVM_MCP_BEARER_FILE` or `CREDENTIALS_DIRECTORY/pikvm-mcp-bearer` can

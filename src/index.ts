@@ -3,6 +3,7 @@
 // Modified 2026-10 by PLN: MSD local upload directory (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: URL fetch allowlist (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: password and bearer secret files (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: empty secret vars are unset (GPL-3.0; see NOTICE).
 /**
  * PiKVM MCP Server
  *
@@ -40,7 +41,10 @@ async function main() {
     // Fail closed: an unauthenticated network listener on a HID server would
     // let anyone type on the remote machine.
     if (!bearerToken) {
-      console.error('Fatal: PIKVM_MCP_BEARER must be set when PIKVM_MCP_PORT is set (HTTP mode requires bearer auth).');
+      console.error(
+        'Fatal: PIKVM_MCP_BEARER must be set when PIKVM_MCP_PORT is set (HTTP mode requires bearer auth). '
+        + 'Set PIKVM_MCP_BEARER, PIKVM_MCP_BEARER_FILE, or CREDENTIALS_DIRECTORY/pikvm-mcp-bearer.',
+      );
       process.exit(1);
     }
     const armGateEnforced = !armHid;

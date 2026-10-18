@@ -7,6 +7,7 @@
 // Modified 2026-10 by PLN: write_remote connect timeout (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: warn on a junk connect timeout (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: password and bearer secret files (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: empty secret vars are unset (GPL-3.0; see NOTICE).
 // Env read adapted from dtrukr/pikvm_mcp_server src/config.ts @ d120243 (GPL-3.0).
 
 /**
@@ -187,6 +188,9 @@ export function loadConfig(): Config {
     name: 'PIKVM_MCP_BEARER',
     credName: 'pikvm-mcp-bearer',
   });
+  if (typeof bearerToken === 'string' && bearerToken !== bearerToken.trim()) {
+    throw new Error('PIKVM_MCP_BEARER has leading or trailing whitespace');
+  }
   const port = parseInt(process.env.PIKVM_MCP_PORT || '', 10);
   const http: HttpConfig | undefined = Number.isFinite(port) && port > 0
     ? {

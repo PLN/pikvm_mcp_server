@@ -2,6 +2,7 @@
 <!-- Modified 2026-10 by PLN: 1 MiB ISO, leftover names, closed port 65000 (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: password via resolveSecret (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: restore leftover images and reject fetch bad ports (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: empty secret vars are unset (GPL-3.0; see NOTICE) -->
 
 # Hardware suite
 
@@ -35,7 +36,7 @@ export PIKVM_HW_TEST_DEVICE=default
 npm run test:hw
 ```
 
-The password is `loadConfig()`'s `resolveSecret` result, the same helper the server uses. `PIKVM_PASSWORD` wins. Otherwise `PIKVM_PASSWORD_FILE` is a regular file (one trailing newline removed). Otherwise, when `CREDENTIALS_DIRECTORY` is set, `$CREDENTIALS_DIRECTORY/pikvm-password` is the systemd `LoadCredential` file. A missing credential file leaves the password unset. A missing `PIKVM_PASSWORD_FILE` is an error that names that variable and the path. The value is not logged.
+The password is `loadConfig()`'s `resolveSecret` result, the same helper the server uses. A non-empty `PIKVM_PASSWORD` wins and is used verbatim. An empty `PIKVM_PASSWORD` or `PIKVM_PASSWORD_FILE` is unset. Otherwise `PIKVM_PASSWORD_FILE` is a regular file (one trailing newline removed). Otherwise, when `CREDENTIALS_DIRECTORY` is set, `$CREDENTIALS_DIRECTORY/pikvm-password` is the systemd `LoadCredential` file. A missing credential file leaves the password unset. A missing `PIKVM_PASSWORD_FILE` is an error that names that variable and the path. The value is not logged.
 
 | Variable | Role |
 | --- | --- |

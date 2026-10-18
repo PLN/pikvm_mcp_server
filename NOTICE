@@ -16,6 +16,7 @@ Modified 2026-10 by PLN: opt-in hardware suite (GPL-3.0; see below).
 Modified 2026-10 by PLN: header and body timeouts stay timeouts (GPL-3.0; see below).
 Modified 2026-10 by PLN: hardware ISO, net check, and cleanup names (GPL-3.0; see below).
 Modified 2026-10 by PLN: password and bearer secret files (GPL-3.0; see below).
+Modified 2026-10 by PLN: empty secret vars are unset (GPL-3.0; see below).
 Modified 2026-10 by PLN: restore leftover images and reject fetch bad ports (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
@@ -476,6 +477,18 @@ No code from another pikvm_mcp_server fork was added for these methods.
   Phase B item 10 passwordFile is still to be done and should call
   the same helper. No code from another pikvm_mcp_server fork was
   copied.
+
+2026-10, by PLN:
+  An empty PIKVM_PASSWORD, PIKVM_MCP_BEARER, or the matching _FILE
+  variable is unset and falls through. Empty file content is still an
+  error. Direct values are kept verbatim. File bytes lose one trailing
+  newline and a leading UTF-8 BOM. A NUL byte is an error that names
+  the variable and the path. Secret files are opened O_RDONLY|O_NONBLOCK
+  and checked with fstat on that fd, so a FIFO does not block. Symlinks
+  stay allowed. HTTP mode without a bearer names PIKVM_MCP_BEARER,
+  PIKVM_MCP_BEARER_FILE, and CREDENTIALS_DIRECTORY/pikvm-mcp-bearer.
+  A bearer with leading or trailing whitespace is rejected at startup
+  by name only. No code from another pikvm_mcp_server fork was copied.
 
 2026-10, by PLN:
   Hardware cleanup restores the snapshot image when this run did not
