@@ -1,12 +1,14 @@
 // Modified 2026-10 by PLN: hardware suite MSD cycle and cleanup (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: cleanup deletes only this run's image names (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: restore a leftover image this run did not create (GPL-3.0; see NOTICE).
 
 /**
  * Upload, mount, eject, and remove one mcp-hwtest image through the tools.
  * The finally block disconnects a drive this cycle connected, removes
  * only the image names this run created, and restores the snapshot.
- * Any other mcp-hwtest-* name is logged and left in place. A forced
- * failure still runs the finally block.
+ * A selected image this run did not create is restored, including a
+ * leftover mcp-hwtest-* name. Any other mcp-hwtest-* name is logged
+ * and left in place. A forced failure still runs the finally block.
  */
 
 import { inspectFetchUrl } from '../../dist/url-policy.js';
@@ -93,7 +95,7 @@ async function cleanup(call, snap, created, client, log) {
   }
   const mode = snap.cdrom ? 'cdrom' : 'flash';
   const rw = snap.cdrom ? false : snap.rw;
-  if (snap.image && !isHwTestImageName(snap.image)) {
+  if (snap.image && !created.has(snap.image)) {
     try {
       await callJson(call, 'pikvm_msd_mount', {
         image: snap.image,

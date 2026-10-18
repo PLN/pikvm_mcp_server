@@ -1,5 +1,6 @@
 // Modified 2026-10 by PLN: read-only hardware checks (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: closed-port probe uses 65000 (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: reject fetch bad ports (GPL-3.0; see NOTICE).
 
 /**
  * Read-only checks. Nothing here changes the drive.
@@ -13,6 +14,7 @@ import { randomBytes } from 'node:crypto';
 import { describe, test } from 'node:test';
 import { KvmdError, PiKVMClient } from '../../dist/pikvm/client.js';
 import { hwSkipReason } from './gate.mjs';
+import { unreachableProbePort } from './probe-port.mjs';
 import { kvmdGet, openHardwareSession, redactForLog } from './session.mjs';
 
 const skip = hwSkipReason();
@@ -117,15 +119,12 @@ describe('read-only hardware', { concurrency: false }, () => {
   });
 
   test('a closed port on the same host is PIKVM_UNREACHABLE', { skip }, async (t) => {
-    const raw = process.env.PIKVM_HW_TEST_UNREACHABLE_PORT;
-    if (raw === '0' || raw === 'skip') {
-      t.skip('PIKVM_HW_TEST_UNREACHABLE_PORT disables the closed-port probe');
+    const choice = unreachableProbePort(process.env.PIKVM_HW_TEST_UNREACHABLE_PORT);
+    if (choice.skip) {
+      t.skip(choice.reason);
       return;
     }
-    const port = raw === undefined || raw === '' ? 65000 : Number(raw);
-    if (!Number.isInteger(port) || port < 1 || port > 65535) {
-      throw new Error('PIKVM_HW_TEST_UNREACHABLE_PORT must be a port, 0, or skip');
-    }
+    const port = choice.port;
     const session = await openHardwareSession();
     try {
       const url = new URL(session.config.pikvm.host);

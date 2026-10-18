@@ -16,6 +16,7 @@ Modified 2026-10 by PLN: opt-in hardware suite (GPL-3.0; see below).
 Modified 2026-10 by PLN: header and body timeouts stay timeouts (GPL-3.0; see below).
 Modified 2026-10 by PLN: hardware ISO, net check, and cleanup names (GPL-3.0; see below).
 Modified 2026-10 by PLN: password and bearer secret files (GPL-3.0; see below).
+Modified 2026-10 by PLN: restore leftover images and reject fetch bad ports (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -475,3 +476,10 @@ No code from another pikvm_mcp_server fork was added for these methods.
   Phase B item 10 passwordFile is still to be done and should call
   the same helper. No code from another pikvm_mcp_server fork was
   copied.
+
+2026-10, by PLN:
+  Hardware cleanup restores the snapshot image when this run did not
+  create that name, including a leftover mcp-hwtest-* image that was
+  already selected. The closed-port probe rejects ports on the Fetch
+  bad-port list before a connection. No code from another
+  pikvm_mcp_server fork was added.

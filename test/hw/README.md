@@ -1,6 +1,7 @@
 <!-- Modified 2026-10 by PLN: opt-in hardware suite (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: 1 MiB ISO, leftover names, closed port 65000 (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: password via resolveSecret (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: restore leftover images and reject fetch bad ports (GPL-3.0; see NOTICE) -->
 
 # Hardware suite
 
@@ -56,7 +57,7 @@ The read-only level does not need the HTTP arm flags. The MSD and HID levels do,
 
 | Level | Variables | What it touches |
 | --- | --- | --- |
-| Read-only (default) | `PIKVM_HW_TEST_DEVICE=default` plus the host and password | Auth check, `GET /api/info?fields=system,hw` (kvmd version and model are logged), one raw `GET /api/msd` (logged with the password redacted) and `pikvm_msd_status`, the TLS mode in use, one bad-password `GET` (a single 401, `PIKVM_AUTH_FAILED`, not retried), and a closed-port probe of the same host. The probe uses port 65000 unless `PIKVM_HW_TEST_UNREACHABLE_PORT` names another port. Set that variable to `0` or `skip` to skip the probe. A connection refused is `PIKVM_UNREACHABLE`. A filtered port (the request times out) is skipped rather than failed. |
+| Read-only (default) | `PIKVM_HW_TEST_DEVICE=default` plus the host and password | Auth check, `GET /api/info?fields=system,hw` (kvmd version and model are logged), one raw `GET /api/msd` (logged with the password redacted) and `pikvm_msd_status`, the TLS mode in use, one bad-password `GET` (a single 401, `PIKVM_AUTH_FAILED`, not retried), and a closed-port probe of the same host. The probe uses port 65000 unless `PIKVM_HW_TEST_UNREACHABLE_PORT` names another port. Set that variable to `0` or `skip` to skip the probe. Ports on the Fetch bad-port list (1, 7, 9, and the rest of that list) are rejected before a connection, with an error that names the variable. A connection refused is `PIKVM_UNREACHABLE`. A filtered port (the request times out) is skipped rather than failed. |
 | MSD | also `PIKVM_HW_TEST_ALLOW_MSD=1` and `PIKVM_MCP_ARM_MSD=1` | Uploads a 1 MiB `mcp-hwtest-<timestamp>-<rand>.iso`, mounts it as cdrom, ejects twice (the second result is `alreadyDisconnected`), mounts it as flash read-only, ejects, and removes it. If `PIKVM_HW_TEST_FETCH_URL` is an allowlisted `https` URL, `pikvm_msd_fetch_url` downloads it under another `mcp-hwtest-*` name and then removes that name. |
 | MSD force | `PIKVM_HW_TEST_ALLOW_MSD=force` instead of `1` | Dangerous. Confirm the target host is not using the virtual drive before running force. If the virtual drive is already connected, the cycle disconnects it, runs the writes above, and remounts the previous image afterwards. A busy drive is not skipped either; the cycle may fail. |
 | HID | also `PIKVM_HW_TEST_ALLOW_HID=1` and `PIKVM_MCP_ARM_HID=1` | `pikvm_type` sends the two characters `hw` with delay 0 and again with delay 50. Delay is milliseconds. kvmd reads seconds, so 50 is sent as `0.05`. This types into whatever has focus. Leave the target on a safe screen, such as an empty text editor, and do not leave a shell prompt focused. |
@@ -113,7 +114,7 @@ The `finally` block:
 
 1. Disconnects the drive if it is connected.
 2. Removes only the exact image names this run created (the upload name, and the fetch name when a fetch was requested). Any other `mcp-hwtest-*` name is a leftover: it is logged and not deleted. `mcp-hwtest.iso` (no hyphen after the word) does not match the prefix and is left in place.
-3. Remounts the previous image when the snapshot had one and that name is not an `mcp-hwtest-*` image, with the previous cdrom or flash mode, the previous `rw` flag (forced false for cdrom), and the previous connected flag. When the snapshot had no image, the previous cdrom and `rw` flags are written with `set_params` and no image name.
+3. Remounts the previous image when the snapshot had one and this run did not create that name, including a leftover `mcp-hwtest-*` image that was already selected. The previous cdrom or flash mode, the previous `rw` flag (forced false for cdrom), and the previous connected flag are put back. When the snapshot had no image, the previous cdrom and `rw` flags are written with `set_params` and no image name.
 4. Logs leftover `mcp-hwtest-*` names that this run did not create, or `hw: no mcp-hwtest images left`.
 
 A failure in the middle, including a forced failure, still runs that block. Killing the process (Ctrl-C, or the machine losing power) does not. Clean up by hand. `curl -u admin` prompts for the password; do not put the password on the command line.
