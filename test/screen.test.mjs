@@ -1,4 +1,5 @@
 // Modified 2026-10 by PLN: screenshot defaults, crop, metadata, and OCR (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: frame tests watch crashes, and a capture cannot change a resolved move (GPL-3.0; see NOTICE).
 
 /**
  * Preview defaults, local crop, coordinate metadata, and optional OCR.
@@ -643,7 +644,8 @@ test('OCR errors are redacted', async (t) => {
   }
 });
 
-test('a crop does not move the default click frame', async () => {
+test('a crop does not move the default click frame', async (t) => {
+  watchCrashes(t);
   const mock = await startKvmdMock();
   try {
     const session = await startLegacy(mock);
@@ -700,7 +702,8 @@ test('a crop does not move the default click frame', async () => {
   }
 });
 
-test('interleaved screenshots keep request order, and frameId is exact', async () => {
+test('interleaved screenshots keep request order, and frameId is exact', async (t) => {
+  watchCrashes(t);
   const mock = await startKvmdMock({ holdSnapshots: 1 });
   try {
     const session = await startLegacy(mock);
@@ -861,7 +864,71 @@ test('an evicted or cross-device frameId sends no HID', async (t) => {
   }
 });
 
-test('screenshot, auto_calibrate, then click keeps the preview frame', { timeout: 60000 }, async () => {
+test('a full capture between resolve and send keeps the resolved frame', async (t) => {
+  watchCrashes(t);
+  const mock = await startKvmdMock();
+  try {
+    const session = await startLegacy(mock);
+    try {
+      const otherId = await openSession(session.srv.base);
+      const first = await rpc(session.srv.base, session.sessionId, 'tools/call', {
+        name: 'pikvm_screenshot',
+        arguments: {},
+      });
+      const firstMeta = metadataOf(first.result);
+      assert.equal(firstMeta.width, 960);
+      assert.equal(firstMeta.height, 540);
+      const streamers = mock.calls.filter((call) => call.path === '/api/streamer').length;
+      mock.holdNextStreamer();
+      const clickPromise = rpc(session.srv.base, session.sessionId, 'tools/call', {
+        name: 'pikvm_mouse_click',
+        arguments: { x: 480, y: 270 },
+      });
+      await waitUntil(() => mock.calls.filter((call) => call.path === '/api/streamer').length > streamers);
+      const second = await rpc(session.srv.base, otherId, 'tools/call', {
+        name: 'pikvm_screenshot',
+        arguments: { maxWidth: 480, maxHeight: 270 },
+      });
+      const secondMeta = metadataOf(second.result);
+      assert.equal(secondMeta.width, 480);
+      assert.equal(secondMeta.height, 270);
+      assert.equal(secondMeta.scaleX, 4);
+      const replaced = pixelToNormalized(480 * 4, 270 * 4, { width: 1920, height: 1080 }, null);
+      mock.releaseStreamer();
+      const clicked = await clickPromise;
+      assert.notEqual(clicked.result.isError, true, clicked.result.content[0].text);
+      const echo = metadataOf(clicked.result);
+      assert.equal(echo.frameId, 'default');
+      assert.equal(echo.width, 960);
+      assert.equal(echo.height, 540);
+      assert.equal(echo.scaleX, 2);
+      assert.equal(echo.scaleY, 2);
+      assert.deepEqual(echo.origin, { x: 0, y: 0 });
+      assert.deepEqual(moveTarget(hidMoves(mock).at(-1)), { x: 17, y: 30 });
+      assert.notDeepEqual(moveTarget(hidMoves(mock).at(-1)), replaced);
+
+      const after = await rpc(session.srv.base, session.sessionId, 'tools/call', {
+        name: 'pikvm_mouse_click',
+        arguments: { x: 480, y: 270 },
+      });
+      assert.notEqual(after.result.isError, true, after.result.content[0].text);
+      const afterEcho = metadataOf(after.result);
+      assert.equal(afterEcho.frameId, 'default');
+      assert.equal(afterEcho.width, 480);
+      assert.equal(afterEcho.scaleX, 4);
+      assert.deepEqual(moveTarget(hidMoves(mock).at(-1)), replaced);
+      assert.notDeepEqual(replaced, { x: 17, y: 30 });
+    } finally {
+      mock.releaseStreamer();
+      await session.close();
+    }
+  } finally {
+    await mock.close();
+  }
+});
+
+test('screenshot, auto_calibrate, then click keeps the preview frame', { timeout: 60000 }, async (t) => {
+  watchCrashes(t);
   const mock = await startKvmdMock();
   try {
     const session = await startLegacy(mock);

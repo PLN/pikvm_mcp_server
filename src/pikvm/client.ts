@@ -15,6 +15,7 @@
 // Modified 2026-10 by PLN: click frames stay on the full preview (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: OCR is not retried after it is sent (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: sharp refuses an oversized image (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: one resolved click frame for the move and the echo (GPL-3.0; see NOTICE).
 // AbortSignal.timeout and PIKVM_UNREACHABLE / PIKVM_AUTH_FAILED no-retry codes
 // adapted from dtrukr/pikvm_mcp_server src/pikvm/client.ts @ d120243 (GPL-3.0).
 // Snapshot HTTP 503 retry-once adapted from dvaerum/pikvm_mcp_server
@@ -1556,19 +1557,21 @@ export class PiKVMClient {
   }
 
   /**
-   * Move mouse to absolute pixel position (via REST API).
-   * Coordinates are in the default click frame, or in `frameId` when given.
-   * The default is the last full preview in request order. A crop is not
-   * the default. An unknown frameId throws before any HID event.
+   * Move to absolute pixels in one click frame.
+   * `resolved` is that frame, looked up once by the caller. Omitted
+   * looks up the default frame once, before the move is sent. A capture
+   * that finishes during the move does not change this mapping or the
+   * echoed frame. The default is the last full preview in request order.
+   * A crop is not the default.
    * @param x - X coordinate in that frame (0 = left edge of the image)
    * @param y - Y coordinate in that frame (0 = top edge of the image)
    */
   async mouseMove(
     x: number,
     y: number,
-    frameId?: string,
+    resolved?: { frame: ClickFrame | null; echo: FrameEcho },
   ): Promise<{ calibrationInvalidated: boolean; frame: FrameEcho }> {
-    const described = this.describeFrame(frameId);
+    const described = resolved ?? this.describeFrame();
     const scaled = this.mapFrame(described.frame, x, y);
     const posted = await this.postMouseMove(scaled.x, scaled.y);
     return { calibrationInvalidated: posted.calibrationInvalidated, frame: described.echo };
