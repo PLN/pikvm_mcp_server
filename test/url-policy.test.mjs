@@ -3,6 +3,7 @@
 // Modified 2026-10 by PLN: local NAT64 and non-global wrapped IPv4 (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: redactUrl, named allowlist errors, trailing-dot href (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: redactError covers string, object, and cyclic causes (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: throwing getters and a deep cause stay redacted (GPL-3.0; see NOTICE).
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -65,6 +66,42 @@ test('redactError redacts an Error cause, a string, an object url, and a cycle',
   const boxCopy = redactError(boxed).cause;
   assert.equal(boxCopy.url, 'https://127.0.0.1/kvm');
   assert.equal(boxCopy.self, boxCopy);
+});
+
+test('redactError replaces a throwing getter and stops at the depth cap', () => {
+  const secret = 'https://admin:SECRETPW@127.0.0.1/kvm?token=TOK';
+  const box = {};
+  Object.defineProperty(box, 'url', {
+    enumerable: true,
+    get() {
+      throw new Error(secret);
+    },
+  });
+  const thrown = new Error('outer');
+  thrown.cause = box;
+  const copied = redactError(thrown);
+  const text = JSON.stringify(copied.cause);
+  assert.equal(text.includes('SECRETPW'), false);
+  assert.equal(text.includes('TOK'), false);
+  assert.equal(copied.cause.url, '[unreadable: https://127.0.0.1/kvm]');
+
+  let kept = { url: secret };
+  for (let i = 0; i < 20; i += 1) kept = { nested: kept };
+  const shallow = new Error('shallow');
+  shallow.cause = kept;
+  const shallowText = JSON.stringify(redactError(shallow).cause);
+  assert.equal(shallowText.includes('SECRETPW'), false);
+  assert.equal(shallowText.includes('https://127.0.0.1/kvm'), true);
+  assert.equal(shallowText.includes('[depth]'), false);
+
+  let deep = { url: secret };
+  for (let i = 0; i < 20000; i += 1) deep = { nested: deep };
+  const buried = new Error('buried');
+  buried.cause = deep;
+  const buriedText = JSON.stringify(redactError(buried).cause);
+  assert.equal(buriedText.includes('SECRETPW'), false);
+  assert.equal(buriedText.includes('TOK'), false);
+  assert.equal(buriedText.includes('[depth]'), true);
 });
 
 test('allowlist parses https prefixes and tailscale CIDRs', () => {

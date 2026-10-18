@@ -28,6 +28,7 @@ Modified 2026-10 by PLN: listed host is an origin (GPL-3.0; see below).
 Modified 2026-10 by PLN: duplicate devices, a shared origin, and a per-device job cap (GPL-3.0; see below).
 Modified 2026-10 by PLN: test certificate serials are minimal DER (GPL-3.0; see below).
 Modified 2026-10 by PLN: redact a non-Error cause, and one host across schemes (GPL-3.0; see below).
+Modified 2026-10 by PLN: a throwing getter and a deep cause stay redacted (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -636,4 +637,11 @@ No code from another pikvm_mcp_server fork was added for these methods.
   object cause, including a url. A cause that points at itself is
   copied once. http://h and https://h are the same device, and so are
   two schemes on the same explicit port. The error names both devices.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  redactError reads each cause property inside try/catch. A getter
+  that throws is replaced with a placeholder, and that message is
+  redacted. A cause deeper than 32 levels is replaced with [depth],
+  so a chain of about 20k objects does not overflow the stack.
   No code from another pikvm_mcp_server fork was copied.
