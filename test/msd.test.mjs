@@ -7,7 +7,7 @@
 // Modified 2026-10 by PLN: local NAT64 and non-global wrapped IPv4 (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: trailing-dot host is the form sent to kvmd (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: upload abort must not crash the process (GPL-3.0; see NOTICE).
-// Modified 2026-10 by PLN: stall FileHandle.read and probe fds after abort (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: abort tests reject a raw-fd upload read (GPL-3.0; see NOTICE).
 
 /**
  * MSD tools against the mock. The HTTP harness matches test/http.test.mjs.
@@ -823,12 +823,15 @@ async function assertKvmdStillAnswers(base, sessionId) {
 }
 
 const stalledUploadFds = new Set();
+const closedStalledFds = [];
 
 /**
  * Hold the read that the upload stream actually uses. FileHandle.read
- * is what createReadStream calls, so a callback delay on fs.read alone
- * never leaves a read in flight. The prototype is taken from a real
- * handle and restored in finally.
+ * is what FileHandle.createReadStream calls. fs.read is what a numeric
+ * fd passed to fs.createReadStream calls. Recording those fds, and any
+ * fs.close of them, is how an abort test sees the raw-fd stream come
+ * back. The prototype is taken from a real handle and restored in
+ * finally. Nothing here closes a descriptor it did not open.
  */
 async function withStalledFsRead(ms, fn) {
   const probe = await openHandle(process.execPath, 'r');
@@ -836,7 +839,10 @@ async function withStalledFsRead(ms, fn) {
   const origHandleRead = proto.read;
   await probe.close();
   const origRead = fs.read;
+  const origClose = fs.close;
+  const origCloseSync = fs.closeSync;
   stalledUploadFds.clear();
+  closedStalledFds.length = 0;
   proto.read = function stalledHandleRead(...args) {
     return Promise.resolve(origHandleRead.apply(this, args)).then((result) => new Promise((resolve) => {
       setTimeout(() => resolve(result), ms);
@@ -848,13 +854,39 @@ async function withStalledFsRead(ms, fn) {
       setTimeout(() => callback(err, bytesRead, buf), ms);
     });
   };
+  fs.close = function stalledClose(fd, cb) {
+    if (stalledUploadFds.has(fd)) closedStalledFds.push(fd);
+    return origClose.call(fs, fd, cb);
+  };
+  fs.closeSync = function stalledCloseSync(fd) {
+    if (stalledUploadFds.has(fd)) closedStalledFds.push(fd);
+    return origCloseSync.call(fs, fd);
+  };
   try {
     await fn();
   } finally {
     proto.read = origHandleRead;
     fs.read = origRead;
+    fs.close = origClose;
+    fs.closeSync = origCloseSync;
     stalledUploadFds.clear();
+    closedStalledFds.length = 0;
   }
+}
+
+/** A raw-fd upload stream calls fs.read. The file-handle stream does not. */
+function assertNoRawUploadRead() {
+  assert.equal(stalledUploadFds.size, 0);
+  assert.equal(closedStalledFds.length, 0);
+}
+
+/**
+ * The job is failed while fh.close is still waiting for the stalled
+ * read. That wait holds the process-wide upload lock. Give the read
+ * time to finish so the next test is not told an upload is running.
+ */
+function finishStalledRead(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms + 100));
 }
 
 /**
@@ -879,47 +911,6 @@ async function withEioAfterFirstRead(fn) {
     await fn();
   } finally {
     proto.read = orig;
-  }
-}
-
-/**
- * The idle abort frees the upload descriptor before this process can
- * open a probe, and a keep-alive socket takes the number. Close that
- * reused descriptor so the probe occupies it while the stalled read
- * is still pending. A descriptor that still names the image is the
- * live upload and is left open.
- */
-function releaseReusedUploadFds(imagePath) {
-  for (const fd of stalledUploadFds) {
-    let link;
-    try {
-      link = fs.readlinkSync(`/proc/self/fd/${fd}`);
-    } catch {
-      continue;
-    }
-    if (link === imagePath) continue;
-    try {
-      fs.closeSync(fd);
-    } catch {
-      // Already closed. The probe open below takes a free number.
-    }
-  }
-}
-
-async function assertProbeFdsSurvive(path, waitMs) {
-  releaseReusedUploadFds(path);
-  const fds = [0, 1, 2].map(() => fs.openSync(path, 'r'));
-  try {
-    await new Promise((resolve) => setTimeout(resolve, waitMs));
-    for (const fd of fds) assert.equal(fs.fstatSync(fd).isFile(), true);
-  } finally {
-    for (const fd of fds) {
-      try {
-        fs.closeSync(fd);
-      } catch {
-        // A reused descriptor may already be closed. The fstat assertion reports that.
-      }
-    }
   }
 }
 
@@ -1899,10 +1890,11 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
           assert.equal(started.isError, undefined, started.content[0].text);
           const { jobId } = JSON.parse(started.content[0].text);
           const failed = await pollJob(base, sessionId, jobId);
+          assertNoRawUploadRead();
           assert.equal(failed.state, 'failed');
           assert.equal(failed.error.type, 'PIKVM_MSD_STATE_UNKNOWN');
-          await assertProbeFdsSurvive(join(dir, 'disk.img'), 400);
           await assertKvmdStillAnswers(base, sessionId);
+          await finishStalledRead(200);
         });
       }));
     });
@@ -1923,10 +1915,11 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
           assert.equal(started.isError, undefined, started.content[0].text);
           const { jobId } = JSON.parse(started.content[0].text);
           const failed = await pollJob(base, sessionId, jobId);
+          assertNoRawUploadRead();
           assert.equal(failed.state, 'failed');
           assert.equal(failed.error.type, 'PIKVM_MSD_STATE_UNKNOWN');
-          await assertProbeFdsSurvive(join(dir, 'disk.img'), 1000);
           await assertKvmdStillAnswers(base, sessionId);
+          await finishStalledRead(800);
         });
       }));
     });
@@ -1945,9 +1938,10 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
           assert.equal(started.isError, undefined, started.content[0].text);
           const { jobId } = JSON.parse(started.content[0].text);
           const failed = await pollJob(base, sessionId, jobId);
+          assertNoRawUploadRead();
           assert.equal(failed.state, 'failed');
           assert.equal(failed.error.type, 'PIKVM_SOURCE_READ_ERROR');
-          await new Promise((resolve) => setTimeout(resolve, 100));
+          await finishStalledRead(200);
           await assertKvmdStillAnswers(base, sessionId);
           const again = await callTool(base, sessionId, 'pikvm_msd_upload', {
             file: 'next.img',
