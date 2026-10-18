@@ -7,9 +7,8 @@ Modified 2026-10 by PLN: URL fetch allowlist and Tailscale opt-in (GPL-3.0; see 
 Modified 2026-10 by PLN: metadata embeddings, connect timeout, and fetch cleanup (GPL-3.0; see below).
 Modified 2026-10 by PLN: deny local NAT64 and non-global wrapped IPv4 (GPL-3.0; see below).
 Modified 2026-10 by PLN: normalized fetch host and named allowlist errors (GPL-3.0; see below).
-Modified 2026-10 by PLN: ignore EBADF when a mock socket is already closed (GPL-3.0; see below).
-Modified 2026-10 by PLN: handle a short-body clientError on the mock (GPL-3.0; see below).
 Modified 2026-10 by PLN: close the upload file handle once (GPL-3.0; see below).
+Modified 2026-10 by PLN: the upload double close was the EBADF (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -340,33 +339,45 @@ No code from another pikvm_mcp_server fork was added for these methods.
   and the query removed. A non-numeric
   PIKVM_MSD_URL_CONNECT_TIMEOUT_SEC uses the 30 second default and logs
   a warning. That connect timeout stays independent of the 60 second
-  idle timeout and is not clamped to it. The kvmd test mock ignores
-  EBADF on a socket that is already closed. No code from another
+  idle timeout and is not clamped to it. No code from another
   pikvm_mcp_server fork was added.
 
 2026-10, by PLN:
-  A body shorter than Content-Length makes the mock parser emit
-  HPE_INVALID_EOF_STATE from socketOnEnd. The mock handles that
-  clientError and destroys the socket without rethrowing it. EBADF is
-  ignored only while closeAllConnections runs. Any other socket error
-  at that point is emitted again when nothing else is listening. No
-  code from another pikvm_mcp_server fork was added.
+  A body shorter than Content-Length makes Node emit
+  HPE_INVALID_EOF_STATE from socketOnEnd. That uncaught exception
+  existed only while a socket error listener rethrew it. The listener
+  was added while the upload double close was mistaken for a mock
+  race. With that listener gone, Node's own clientError handling
+  covers the short body. The mock does not install its own. No code
+  from another pikvm_mcp_server fork was added.
+
+2026-10, by PLN:
+  The EBADF seen in CI on this branch was not a mock socket race.
+  The upload passed a numeric FileHandle descriptor to
+  fs.createReadStream. After a mid-read abort the stream's close ran
+  again once the in-flight read finished, and that second close threw
+  EBADF: bad file descriptor, close. That is fixed on main in PR 7
+  (1b13ffc): the upload reads through FileHandle.createReadStream, and
+  while a read is in flight fh.close() waits for the stream's close
+  rather than doing nothing. The test
+  mock no longer ignores EBADF. No code from another pikvm_mcp_server
+  fork was added.
 
 2026-10, by PLN:
   The upload stream was fs.createReadStream with the numeric
-  FileHandle descriptor and autoClose false. destroy() still closes
-  a numeric descriptor. closeUpload then called fh.close() on that
-  same descriptor. After a mid-read abort the second close threw
+  FileHandle descriptor and autoClose false. destroy() closes that
+  descriptor. While a read was still in flight, the stream's close
+  ran after the read returned. That second close threw
   EBADF: bad file descriptor, close. Nothing handled it, so the
   process exited. When the descriptor number had been reused, that
-  second close applied to some other file or socket.
+  close applied to some other file or socket.
   The upload now reads through FileHandle.createReadStream with
   autoClose false, start 0, and end size - 1. The stream holds one
-  ref on the handle. destroy() releases it and closes the descriptor
-  once. A later fh.close() does nothing once the descriptor is
-  closed, and it is the only close when the stream was never created.
-  A connection reset, an idle timeout, and a source read error each
-  take that path. hashFd still uses positioned FileHandle.read and
-  does not open a stream. No other path passes a raw fd to
-  createReadStream.
+  ref on the handle. While a read is in flight, fh.close() waits for
+  the stream's close rather than doing nothing, and the descriptor
+  is closed once, after the read. When the stream was never created,
+  only fh.close() runs. A connection reset, an idle timeout, and a
+  source read error each take that path. hashFd still uses positioned
+  FileHandle.read and does not open a stream. No other path passes a
+  raw fd to createReadStream.
   No code from another pikvm_mcp_server fork was added.

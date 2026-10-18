@@ -6,8 +6,7 @@
 // Modified 2026-10 by PLN: upload busy flag and resetDuringWrite (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: storeIncomplete for fetch cleanup tests (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: kvmd removes an incomplete download unless storeIncomplete (GPL-3.0; see NOTICE).
-// Modified 2026-10 by PLN: ignore EBADF while a mock socket closes (GPL-3.0; see NOTICE).
-// Modified 2026-10 by PLN: handle a short-body clientError on the mock (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: the upload double close was the EBADF, not this mock (GPL-3.0; see NOTICE).
 
 /**
  * Minimal KVMD REST mock implementing exactly the routes src/pikvm/client.ts
@@ -101,28 +100,6 @@ async function sendRoute(req, res, route) {
   }
   res.writeHead(status, headers);
   res.end(payload);
-}
-
-/**
- * A short Content-Length body ends the socket before the parser is
- * finished. Node reports that as clientError HPE_INVALID_EOF_STATE from
- * socketOnEnd. Handle it here. Destroying without the error object
- * keeps it off the socket 'error' channel. Any other client error still
- * gets the 400 Node would have written, then the socket is destroyed.
- */
-export function handleClientAbort(server) {
-  server.on('clientError', (err, socket) => {
-    const premature = err?.code === 'HPE_INVALID_EOF_STATE' || err?.code === 'ECONNRESET';
-    const response = socket._httpMessage;
-    if (!premature && socket.writable && !socket.destroyed && !response?.headersSent) {
-      try {
-        socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
-      } catch {
-        // The peer already went away.
-      }
-    }
-    if (!socket.destroyed) socket.destroy();
-  });
 }
 
 function readIncoming(req, onProgress) {
@@ -613,7 +590,6 @@ export async function startKvmdMock(options = {}) {
     return false;
   }
 
-  const openSockets = new Set();
   const server = http.createServer(async (req, res) => {
     const u = new URL(req.url, 'http://localhost');
     calls.push({
@@ -670,12 +646,6 @@ export async function startKvmdMock(options = {}) {
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'mock: unknown route' }));
   });
-  handleClientAbort(server);
-  server.on('connection', (socket) => {
-    openSockets.add(socket);
-    socket.on('close', () => openSockets.delete(socket));
-  });
-
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const port = server.address().port;
 
@@ -686,16 +656,6 @@ export async function startKvmdMock(options = {}) {
     uploads,
     url: `http://127.0.0.1:${port}`,
     close: () => new Promise((resolve) => {
-      // closeAllConnections can emit EBADF once the fd is already gone.
-      // Ignore only that code, and only while closing. Any other error
-      // is emitted again when this is the last listener, so a real
-      // socket error is not swallowed.
-      const onCloseError = function onCloseError(err) {
-        if (err?.code === 'EBADF') return;
-        this.removeListener('error', onCloseError);
-        if (this.listenerCount('error') === 0) this.emit('error', err);
-      };
-      for (const socket of openSockets) socket.on('error', onCloseError);
       // A paused upload can leave the socket open after the client aborts.
       // Drop it so close settles.
       server.close(resolve);

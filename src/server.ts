@@ -6,7 +6,6 @@
 // Modified 2026-10 by PLN: URL fetch tool and transfer mount block (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: write_remote connect timeout (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: redactUrl on tool errors (GPL-3.0; see NOTICE).
-// Modified 2026-10 by PLN: upload source-read test hook (GPL-3.0; see NOTICE).
 
 /**
  * MCP server factory for PiKVM tools
@@ -87,8 +86,6 @@ export interface MsdServerConfig extends MsdConfig {
   uploadPollMs?: number;
   jobLimit?: number;
   jobTtlMs?: number;
-  /** Test-only. Unset in production. */
-  failSourceRead?: boolean;
 }
 
 // ============================================================================
@@ -1159,7 +1156,6 @@ export function createMcpServer(deps: McpServerDeps): Server {
             uploadPollMs: deps.msd?.uploadPollMs,
             jobLimit: deps.msd?.jobLimit,
             jobTtlMs: deps.msd?.jobTtlMs,
-            failSourceRead: deps.msd?.failSourceRead,
           });
           return jsonText(outcome);
         }
