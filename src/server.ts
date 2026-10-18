@@ -1,6 +1,8 @@
 // Modified 2026-10 by PLN: typed KvmdError, timeouts, GET retry (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: MSD status, mount, and eject (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: MSD read-only allowlist and expectImage (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: upload, job, and remove tools (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: hashing jobs and typed upload errors (GPL-3.0; see NOTICE).
 
 /**
  * MCP server factory for PiKVM tools
@@ -25,12 +27,18 @@ import type { BusyLock } from './pikvm/lock.js';
 import { autoCalibrateWithRetries } from './pikvm/auto-calibrate.js';
 import { allPrompts, getPromptByName } from './prompts/index.js';
 import { skillTools, isSkillTool, handleSkillToolCall } from './prompts/skill-tools.js';
+import { MSD_EXTENSIONS_DEFAULT, MSD_MAX_BYTES_DEFAULT, type MsdConfig } from './config.js';
 import {
   ejectMsd,
   mountMsd,
   MsdExpectImageError,
+  MsdPreflightError,
+  MsdUploadBusyError,
   publicMsdState,
+  readMsdJob,
+  removeMsd,
   resolveDevice,
+  startMsdUpload,
 } from './msd.js';
 
 export interface McpServerDeps {
@@ -50,6 +58,20 @@ export interface McpServerDeps {
    * Omitted means ungated, which is stdio.
    */
   msdArmGateEnforced?: boolean;
+  /** Local upload directory and caps. Upload is hidden while localDir is unset. */
+  msd?: MsdServerConfig;
+}
+
+/**
+ * MsdConfig plus optional knobs the production entrypoint leaves unset.
+ * Tests use them to pause a job, shorten the uploading poll, and cap jobs.
+ */
+export interface MsdServerConfig extends MsdConfig {
+  beforeHash?: () => Promise<void>;
+  beforeUploadStream?: () => Promise<void>;
+  uploadPollMs?: number;
+  jobLimit?: number;
+  jobTtlMs?: number;
 }
 
 // ============================================================================
@@ -196,6 +218,7 @@ export const ARM_GATED_TOOLS = new Set([
  */
 export const MSD_READ_ONLY_TOOLS = new Set([
   'pikvm_msd_status',
+  'pikvm_msd_job',
 ]);
 
 export function msdToolRequiresArm(name: string): boolean {
@@ -204,8 +227,8 @@ export function msdToolRequiresArm(name: string): boolean {
 
 /**
  * Tool failure text. KvmdError keeps status, type, message, and endpoint.
- * MsdExpectImageError names the connected image. Other errors stay
- * `Error: <message>`.
+ * MsdExpectImageError names the connected image. MsdPreflightError and
+ * MsdUploadBusyError keep their type. Other errors stay `Error: <message>`.
  */
 export function formatToolError(error: unknown, password = ''): string {
   const redact = (value: string) => redactSecrets(value, password);
@@ -213,6 +236,11 @@ export function formatToolError(error: unknown, password = ''): string {
     const message = redact(error.message);
     const image = redact(error.image);
     const details = JSON.stringify({ type: error.type, image, message });
+    return `Error [${error.type}]: ${message}\n${details}`;
+  }
+  if (error instanceof MsdPreflightError || error instanceof MsdUploadBusyError) {
+    const message = redact(error.message);
+    const details = JSON.stringify({ type: error.type, message });
     return `Error [${error.type}]: ${message}\n${details}`;
   }
   if (error instanceof KvmdError) {
@@ -261,7 +289,7 @@ function msdDisarmedResult(tool: string) {
           `MSD arm-gate: "${tool}" is blocked. Mass-storage changes are DISARMED ` +
           `(default in HTTP mode).\n` +
           `To arm: set PIKVM_MCP_ARM_MSD=1 in the server's environment and restart. ` +
-          `pikvm_msd_status stays available. PIKVM_MCP_ARM_HID=1 does not arm MSD.`,
+          `pikvm_msd_status and pikvm_msd_job stay available. PIKVM_MCP_ARM_HID=1 does not arm MSD.`,
       },
     ],
     isError: true,
@@ -558,7 +586,7 @@ const tools: Tool[] = [
         },
         expectImage: {
           type: 'string',
-          description: 'Required when the virtual drive is already connected. Must equal the connected image name. The mount does not disconnect a different image.',
+          description: 'Required when the virtual drive is already connected. Must equal the connected image name. A value supplied while the drive is disconnected must also equal the snapshot image. The mount does not disconnect a different image.',
         },
         connect: {
           type: 'boolean',
@@ -584,6 +612,68 @@ const tools: Tool[] = [
         },
       },
       required: ['expectImage'],
+    },
+  },
+  {
+    name: 'pikvm_msd_upload',
+    description: 'Upload a local image into PiKVM storage and return a jobId immediately after the file is confined. Hashing and the kvmd pre-check run in the job, which is hashing and then running. A sha256 mismatch fails the job and uploads nothing. A second upload while one is running is refused. file is a bare name under PIKVM_MSD_LOCAL_DIR. confirmImage must equal file. The drive is not changed. Poll pikvm_msd_job. Hidden while PIKVM_MSD_LOCAL_DIR is unset.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        device: {
+          type: 'string',
+          description: 'Device name. Ignored until more than one device exists.',
+        },
+        file: {
+          type: 'string',
+          description: 'Bare file name inside PIKVM_MSD_LOCAL_DIR. No directory separators.',
+        },
+        confirmImage: {
+          type: 'string',
+          description: 'Must equal file.',
+        },
+        sha256: {
+          type: 'string',
+          description: 'Optional expected sha256 hex digest of the file. A mismatch fails the job before any upload POST.',
+        },
+      },
+      required: ['file', 'confirmImage'],
+    },
+  },
+  {
+    name: 'pikvm_msd_job',
+    description: 'Read an in-memory MSD upload job. Returns state hashing, running, done, or failed, plus bytes, total, and sha256 when known. A failed upload that stored the wrong bytes includes removed. Finished jobs are dropped after 24 hours. Does not change the drive.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        jobId: {
+          type: 'string',
+          description: 'Job id returned by pikvm_msd_upload.',
+        },
+      },
+      required: ['jobId'],
+    },
+  },
+  {
+    name: 'pikvm_msd_remove',
+    description: 'Remove an image from PiKVM storage. confirmImage must equal image. Refuses while the virtual drive is connected, and does not disconnect it. Returns the drive re-read after the removal.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        device: {
+          type: 'string',
+          description: 'Device name. Ignored until more than one device exists.',
+        },
+        image: {
+          type: 'string',
+          description: 'Storage image name to remove.',
+        },
+        confirmImage: {
+          type: 'string',
+          description: 'Must equal image.',
+        },
+      },
+      required: ['image', 'confirmImage'],
     },
   },
   ...skillTools,
@@ -640,7 +730,10 @@ export function createMcpServer(deps: McpServerDeps): Server {
 
   // Handle list tools request
   server.setRequestHandler(ListToolsRequestSchema, async () => {
-    return { tools };
+    const visible = deps.msd?.localDir
+      ? tools
+      : tools.filter((tool) => tool.name !== 'pikvm_msd_upload');
+    return { tools: visible };
   });
 
   // Handle tool calls
@@ -989,6 +1082,50 @@ export function createMcpServer(deps: McpServerDeps): Server {
           const resolved = resolveDevice(args, deps.pikvm);
           const expectImage = requireText(args.expectImage, 'expectImage');
           const outcome = await ejectMsd(resolved.client, expectImage, resolved.name);
+          return jsonText(outcome);
+        }
+
+        case 'pikvm_msd_upload': {
+          const localDir = deps.msd?.localDir;
+          if (!localDir) {
+            throw new Error('pikvm_msd_upload is unavailable until PIKVM_MSD_LOCAL_DIR is set');
+          }
+          const resolved = resolveDevice(args, deps.pikvm);
+          const file = requireString(args.file, 'file');
+          const confirmImage = requireString(args.confirmImage, 'confirmImage');
+          const sha256 = args.sha256 === undefined ? undefined : requireString(args.sha256, 'sha256');
+          const outcome = await startMsdUpload(resolved.client, {
+            device: resolved.name,
+            localDir,
+            maxBytes: deps.msd?.maxBytes ?? MSD_MAX_BYTES_DEFAULT,
+            extensions: deps.msd?.extensions ?? MSD_EXTENSIONS_DEFAULT,
+            file,
+            confirmImage,
+            sha256,
+            beforeHash: deps.msd?.beforeHash,
+            beforeUploadStream: deps.msd?.beforeUploadStream,
+            uploadPollMs: deps.msd?.uploadPollMs,
+            jobLimit: deps.msd?.jobLimit,
+            jobTtlMs: deps.msd?.jobTtlMs,
+          });
+          return jsonText(outcome);
+        }
+
+        case 'pikvm_msd_job': {
+          const jobId = requireString(args.jobId, 'jobId');
+          const job = readMsdJob(jobId, {
+            jobLimit: deps.msd?.jobLimit,
+            jobTtlMs: deps.msd?.jobTtlMs,
+          });
+          if (!job) throw new Error('unknown job');
+          return jsonText(job);
+        }
+
+        case 'pikvm_msd_remove': {
+          const resolved = resolveDevice(args, deps.pikvm);
+          const image = requireString(args.image, 'image');
+          const confirmImage = requireString(args.confirmImage, 'confirmImage');
+          const outcome = await removeMsd(resolved.client, image, confirmImage, resolved.name);
           return jsonText(outcome);
         }
 

@@ -2,6 +2,7 @@
 // Modified 2026-10 by PLN: MSD upload deadlines (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: cap MSD job at 7 days and idle at 1 hour (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: PIKVM_MCP_ARM_MSD (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: PIKVM_MSD_LOCAL_DIR and PIKVM_MSD_MAX_BYTES (GPL-3.0; see NOTICE).
 // Env read adapted from dtrukr/pikvm_mcp_server src/config.ts @ d120243 (GPL-3.0).
 
 /**
@@ -62,6 +63,44 @@ export interface HttpConfig {
   armMsd: boolean;
 }
 
+/** 16 GiB. Local uploads and later URL downloads share this cap. */
+export const MSD_MAX_BYTES_DEFAULT = 16 * 1024 * 1024 * 1024;
+
+export const MSD_EXTENSIONS_DEFAULT = ['.iso', '.img'] as const;
+
+export function parseMsdMaxBytes(raw: string | undefined): number {
+  if (raw === undefined || raw === '' || !/^[0-9]+$/.test(raw)) return MSD_MAX_BYTES_DEFAULT;
+  const n = Number(raw);
+  if (!Number.isSafeInteger(n) || n <= 0) return MSD_MAX_BYTES_DEFAULT;
+  return n;
+}
+
+export function parseMsdExtensions(raw: string | undefined): string[] {
+  const source = raw === undefined || raw.trim() === '' ? MSD_EXTENSIONS_DEFAULT.join(',') : raw;
+  const out: string[] = [];
+  for (const part of source.split(',')) {
+    let ext = part.trim().toLowerCase();
+    if (!ext) continue;
+    if (!ext.startsWith('.')) ext = `.${ext}`;
+    if (!/^\.[a-z0-9]+$/.test(ext)) continue;
+    if (!out.includes(ext)) out.push(ext);
+  }
+  return out.length > 0 ? out : [...MSD_EXTENSIONS_DEFAULT];
+}
+
+export function parseMsdLocalDir(raw: string | undefined): string | undefined {
+  if (raw === undefined) return undefined;
+  const trimmed = raw.trim();
+  return trimmed === '' ? undefined : trimmed;
+}
+
+export interface MsdConfig {
+  /** Unset hides pikvm_msd_upload. */
+  localDir?: string;
+  maxBytes: number;
+  extensions: readonly string[];
+}
+
 export interface Config {
   pikvm: {
     host: string;
@@ -81,6 +120,7 @@ export interface Config {
     verifyRounds: number;
     moveDelayMs: number;
   };
+  msd: MsdConfig;
   /** Present only when PIKVM_MCP_PORT is set (HTTP mode). */
   http?: HttpConfig;
 }
@@ -134,6 +174,11 @@ export function loadConfig(): Config {
       rounds: parseInt(process.env.PIKVM_CALIBRATION_ROUNDS || '5', 10),
       verifyRounds: parseInt(process.env.PIKVM_CALIBRATION_VERIFY_ROUNDS || '5', 10),
       moveDelayMs: parseInt(process.env.PIKVM_CALIBRATION_MOVE_DELAY || '300', 10),
+    },
+    msd: {
+      localDir: parseMsdLocalDir(process.env.PIKVM_MSD_LOCAL_DIR),
+      maxBytes: parseMsdMaxBytes(process.env.PIKVM_MSD_MAX_BYTES),
+      extensions: parseMsdExtensions(process.env.PIKVM_MSD_EXTENSIONS),
     },
     http,
   };

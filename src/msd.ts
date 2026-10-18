@@ -1,15 +1,24 @@
 // Modified 2026-10 by PLN: MSD mount and eject policy (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: expectImage, preflight, and MSD mutex (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: upload jobs, remove, and job lock (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: hashing jobs, bad-image cleanup, upload try-lock (GPL-3.0; see NOTICE).
 
 /**
- * Policy for MSD status, mount, and eject.
+ * Policy for MSD status, mount, eject, upload, and remove.
  * Plain kvmd calls stay on the client. Echo-back checks, preflight,
- * and mount rollback live here. Jobs and uploads are a later change.
+ * and mount rollback live here.
  * Mount and eject share a per-device mutex so one session's rollback
- * cannot run in the middle of another's change. Job code can reuse
- * withMsdLock.
+ * cannot run in the middle of another's change. An upload takes a
+ * fail-fast try-lock, so a second upload is refused and a transfer
+ * does not queue mount or eject.
  */
 
+import { createHash, randomBytes } from 'node:crypto';
+import { constants, createReadStream } from 'node:fs';
+import { lstat, open, realpath } from 'node:fs/promises';
+import type { FileHandle } from 'node:fs/promises';
+import path from 'node:path';
+import { Readable } from 'node:stream';
 import {
   KvmdError,
   type MsdDriveState,
@@ -68,17 +77,38 @@ export interface ErrorFields {
 }
 
 /**
- * The drive is already connected and the caller did not name that image.
- * Mount must not disconnect it.
+ * expectImage does not match the snapshot image. That includes a value
+ * supplied while the drive is disconnected. Mount must not change the drive.
  */
 export class MsdExpectImageError extends Error {
   readonly type = 'MsdExpectImageError';
   readonly image: string;
 
   constructor(image: string) {
-    super(`drive is connected to ${JSON.stringify(image)}; expectImage must equal that name`);
+    super(`drive image is ${JSON.stringify(image)}; expectImage must equal that name`);
     this.name = 'MsdExpectImageError';
     this.image = image;
+  }
+}
+
+/** A kvmd state check refused the upload or the removal before any POST. */
+export class MsdPreflightError extends Error {
+  readonly type: string;
+
+  constructor(type: string, message: string) {
+    super(message);
+    this.name = type;
+    this.type = type;
+  }
+}
+
+/** Another upload already holds this device. The caller is not queued. */
+export class MsdUploadBusyError extends Error {
+  readonly type = 'MsdUploadBusyError';
+
+  constructor() {
+    super('upload already running');
+    this.name = 'MsdUploadBusyError';
   }
 }
 
@@ -147,7 +177,11 @@ function errorFields(err: unknown): ErrorFields {
       endpoint: err.endpoint,
     };
   }
-  if (err instanceof MsdExpectImageError) {
+  if (
+    err instanceof MsdExpectImageError
+    || err instanceof MsdPreflightError
+    || err instanceof MsdUploadBusyError
+  ) {
     return {
       status: 0,
       type: err.type,
@@ -170,13 +204,26 @@ function logImage(image: string): string {
   return image;
 }
 
-function logMsd(event: string, device: string, image: string, ok: boolean, error?: string): void {
+function logMsd(
+  event: string,
+  device: string,
+  image: string,
+  ok: boolean,
+  error?: string,
+  extra?: Record<string, string | number | boolean>,
+): void {
   const line: Record<string, unknown> = {
     event,
     device,
     image: logImage(image),
     ok,
   };
+  if (extra) {
+    for (const [key, value] of Object.entries(extra)) {
+      if (key === 'path' || key === 'file' || key === 'url') continue;
+      line[key] = value;
+    }
+  }
   if (error) line.error = error;
   console.error(JSON.stringify(line));
 }
@@ -292,12 +339,15 @@ async function mountMsdLocked(client: PiKVMClient, request: MountRequest): Promi
     throw new Error('image must not contain ://');
   }
   const state = await client.getMsdState();
-  const snap = snapshotOf(state.drive);
-  if (snap.connected && expectImage !== snap.image) {
-    throw new MsdExpectImageError(snap.image);
-  }
+  // Offline hides the drive, so there is no snapshot image to compare.
   if (!state.online) {
     throw new Error('kvmd MSD is offline');
+  }
+  const snap = snapshotOf(state.drive);
+  // A connected drive always requires expectImage. A supplied expectImage
+  // is also checked when nothing is connected, so it is not ignored.
+  if ((snap.connected || expectImage !== undefined) && expectImage !== snap.image) {
+    throw new MsdExpectImageError(snap.image);
   }
   if (state.busy) {
     throw new Error('kvmd MSD is busy');
@@ -342,4 +392,394 @@ async function mountMsdLocked(client: PiKVMClient, request: MountRequest): Promi
 
 export function mountMsd(client: PiKVMClient, request: MountRequest): Promise<MountResult> {
   return withMsdLock(request.device, () => mountMsdLocked(client, request));
+}
+
+/**
+ * Devices with an upload in progress. A second upload fails immediately
+ * instead of waiting behind a transfer. Mount and eject do not take this
+ * set, and an upload does not take withMsdLock or BusyLock.
+ */
+const uploadHeld = new Set<string>();
+
+function acquireUpload(device: string): void {
+  if (uploadHeld.has(device)) throw new MsdUploadBusyError();
+  uploadHeld.add(device);
+}
+
+function releaseUpload(device: string): void {
+  uploadHeld.delete(device);
+}
+
+const UPLOAD_POLL_MS = 1500;
+const JOB_TTL_MS = 24 * 60 * 60 * 1000;
+const JOB_CAP = 64;
+
+type JobState = 'hashing' | 'running' | 'done' | 'failed';
+
+export interface MsdJobView {
+  state: JobState;
+  bytes: number;
+  total: number;
+  sha256?: string;
+  error?: ErrorFields;
+  /** Set when a post-check failure tried to delete the stored image. */
+  removed?: boolean;
+  removeError?: ErrorFields;
+}
+
+interface JobRecord {
+  state: JobState;
+  bytes: number;
+  total: number;
+  sha256?: string;
+  error?: ErrorFields;
+  removed?: boolean;
+  removeError?: ErrorFields;
+  finishedAt?: number;
+}
+
+const jobs = new Map<string, JobRecord>();
+
+function jobLimitOf(value: number | undefined): number {
+  return value !== undefined && Number.isSafeInteger(value) && value > 0 ? value : JOB_CAP;
+}
+
+function jobTtlOf(value: number | undefined): number {
+  return value !== undefined && Number.isSafeInteger(value) && value >= 0 ? value : JOB_TTL_MS;
+}
+
+/** Drop finished jobs older than the TTL, then the oldest finished jobs past the cap. */
+function pruneJobs(limit: number, ttlMs: number): void {
+  const now = Date.now();
+  for (const [id, job] of jobs) {
+    if (job.finishedAt !== undefined && now - job.finishedAt > ttlMs) jobs.delete(id);
+  }
+  if (jobs.size <= limit) return;
+  const finished = [...jobs.entries()].filter(([, job]) => job.finishedAt !== undefined);
+  finished.sort((a, b) => (a[1].finishedAt ?? 0) - (b[1].finishedAt ?? 0));
+  for (const [id] of finished) {
+    if (jobs.size <= limit) break;
+    jobs.delete(id);
+  }
+}
+
+export interface JobReadOptions {
+  jobLimit?: number;
+  jobTtlMs?: number;
+}
+
+export function readMsdJob(jobId: string, options: JobReadOptions = {}): MsdJobView | undefined {
+  pruneJobs(jobLimitOf(options.jobLimit), jobTtlOf(options.jobTtlMs));
+  const job = jobs.get(jobId);
+  if (!job) return undefined;
+  const view: MsdJobView = {
+    state: job.state,
+    bytes: job.bytes,
+    total: job.total,
+  };
+  if (job.sha256 !== undefined) view.sha256 = job.sha256;
+  if (job.error !== undefined) view.error = job.error;
+  if (job.removed !== undefined) view.removed = job.removed;
+  if (job.removeError !== undefined) view.removeError = job.removeError;
+  return view;
+}
+
+export interface UploadRequest {
+  device: string;
+  localDir: string;
+  maxBytes: number;
+  extensions: readonly string[];
+  file: string;
+  confirmImage: string;
+  sha256?: string;
+  /** Awaited in the job before the hash. Unset in production. */
+  beforeHash?: () => Promise<void>;
+  /** Awaited in the upload body before the file is read. Unset in production. */
+  beforeUploadStream?: () => Promise<void>;
+  /** Overrides the 1.5s storage.uploading poll. Unset in production. */
+  uploadPollMs?: number;
+  /** Retained-job cap. Default 64. Unset in production. */
+  jobLimit?: number;
+  /** Finished-job TTL in ms. Default 24h. Unset in production. */
+  jobTtlMs?: number;
+}
+
+export interface RemoveResult {
+  removed: true;
+  drive: MsdDriveState | null;
+}
+
+function assertBareName(file: string, extensions: readonly string[]): void {
+  if (file.length === 0 || file.length > 255 || file !== file.trim()) {
+    throw new Error('file must be a bare image name');
+  }
+  if (
+    file.includes('/')
+    || file.includes('\\')
+    || file.includes('\0')
+    || file.startsWith('.')
+    || file === 'lost+found'
+  ) {
+    throw new Error('file must be a bare image name');
+  }
+  for (let i = 0; i < file.length; i += 1) {
+    const code = file.charCodeAt(i);
+    if (code < 0x20 || code > 0x7e) throw new Error('file must be a bare image name');
+  }
+  const lower = file.toLowerCase();
+  if (!extensions.some((ext) => lower.endsWith(ext))) {
+    throw new Error('file suffix is not allowed');
+  }
+}
+
+function normalizeSha256(value: string): string {
+  const hex = value.trim().toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(hex)) throw new Error('sha256 must be 64 hex characters');
+  return hex;
+}
+
+async function hashFd(fh: FileHandle, size: number): Promise<string> {
+  const hash = createHash('sha256');
+  const buf = Buffer.alloc(64 * 1024);
+  let offset = 0;
+  while (offset < size) {
+    const { bytesRead } = await fh.read(buf, 0, Math.min(buf.length, size - offset), offset);
+    if (bytesRead === 0) break;
+    hash.update(buf.subarray(0, bytesRead));
+    offset += bytesRead;
+  }
+  if (offset !== size) throw new Error('short read while hashing');
+  return hash.digest('hex');
+}
+
+async function confine(
+  localDir: string,
+  file: string,
+  maxBytes: number,
+): Promise<{ fh: FileHandle; size: number }> {
+  let root: string;
+  try {
+    root = await realpath(localDir);
+  } catch {
+    throw new Error('upload directory is not available');
+  }
+  const rootStat = await lstat(root);
+  if (!rootStat.isDirectory()) throw new Error('upload directory is not available');
+  const candidate = path.join(root, file);
+  let listed;
+  try {
+    listed = await lstat(candidate);
+  } catch {
+    throw new Error('file is not in the upload directory');
+  }
+  if (listed.isSymbolicLink()) throw new Error('symlink rejected');
+  if (listed.isDirectory()) throw new Error('directory rejected');
+  if (!listed.isFile()) throw new Error('not a regular file');
+  let fh: FileHandle;
+  try {
+    fh = await open(candidate, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  } catch {
+    throw new Error('upload path rejected');
+  }
+  try {
+    const st = await fh.stat();
+    if (!st.isFile()) throw new Error('not a regular file');
+    if (st.size <= 0) throw new Error('file is empty');
+    if (st.size > maxBytes) throw new Error('file exceeds PIKVM_MSD_MAX_BYTES');
+    const resolved = await realpath(candidate);
+    if (path.relative(root, resolved) !== file) throw new Error('upload path rejected');
+    return { fh, size: st.size };
+  } catch (err) {
+    await fh.close().catch(() => undefined);
+    throw err;
+  }
+}
+
+async function assertUploadAllowed(client: PiKVMClient, image: string, size: number): Promise<void> {
+  const state = await client.getMsdState();
+  if (!state.online) throw new MsdPreflightError('MsdOfflineError', 'kvmd MSD is offline');
+  if (state.busy) throw new MsdPreflightError('MsdBusyError', 'kvmd MSD is busy');
+  if (state.drive?.connected === true) throw new MsdPreflightError('MsdConnectedError', 'drive is connected');
+  if (state.images[image]) throw new MsdPreflightError('MsdImageExistsError', 'image already exists');
+  if (state.free === null || state.free < size) {
+    throw new MsdPreflightError('MsdFreeSpaceError', 'free space is below the file size');
+  }
+}
+
+function closeUpload(stream: Readable | undefined, fh: FileHandle): Promise<void> {
+  stream?.destroy();
+  return fh.close().catch(() => undefined);
+}
+
+async function removeUploadedImage(
+  client: PiKVMClient,
+  image: string,
+  device: string,
+): Promise<{ removed: boolean; removeError?: ErrorFields }> {
+  try {
+    await withMsdLock(device, () => client.msdRemove(image));
+    return { removed: true };
+  } catch (err) {
+    return { removed: false, removeError: errorFields(err) };
+  }
+}
+
+function failJob(job: JobRecord, err: unknown): void {
+  job.state = 'failed';
+  job.finishedAt = Date.now();
+  job.error = errorFields(err);
+}
+
+async function runUpload(
+  client: PiKVMClient,
+  request: UploadRequest,
+  fh: FileHandle,
+  size: number,
+  expected: string | undefined,
+  job: JobRecord,
+): Promise<void> {
+  const { device, file } = request;
+  const pollMs = request.uploadPollMs !== undefined
+    && Number.isSafeInteger(request.uploadPollMs)
+    && request.uploadPollMs > 0
+    ? request.uploadPollMs
+    : UPLOAD_POLL_MS;
+  let stream: Readable | undefined;
+  let timer: ReturnType<typeof setInterval> | undefined;
+  const signal = { bad: '' };
+  const sent = { n: 0 };
+  let wrote = false;
+  try {
+    if (request.beforeHash) await request.beforeHash();
+    const prehash = await hashFd(fh, size);
+    if (expected !== undefined && prehash !== expected) throw new Error('sha256 mismatch');
+    await assertUploadAllowed(client, file, size);
+    job.state = 'running';
+    const hash = createHash('sha256');
+    stream = createReadStream(file, {
+      fd: fh.fd,
+      autoClose: false,
+      start: 0,
+      end: size - 1,
+    });
+    const source = stream;
+    const body = Readable.from((async function* () {
+      if (request.beforeUploadStream) await request.beforeUploadStream();
+      for await (const chunk of source) {
+        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        hash.update(buf);
+        sent.n += buf.length;
+        job.bytes = sent.n;
+        yield buf;
+      }
+    })());
+    timer = setInterval(() => {
+      client.getMsdState().then((state) => {
+        const up = state.uploading;
+        if (!up) return;
+        if (up.name !== file) signal.bad = 'storage.uploading name does not match';
+        else if (up.size > 0 && up.size !== size) signal.bad = 'storage.uploading size does not match';
+        else if (up.written > sent.n) signal.bad = 'storage.uploading is ahead of bytes sent';
+      }).catch(() => undefined);
+    }, pollMs);
+    timer.unref();
+    const result = await client.msdWrite(file, body, size, { removeIncomplete: true });
+    wrote = true;
+    const digest = hash.digest('hex');
+    job.sha256 = digest;
+    if (signal.bad) throw new Error(signal.bad);
+    if (digest !== prehash) throw new Error('sha256 changed while uploading');
+    if (result.written !== size) throw new Error('written does not match size');
+    const after = await client.getMsdState();
+    if (after.images[file]?.complete !== true) throw new Error('image is incomplete after upload');
+    job.bytes = size;
+    job.state = 'done';
+    job.finishedAt = Date.now();
+    logMsd('msd_upload', device, file, true, undefined, { bytes: size, sha256: digest });
+  } catch (err) {
+    if (wrote) {
+      const cleanup = await removeUploadedImage(client, file, device);
+      job.removed = cleanup.removed;
+      if (cleanup.removeError) job.removeError = cleanup.removeError;
+    }
+    failJob(job, err);
+    logMsd('msd_upload', device, file, false, job.error?.type ?? 'Error', {
+      bytes: job.bytes,
+      ...(job.sha256 ? { sha256: job.sha256 } : {}),
+      ...(job.removed !== undefined ? { removed: job.removed } : {}),
+    });
+  } finally {
+    if (timer) clearInterval(timer);
+    await closeUpload(stream, fh);
+    pruneJobs(jobLimitOf(request.jobLimit), jobTtlOf(request.jobTtlMs));
+  }
+}
+
+/**
+ * Confine the path, then return a jobId. Hashing and the kvmd pre-check
+ * run in the job (state hashing, then running). A sha256 mismatch fails
+ * the job and does not POST. A second upload while one is running throws
+ * before it opens a file.
+ */
+export async function startMsdUpload(
+  client: PiKVMClient,
+  request: UploadRequest,
+): Promise<{ jobId: string }> {
+  const { device, file, confirmImage, sha256, maxBytes, extensions } = request;
+  if (confirmImage !== file) throw new Error('confirmImage does not match image');
+  assertBareName(file, extensions);
+  const expected = sha256 === undefined ? undefined : normalizeSha256(sha256);
+  acquireUpload(device);
+  let opened: { fh: FileHandle; size: number };
+  try {
+    opened = await confine(request.localDir, file, maxBytes);
+  } catch (err) {
+    releaseUpload(device);
+    throw err;
+  }
+  const job: JobRecord = {
+    state: 'hashing',
+    bytes: 0,
+    total: opened.size,
+  };
+  const jobId = randomBytes(16).toString('hex');
+  jobs.set(jobId, job);
+  pruneJobs(jobLimitOf(request.jobLimit), jobTtlOf(request.jobTtlMs));
+  void runUpload(client, request, opened.fh, opened.size, expected, job)
+    .finally(() => releaseUpload(device));
+  return { jobId };
+}
+
+export async function removeMsd(
+  client: PiKVMClient,
+  image: string,
+  confirmImage: string,
+  device: string,
+): Promise<RemoveResult> {
+  if (confirmImage !== image) throw new Error('confirmImage does not match image');
+  if (
+    image.length === 0
+    || image.includes('/')
+    || image.includes('\\')
+    || image.includes('\0')
+    || image.includes('://')
+  ) {
+    throw new Error('image must be a storage name');
+  }
+  return withMsdLock(device, async () => {
+    const state = await client.getMsdState();
+    if (state.drive?.connected === true) {
+      throw new MsdPreflightError('MsdConnectedError', 'drive is connected');
+    }
+    if (state.busy) throw new MsdPreflightError('MsdBusyError', 'kvmd MSD is busy');
+    try {
+      await client.msdRemove(image);
+      const drive = (await client.getMsdState()).drive;
+      logMsd('msd_remove', device, image, true);
+      return { removed: true, drive };
+    } catch (err) {
+      logMsd('msd_remove', device, image, false, errorFields(err).type);
+      throw err;
+    }
+  });
 }

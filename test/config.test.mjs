@@ -3,6 +3,7 @@
  * Modified 2026-10 by PLN: MSD upload deadlines (GPL-3.0; see NOTICE).
  * Modified 2026-10 by PLN: cap MSD job at 7 days and idle at 1 hour (GPL-3.0; see NOTICE).
  * Modified 2026-10 by PLN: PIKVM_MCP_ARM_MSD (GPL-3.0; see NOTICE).
+ * Modified 2026-10 by PLN: PIKVM_MSD_LOCAL_DIR and PIKVM_MSD_MAX_BYTES (GPL-3.0; see NOTICE).
  *
  * loadEnvFile unit tests — verify PIKVM_MCP_NO_DOTENV=1 makes .env lose to
  * explicitly-set process env (the gateway systemd landmine fix).
@@ -216,6 +217,36 @@ test('MSD upload deadlines default to 6 hours and 60 seconds', () => {
     assert.equal(loadConfig().pikvm.msdIdleTimeoutMs, MSD_IDLE_TIMEOUT_MAX_MS);
     assert.equal(MSD_JOB_TIMEOUT_MAX_MS, 604800000);
     assert.equal(MSD_IDLE_TIMEOUT_MAX_MS, 3600000);
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+});
+
+test('PIKVM_MSD_LOCAL_DIR stays unset and PIKVM_MSD_MAX_BYTES defaults to 16 GiB', () => {
+  const keys = ['PIKVM_HOST', 'PIKVM_PASSWORD', 'PIKVM_MSD_LOCAL_DIR', 'PIKVM_MSD_MAX_BYTES', 'PIKVM_MSD_EXTENSIONS'];
+  const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  process.env.PIKVM_HOST = 'http://mock.test';
+  process.env.PIKVM_PASSWORD = 'testpw';
+  try {
+    delete process.env.PIKVM_MSD_LOCAL_DIR;
+    delete process.env.PIKVM_MSD_MAX_BYTES;
+    delete process.env.PIKVM_MSD_EXTENSIONS;
+    assert.equal(loadConfig().msd.localDir, undefined);
+    assert.equal(loadConfig().msd.maxBytes, 16 * 1024 * 1024 * 1024);
+    assert.deepEqual(loadConfig().msd.extensions, ['.iso', '.img']);
+    process.env.PIKVM_MSD_LOCAL_DIR = '  ';
+    process.env.PIKVM_MSD_MAX_BYTES = '0';
+    process.env.PIKVM_MSD_EXTENSIONS = 'iso, .IMG';
+    assert.equal(loadConfig().msd.localDir, undefined);
+    assert.equal(loadConfig().msd.maxBytes, 16 * 1024 * 1024 * 1024);
+    assert.deepEqual(loadConfig().msd.extensions, ['.iso', '.img']);
+    process.env.PIKVM_MSD_LOCAL_DIR = '/srv/iso';
+    process.env.PIKVM_MSD_MAX_BYTES = '4096';
+    assert.equal(loadConfig().msd.localDir, '/srv/iso');
+    assert.equal(loadConfig().msd.maxBytes, 4096);
   } finally {
     for (const [k, v] of Object.entries(saved)) {
       if (v === undefined) delete process.env[k];
