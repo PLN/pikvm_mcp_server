@@ -1,5 +1,6 @@
 // Modified 2026-10 by PLN: TLS verify, pin, and insecure modes (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: invalid-CA, partial trust, expiry, and IPv6 pin tests (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: TLS 1.2 reset stays unreachable (GPL-3.0; see NOTICE).
 
 /**
  * Self-signed server minted in this process. No committed key.
@@ -22,6 +23,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
+import net from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Readable } from 'node:stream';
@@ -233,6 +235,9 @@ test('pin connect options keep rejectUnauthorized true', () => {
   const options = kvmdConnectOptions(pinSpec(right));
   assert.equal(options.rejectUnauthorized, true);
   assert.equal(options.allowPartialTrustChain, true);
+  const verifyOptions = kvmdConnectOptions({ device: 'default', mode: 'verify' });
+  assert.equal(verifyOptions.rejectUnauthorized, true);
+  assert.equal(Object.hasOwn(verifyOptions, 'allowPartialTrustChain'), false);
   assert.equal(typeof options.checkServerIdentity, 'function');
   assert.doesNotThrow(() => assertPinNotInsecure(options));
   const identity = options.checkServerIdentity;
@@ -613,6 +618,26 @@ describe('pin CLI', { concurrency: false }, () => {
   });
 });
 
+function tlsRecordHasCertificate(buf) {
+  let i = 0;
+  while (i + 5 <= buf.length) {
+    if (buf[i] !== 22) return false;
+    const len = buf.readUInt16BE(i + 3);
+    if (i + 5 + len > buf.length) return false;
+    let j = i + 5;
+    const end = i + 5 + len;
+    while (j + 4 <= end) {
+      const kind = buf[j];
+      const hlen = (buf[j + 1] << 16) | (buf[j + 2] << 8) | buf[j + 3];
+      if (kind === 11) return true;
+      if (j + 4 + hlen > end) break;
+      j += 4 + hlen;
+    }
+    i = end;
+  }
+  return false;
+}
+
 function chainServer(cert, key) {
   const sockets = new Set();
   let connections = 0;
@@ -706,10 +731,16 @@ describe('TLS chain classification', { concurrency: false }, () => {
       right.raw,
       'UNLISTED_TLS_FAILURE',
     );
-    assert.equal(unlisted.code, TLS_VERIFY_FAILED);
-    assert.match(unlisted.message, /UNLISTED_TLS_FAILURE/);
-    assert.match(unlisted.message, /device default/);
-    const mismatch = classifyUnauthorizedPeer(pinSpec(wrong), right.raw, 'UNLISTED_TLS_FAILURE');
+    assert.equal(unlisted, undefined);
+    const authorizedReset = classifyUnauthorizedPeer(
+      { device: 'default', mode: 'verify' },
+      right.raw,
+      'ECONNRESET',
+      'certificate verify failed',
+    );
+    assert.equal(authorizedReset.code, TLS_VERIFY_FAILED);
+    assert.match(authorizedReset.message, /authorizationError/);
+    const mismatch = classifyUnauthorizedPeer(pinSpec(wrong), right.raw, 'ECONNRESET');
     assert.equal(mismatch.code, 'PIKVM_TLS_PIN_MISMATCH');
     assert.match(mismatch.message, new RegExp(right.spkiSha256));
     assert.match(mismatch.message, new RegExp(wrong.spkiSha256));
@@ -914,6 +945,75 @@ describe('TLS chain classification', { concurrency: false }, () => {
       assert.equal(readPinnedCert(link).spkiSha256, right.spkiSha256);
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('a TLS 1.2 reset after the certificate is unreachable in verify and pin mode', async () => {
+    const upstream = tls.createServer({
+      key: right.key,
+      cert: right.cert,
+      minVersion: 'TLSv1.2',
+      maxVersion: 'TLSv1.2',
+    });
+    const sockets = new Set();
+    upstream.on('connection', (socket) => {
+      sockets.add(socket);
+      socket.on('close', () => sockets.delete(socket));
+    });
+    await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve));
+    const upstreamPort = upstream.address().port;
+    let resets = 0;
+    const proxy = net.createServer((client) => {
+      sockets.add(client);
+      const up = net.connect(upstreamPort, '127.0.0.1');
+      sockets.add(up);
+      let acc = Buffer.alloc(0);
+      let cut = false;
+      const cutOnce = () => {
+        if (cut) return;
+        cut = true;
+        resets += 1;
+        client.resetAndDestroy();
+        up.resetAndDestroy();
+      };
+      up.on('data', (chunk) => {
+        acc = Buffer.concat([acc, chunk]);
+        if (!client.destroyed) client.write(chunk);
+        if (tlsRecordHasCertificate(acc)) cutOnce();
+      });
+      client.on('data', (chunk) => {
+        if (!up.destroyed) up.write(chunk);
+      });
+      client.on('error', () => {});
+      up.on('error', () => {});
+    });
+    await new Promise((resolve) => proxy.listen(0, '127.0.0.1', resolve));
+    const port = proxy.address().port;
+    try {
+      for (const spec of [
+        { device: 'default', mode: 'verify' },
+        pinSpec(right),
+      ]) {
+        const client = clientFor(port, spec);
+        const before = resets;
+        try {
+          await assert.rejects(() => client.getMsdState(), (err) => {
+            assert.ok(err instanceof KvmdError);
+            assert.equal(err.type, 'PIKVM_UNREACHABLE');
+            assert.equal(err.type === 'PIKVM_TLS_VERIFY_FAILED', false);
+            assert.equal(err.type === 'PIKVM_TLS_PIN_MISMATCH', false);
+            return true;
+          });
+          await new Promise((resolve) => setTimeout(resolve, 1000));
+          assert.equal(resets - before, 3);
+        } finally {
+          await client.close();
+        }
+      }
+    } finally {
+      for (const socket of sockets) socket.destroy();
+      await new Promise((resolve) => proxy.close(resolve));
+      await new Promise((resolve) => upstream.close(resolve));
     }
   });
 

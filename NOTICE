@@ -22,6 +22,7 @@ Modified 2026-10 by PLN: bearer whitespace check is HTTP-only (GPL-3.0; see belo
 Modified 2026-10 by PLN: TLS verify, pin, and insecure modes (GPL-3.0; see below).
 Modified 2026-10 by PLN: TLS failures follow the socket, and a pinned leaf may be CA-signed (GPL-3.0; see below).
 Modified 2026-10 by PLN: kvmd redirects are not followed (GPL-3.0; see below).
+Modified 2026-10 by PLN: a reset after the certificate stays unreachable (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -551,7 +552,7 @@ No code from another pikvm_mcp_server fork was added for these methods.
   certificate, then pin the new one. pin writes the leaf only. A CA or
   intermediate pin does not match that leaf. A destination that is not
   a certificate is shown as unreadable and does not block a re-pin.
-  rename replaces a   symlink at --out and does not write through it, and
+  rename replaces a symlink at --out and does not write through it, and
   the directory fsync after the rename is best-effort. An IPv6 literal
   is connected without the URL brackets and without an SNI name. No
   code from another pikvm_mcp_server fork was copied.
@@ -564,5 +565,14 @@ No code from another pikvm_mcp_server fork was added for these methods.
   PIKVM_UNEXPECTED_REDIRECT. No existing code fits: PIKVM_UNREACHABLE
   is retried, and an HTTP error would not say that the redirect was
   refused. The message includes the status and the Location origin
-  only, with no userinfo, path, query, or password. The error is not
+  only, with no userinfo, path, query, or password.   The error is not
   retried. No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  A pin mismatch is still PIKVM_TLS_PIN_MISMATCH when the socket error is
+  not a verify code. Any other unauthorized socket is
+  PIKVM_TLS_VERIFY_FAILED only when authorizationError is set or the code
+  is a known X509 verify code. A reset after the Certificate flight, with
+  neither, stays on the transport path and follows the usual unreachable
+  retry rules. verify mode does not set allowPartialTrustChain. No code
+  from another pikvm_mcp_server fork was copied.
