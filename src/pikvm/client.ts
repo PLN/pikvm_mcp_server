@@ -11,6 +11,10 @@
 // Modified 2026-10 by PLN: kvmd redirects are not followed (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: configured host and TLS mode for the device list (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: redactUrl on kvmd error text (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: screenshot preview, crop, and OCR (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: click frames stay on the full preview (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: OCR is not retried after it is sent (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: sharp refuses an oversized image (GPL-3.0; see NOTICE).
 // AbortSignal.timeout and PIKVM_UNREACHABLE / PIKVM_AUTH_FAILED no-retry codes
 // adapted from dtrukr/pikvm_mcp_server src/pikvm/client.ts @ d120243 (GPL-3.0).
 // Snapshot HTTP 503 retry-once adapted from dvaerum/pikvm_mcp_server
@@ -58,6 +62,7 @@
  * All mouse operations use the REST API which is more reliable than WebSocket.
  */
 
+import { randomUUID } from 'node:crypto';
 import { Readable } from 'node:stream';
 import { fetch, request as undiciRequest } from 'undici';
 import type { Agent, Dispatcher } from 'undici';
@@ -69,7 +74,6 @@ import {
   deviceTlsFrom,
   type DeviceTls,
 } from '../tls.js';
-import sharp from 'sharp';
 import {
   HID_OTHER_DEADLINE_MS,
   HID_PRINT_REFUSE_MS,
@@ -78,7 +82,21 @@ import {
   hidDelayQueryValue,
 } from '../hid-deadline.js';
 import { capKvmdField, redactSecrets } from '../redact.js';
-import { redactUrl } from '../url-policy.js';
+import { redactError, redactUrl } from '../url-policy.js';
+import {
+  assertRegionInside,
+  capOcrText,
+  limitedSharp,
+  OCR_PROBE_TIMEOUT_MS,
+  OCR_TIMEOUT_DEFAULT_MS,
+  OCR_TIMEOUT_MAX_MS,
+  ocrBoxToSource,
+  parseOcrState,
+  UnknownFrameError,
+  type OcrBox,
+  type OcrState,
+  type ScreenshotRegion,
+} from '../screenshot.js';
 import {
   MSD_IDLE_TIMEOUT_DEFAULT_MS,
   MSD_IDLE_TIMEOUT_MAX_MS,
@@ -111,6 +129,8 @@ export interface PiKVMConfig {
    * Default 60 seconds. The wait for response headers uses the job ceiling.
    */
   msdIdleTimeoutMs?: number;
+  /** One OCR snapshot. Default 30000. A timeout is not retried. */
+  ocrTimeoutMs?: number;
 }
 
 export interface TypeOptions {
@@ -139,11 +159,52 @@ export interface ScreenshotResult {
   actualHeight: number;
   scaleX: number;
   scaleY: number;
+  /** Returned image size. A crop is smaller than the preview. */
+  width: number;
+  height: number;
+  region?: ScreenshotRegion;
+  calibration: { factorX: number; factorY: number } | null;
+  hid: { min: number; max: number };
+  /** Random id for this capture. Internal captures are not stored. */
+  frameId: string;
 }
 
+/** One stored capture. Mouse coordinates in this image use its scale and origin. */
+export interface ClickFrame {
+  id: string;
+  width: number;
+  height: number;
+  scaleX: number;
+  scaleY: number;
+  originX: number;
+  originY: number;
+  /** A full preview. A crop is stored, and it does not become the default. */
+  full: boolean;
+}
+
+/**
+ * What a mouse tool applied. `frameId` is `default` when the caller did
+ * not pass one. Width and height are null when no full preview is stored.
+ */
+export interface FrameEcho {
+  frameId: string;
+  width: number | null;
+  height: number | null;
+  scaleX: number;
+  scaleY: number;
+  origin: { x: number; y: number };
+}
+
+/** Stored captures per device. Older than this are PIKVM_UNKNOWN_FRAME. */
+const FRAME_STORE_LIMIT = 16;
+
+/** PiKVM absolute mouse range. */
+export const HID_MOUSE_MIN = -32768;
+export const HID_MOUSE_MAX = 32767;
+
 // PiKVM uses signed 16-bit integers for absolute mouse coordinates
-const MOUSE_COORD_MIN = -32768;
-const MOUSE_COORD_MAX = 32767;
+const MOUSE_COORD_MIN = HID_MOUSE_MIN;
+const MOUSE_COORD_MAX = HID_MOUSE_MAX;
 
 // Relative mouse deltas are limited to signed 8-bit range
 const MOUSE_DELTA_MIN = -127;
@@ -161,6 +222,30 @@ function remap(value: number, fromMin: number, fromMax: number, toMin: number, t
  */
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
+}
+
+/**
+ * Convert pixel coordinates to PiKVM's normalized coordinate system.
+ * PiKVM uses range -32768 to 32767 for absolute positioning.
+ * Calibration factors compensate for resolution-dependent scaling.
+ * Without calibration, factors are 1.
+ */
+export function pixelToNormalized(
+  pixelX: number,
+  pixelY: number,
+  resolution: ScreenResolution,
+  calibration: { factorX: number; factorY: number } | null,
+): { x: number; y: number } {
+  const baseX = remap(pixelX, 0, resolution.width - 1, MOUSE_COORD_MIN, MOUSE_COORD_MAX);
+  const baseY = remap(pixelY, 0, resolution.height - 1, MOUSE_COORD_MIN, MOUSE_COORD_MAX);
+  const factorX = calibration?.factorX ?? 1.0;
+  const factorY = calibration?.factorY ?? 1.0;
+  const correctedX = Math.round((baseX + 32768) * factorX) - 32768;
+  const correctedY = Math.round((baseY + 32768) * factorY) - 32768;
+  return {
+    x: clamp(correctedX, MOUSE_COORD_MIN, MOUSE_COORD_MAX),
+    y: clamp(correctedY, MOUSE_COORD_MIN, MOUSE_COORD_MAX),
+  };
 }
 
 export interface CalibrationState {
@@ -190,12 +275,19 @@ export class KvmdError extends Error {
   readonly type: string;
   readonly endpoint: string;
 
-  constructor(status: number, type: string, message: string, endpoint: string) {
+  /**
+   * True only when nothing was written. OCR may retry that case once.
+   * A timeout, an HTTP response, and any other failure leave this false.
+   */
+  readonly preSend: boolean;
+
+  constructor(status: number, type: string, message: string, endpoint: string, preSend = false) {
     super(message);
     this.name = 'KvmdError';
     this.status = status;
     this.type = type;
     this.endpoint = endpoint;
+    this.preSend = preSend;
   }
 }
 
@@ -401,7 +493,7 @@ function transportError(err: unknown, endpoint: string, hid: boolean, device = '
   // A connect timeout or DNS failure can sit under a TimeoutError.
   // Nothing was sent, so this stays unreachable rather than a timeout.
   if (isPreSendFailure(err)) {
-    return new KvmdError(0, 'PIKVM_UNREACHABLE', 'kvmd network error', endpoint);
+    return new KvmdError(0, 'PIKVM_UNREACHABLE', 'kvmd network error', endpoint, true);
   }
   if (isTimeoutError(err)) {
     if (hid) {
@@ -747,6 +839,7 @@ interface ResolvedPiKVMConfig extends PiKVMConfig {
   requestTimeoutMs: number;
   msdJobTimeoutMs: number;
   msdIdleTimeoutMs: number;
+  ocrTimeoutMs: number;
   tls: { default: DeviceTls };
 }
 
@@ -754,10 +847,14 @@ export class PiKVMClient {
   private config: ResolvedPiKVMConfig;
   private dispatcher: Agent;
   private cachedResolution: ScreenResolution | null = null;
-  private screenshotScale: {
-    scaleX: number;
-    scaleY: number;
-  } | null = null;
+  /** Last full preview, chosen by request order. Crops do not replace it. */
+  private defaultFrame: ClickFrame | null = null;
+  private readonly frames = new Map<string, ClickFrame>();
+  private readonly frameOrder: string[] = [];
+  private frameSeq = 0;
+  /** Highest full-preview sequence that has been stored. */
+  private appliedFullSeq = -1;
+  private ocr: OcrState = { status: 'unknown', langs: [] };
   private calibration: CalibrationState | null = null;
 
   constructor(config: PiKVMConfig) {
@@ -767,8 +864,12 @@ export class PiKVMClient {
       requestTimeoutMs: 5000,
       msdJobTimeoutMs: MSD_JOB_TIMEOUT_DEFAULT_MS,
       msdIdleTimeoutMs: MSD_IDLE_TIMEOUT_DEFAULT_MS,
+      ocrTimeoutMs: OCR_TIMEOUT_DEFAULT_MS,
       ...config,
     };
+    if (!Number.isInteger(base.ocrTimeoutMs) || base.ocrTimeoutMs < 1 || base.ocrTimeoutMs > OCR_TIMEOUT_MAX_MS) {
+      throw new Error(`PIKVM_OCR_TIMEOUT_MS must be an integer from 1 to ${OCR_TIMEOUT_MAX_MS}`);
+    }
     base.requestTimeoutMs = clampRequestTimeoutMs(base.requestTimeoutMs);
     base.msdJobTimeoutMs = normalizeMsdTimeoutMs(
       base.msdJobTimeoutMs,
@@ -835,7 +936,8 @@ export class PiKVMClient {
     method: string,
     path: string,
     body?: string | object,
-    contentType?: string
+    contentType?: string,
+    timeoutMs?: number,
   ): Promise<T> {
     const idempotentGet = method.toUpperCase() === 'GET';
     const snapshot = idempotentGet && isSnapshotPath(path);
@@ -844,7 +946,7 @@ export class PiKVMClient {
 
     for (;;) {
       try {
-        return await this.requestOnce<T>(method, path, body, contentType);
+        return await this.requestOnce<T>(method, path, body, contentType, timeoutMs);
       } catch (err) {
         if (!idempotentGet || !(err instanceof KvmdError) || !isRetryableGetError(err)) {
           throw err;
@@ -870,7 +972,8 @@ export class PiKVMClient {
     method: string,
     path: string,
     body?: string | object,
-    contentType?: string
+    contentType?: string,
+    timeoutOverride?: number,
   ): Promise<T> {
     const url = new URL(`/api${path}`, this.config.host);
     const endpoint = `${method.toUpperCase()} ${url.pathname}`;
@@ -893,7 +996,7 @@ export class PiKVMClient {
     const hidPost = isHidPost(method, path);
     const timeoutMs = hidPost
       ? this.hidTimeoutMs(path, body)
-      : this.config.requestTimeoutMs;
+      : (timeoutOverride ?? this.config.requestTimeoutMs);
     let response;
     try {
       response = await fetch(url.toString(), {
@@ -1038,15 +1141,28 @@ export class PiKVMClient {
   }
 
   /**
-   * Take a screenshot and calculate coordinate scaling factors
+   * Take a screenshot and calculate coordinate scaling factors.
+   * Preview parameters are sent only when the caller sets them.
+   * A region is cropped locally and must lie inside the captured image.
+   * Cropping uses sharp().extract, the technique from
+   * dvaerum/pikvm_mcp_server src/pikvm/snapshot.ts at 2d6fa16 (GPL-3.0).
+   * `track: false` is an internal capture. It does not enter the frame
+   * store and does not change the default click frame.
+   * A tracked full preview becomes the default only when its request
+   * sequence is the newest one stored. A crop is stored and is not the default.
    */
   async screenshot(options?: {
     maxWidth?: number;
     maxHeight?: number;
     quality?: number;
+    region?: ScreenshotRegion;
+    track?: boolean;
   }): Promise<ScreenshotResult> {
+    const track = options?.track !== false;
+    const seq = track ? this.frameSeq++ : -1;
+    const frameId = randomUUID();
     const params = new URLSearchParams();
-    if (options?.maxWidth || options?.maxHeight) {
+    if (options?.maxWidth || options?.maxHeight || options?.quality) {
       params.set('preview', '1');
       if (options.maxWidth) params.set('preview_max_width', options.maxWidth.toString());
       if (options.maxHeight) params.set('preview_max_height', options.maxHeight.toString());
@@ -1057,30 +1173,192 @@ export class PiKVMClient {
     const arrayBuffer = await this.request<ArrayBuffer>('GET', path);
     const buffer = Buffer.from(arrayBuffer);
 
-    // Get actual screen resolution (force refresh to ensure accuracy)
     const actualResolution = await this.getResolution(true);
-
-    // Get screenshot dimensions using sharp
-    const metadata = await sharp(buffer).metadata();
+    const metadata = await limitedSharp(buffer).metadata();
     if (!metadata.width || !metadata.height) {
       throw new Error('Failed to read screenshot dimensions');
     }
-    const dimensions = { width: metadata.width, height: metadata.height };
+    const fullWidth = metadata.width;
+    const fullHeight = metadata.height;
+    const scaleX = actualResolution.width / fullWidth;
+    const scaleY = actualResolution.height / fullHeight;
+    const region = options?.region;
+    if (region) assertRegionInside(region, fullWidth, fullHeight);
 
-    // Calculate and store scale factors
-    const scaleX = actualResolution.width / dimensions.width;
-    const scaleY = actualResolution.height / dimensions.height;
-    this.screenshotScale = { scaleX, scaleY };
+    let output = buffer;
+    let width = fullWidth;
+    let height = fullHeight;
+    if (region) {
+      output = Buffer.from(await limitedSharp(buffer)
+        .extract({ left: region.x, top: region.y, width: region.width, height: region.height })
+        .jpeg({ quality: options?.quality ?? 70 })
+        .toBuffer());
+      width = region.width;
+      height = region.height;
+    }
+
+    const frame: ClickFrame = {
+      id: frameId,
+      width,
+      height,
+      scaleX,
+      scaleY,
+      originX: region?.x ?? 0,
+      originY: region?.y ?? 0,
+      full: !region,
+    };
+    if (track) this.storeFrame(frame, seq);
+    const factors = this.calibration
+      ? { factorX: this.calibration.factorX, factorY: this.calibration.factorY }
+      : null;
 
     return {
-      buffer,
-      screenshotWidth: dimensions.width,
-      screenshotHeight: dimensions.height,
+      buffer: output,
+      screenshotWidth: width,
+      screenshotHeight: height,
       actualWidth: actualResolution.width,
       actualHeight: actualResolution.height,
       scaleX,
       scaleY,
+      width,
+      height,
+      ...(region ? { region } : {}),
+      calibration: factors,
+      hid: { min: HID_MOUSE_MIN, max: HID_MOUSE_MAX },
+      frameId,
     };
+  }
+
+  /**
+   * Remember a tracked capture. The default click frame is the newest
+   * full preview by request sequence, not by which call finishes last.
+   */
+  private storeFrame(frame: ClickFrame, seq: number): void {
+    this.frames.set(frame.id, frame);
+    this.frameOrder.push(frame.id);
+    while (this.frameOrder.length > FRAME_STORE_LIMIT) {
+      const dropped = this.frameOrder.shift();
+      if (dropped !== undefined) this.frames.delete(dropped);
+    }
+    if (frame.full && seq >= this.appliedFullSeq) {
+      this.appliedFullSeq = seq;
+      this.defaultFrame = frame;
+    }
+  }
+
+  private frameEcho(frame: ClickFrame | null, explicit: boolean): FrameEcho {
+    if (!frame) {
+      return {
+        frameId: 'default',
+        width: null,
+        height: null,
+        scaleX: 1,
+        scaleY: 1,
+        origin: { x: 0, y: 0 },
+      };
+    }
+    return {
+      frameId: explicit ? frame.id : 'default',
+      width: frame.width,
+      height: frame.height,
+      scaleX: frame.scaleX,
+      scaleY: frame.scaleY,
+      origin: { x: frame.originX, y: frame.originY },
+    };
+  }
+
+  /**
+   * Frame for a mouse or OCR call. An unknown, evicted, or other-device
+   * id throws UnknownFrameError before any HID event.
+   * Omitted uses the last full preview in request order.
+   */
+  describeFrame(frameId?: string): { frame: ClickFrame | null; echo: FrameEcho } {
+    if (frameId !== undefined) {
+      const frame = this.frames.get(frameId);
+      if (!frame) throw new UnknownFrameError(frameId);
+      return { frame, echo: this.frameEcho(frame, true) };
+    }
+    return { frame: this.defaultFrame, echo: this.frameEcho(this.defaultFrame, false) };
+  }
+
+  /** Last OCR probe. Unknown until probeOcr succeeds. */
+  ocrState(): OcrState {
+    return this.ocr;
+  }
+
+  /**
+   * One OCR GET. A timeout is not retried. A response means the request
+   * was sent, so HTTP failures are not retried either. Only a pre-send
+   * PIKVM_UNREACHABLE is tried once more.
+   */
+  private async requestOcr<T>(path: string): Promise<T> {
+    try {
+      return await this.requestOnce<T>('GET', path, undefined, undefined, this.config.ocrTimeoutMs);
+    } catch (err) {
+      if (err instanceof KvmdError && err.preSend && err.type === 'PIKVM_UNREACHABLE') {
+        return this.requestOnce<T>('GET', path, undefined, undefined, this.config.ocrTimeoutMs);
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * GET /streamer/ocr. A definite enabled or disabled answer is cached.
+   * A failure stays unknown and is logged redacted. The probe uses this
+   * client's TLS mode, a short timeout, and no retry.
+   */
+  async probeOcr(deviceName = 'default'): Promise<OcrState> {
+    if (this.ocr.status === 'enabled' || this.ocr.status === 'disabled') return this.ocr;
+    try {
+      const body = await this.requestOnce<unknown>(
+        'GET',
+        '/streamer/ocr',
+        undefined,
+        undefined,
+        OCR_PROBE_TIMEOUT_MS,
+      );
+      const parsed = parseOcrState(body);
+      if (parsed.status === 'enabled' || parsed.status === 'disabled') this.ocr = parsed;
+      else this.ocr = { status: 'unknown', langs: [] };
+    } catch (err) {
+      this.ocr = { status: 'unknown', langs: [] };
+      const copied = redactError(err);
+      console.error(`OCR probe failed for device ${JSON.stringify(deviceName)}: ${copied.message}`);
+    }
+    return this.ocr;
+  }
+
+  /**
+   * OCR passthrough. The box is in preview-frame pixels and is converted
+   * to full resolution with that frame's scale and origin. kvmd returns
+   * text/plain. This does not send preview parameters. A timeout is not
+   * retried. Callers check OCR state before calling.
+   */
+  async readText(options?: { langs?: string[]; box?: OcrBox; frameId?: string }): Promise<string> {
+    const described = this.describeFrame(options?.frameId);
+    let box = options?.box;
+    if (box) {
+      const source = await this.getResolution(true);
+      box = ocrBoxToSource(box, described.frame, source);
+    }
+    const params = new URLSearchParams();
+    params.set('ocr', '1');
+    if (options?.langs && options.langs.length > 0) params.set('ocr_langs', options.langs.join(','));
+    if (box) {
+      params.set('ocr_left', String(box.left));
+      params.set('ocr_top', String(box.top));
+      params.set('ocr_right', String(box.right));
+      params.set('ocr_bottom', String(box.bottom));
+    }
+    const body = await this.requestOcr<unknown>(`/streamer/snapshot?${params}`);
+    let text: string;
+    if (typeof body === 'string') text = body;
+    else if (body !== null && typeof body === 'object' && typeof (body as { result?: unknown }).result === 'string') {
+      text = (body as { result: string }).result;
+    } else {
+      throw new Error('OCR response was not text');
+    }
+    return capOcrText(text);
   }
 
   /**
@@ -1121,33 +1399,6 @@ export class PiKVMClient {
   }
 
   /**
-   * Convert pixel coordinates to PiKVM's normalized coordinate system
-   * PiKVM uses range -32768 to 32767 for absolute positioning
-   *
-   * Calibration factors are applied to compensate for resolution-dependent
-   * coordinate scaling issues. Without calibration, factors default to 1.0.
-   */
-  private pixelToNormalized(pixelX: number, pixelY: number, resolution: ScreenResolution): { x: number; y: number } {
-    // Calculate base normalized coordinates
-    const baseX = remap(pixelX, 0, resolution.width - 1, MOUSE_COORD_MIN, MOUSE_COORD_MAX);
-    const baseY = remap(pixelY, 0, resolution.height - 1, MOUSE_COORD_MIN, MOUSE_COORD_MAX);
-
-    // Apply calibration factors if available, otherwise use 1.0 (no correction)
-    const factorX = this.calibration?.factorX ?? 1.0;
-    const factorY = this.calibration?.factorY ?? 1.0;
-
-    // Convert to unsigned (0-65535), apply calibration, convert back to signed
-    const correctedX = Math.round((baseX + 32768) * factorX) - 32768;
-    const correctedY = Math.round((baseY + 32768) * factorY) - 32768;
-
-    // Clamp to valid range
-    return {
-      x: clamp(correctedX, MOUSE_COORD_MIN, MOUSE_COORD_MAX),
-      y: clamp(correctedY, MOUSE_COORD_MIN, MOUSE_COORD_MAX),
-    };
-  }
-
-  /**
    * Perform calibration by moving cursor to center of screen.
    * Returns information needed for the agent to calculate calibration factors.
    */
@@ -1164,7 +1415,7 @@ export class PiKVMClient {
     this.calibration = null;
 
     // Calculate the normalized coordinates we'll send (without calibration)
-    const normalized = this.pixelToNormalized(centerX, centerY, resolution);
+    const normalized = pixelToNormalized(centerX, centerY, resolution, null);
 
     // Move cursor to center using raw coordinates
     const params = new URLSearchParams();
@@ -1227,7 +1478,7 @@ export class PiKVMClient {
     const savedCalibration = this.calibration;
     this.calibration = null;
 
-    const normalized = this.pixelToNormalized(x, y, resolution);
+    const normalized = pixelToNormalized(x, y, resolution, this.calibration);
 
     // Restore calibration
     this.calibration = savedCalibration;
@@ -1247,18 +1498,29 @@ export class PiKVMClient {
            this.calibration.resolution.height !== currentResolution.height;
   }
 
-  /**
-   * Scale coordinates from screenshot space to actual screen space
-   * If no screenshot has been taken, coordinates pass through unchanged
-   */
-  private scaleCoordinates(x: number, y: number): { x: number; y: number } {
-    if (!this.screenshotScale) {
-      return { x, y };
-    }
+  /** Map pixels in a click frame to screen pixels. No frame means screen pixels. */
+  private mapFrame(frame: ClickFrame | null, x: number, y: number): { x: number; y: number } {
+    if (!frame) return { x, y };
     return {
-      x: Math.round(x * this.screenshotScale.scaleX),
-      y: Math.round(y * this.screenshotScale.scaleY),
+      x: Math.round((x + frame.originX) * frame.scaleX),
+      y: Math.round((y + frame.originY) * frame.scaleY),
     };
+  }
+
+  /** Absolute screen pixels, with calibration. Does not consult a click frame. */
+  private async postMouseMove(pixelX: number, pixelY: number): Promise<{ calibrationInvalidated: boolean }> {
+    const resolution = await this.getResolution(true);
+    let calibrationInvalidated = false;
+    if (this.hasResolutionChanged(resolution)) {
+      this.calibration = null;
+      calibrationInvalidated = true;
+    }
+    const normalized = pixelToNormalized(pixelX, pixelY, resolution, this.calibration);
+    const params = new URLSearchParams();
+    params.set('to_x', normalized.x.toString());
+    params.set('to_y', normalized.y.toString());
+    await this.request('POST', `/hid/events/send_mouse_move?${params}`);
+    return { calibrationInvalidated };
   }
 
   /**
@@ -1294,37 +1556,30 @@ export class PiKVMClient {
   }
 
   /**
-   * Move mouse to absolute pixel position (via REST API)
-   * Coordinates are automatically scaled from screenshot space to screen space
-   * if a scaled screenshot was previously taken.
-   * @param x - X coordinate in pixels (0 = left edge), in screenshot space
-   * @param y - Y coordinate in pixels (0 = top edge), in screenshot space
-   * @returns Object with calibrationInvalidated flag if resolution changed
+   * Move mouse to absolute pixel position (via REST API).
+   * Coordinates are in the default click frame, or in `frameId` when given.
+   * The default is the last full preview in request order. A crop is not
+   * the default. An unknown frameId throws before any HID event.
+   * @param x - X coordinate in that frame (0 = left edge of the image)
+   * @param y - Y coordinate in that frame (0 = top edge of the image)
    */
-  async mouseMove(x: number, y: number): Promise<{ calibrationInvalidated: boolean }> {
-    // Scale coordinates from screenshot space to screen space
-    const scaled = this.scaleCoordinates(x, y);
+  async mouseMove(
+    x: number,
+    y: number,
+    frameId?: string,
+  ): Promise<{ calibrationInvalidated: boolean; frame: FrameEcho }> {
+    const described = this.describeFrame(frameId);
+    const scaled = this.mapFrame(described.frame, x, y);
+    const posted = await this.postMouseMove(scaled.x, scaled.y);
+    return { calibrationInvalidated: posted.calibrationInvalidated, frame: described.echo };
+  }
 
-    // Get screen resolution for coordinate conversion (force refresh to detect changes)
-    const resolution = await this.getResolution(true);
-
-    // Check if resolution changed since calibration
-    let calibrationInvalidated = false;
-    if (this.hasResolutionChanged(resolution)) {
-      // Clear calibration since it's no longer valid
-      this.calibration = null;
-      calibrationInvalidated = true;
-    }
-
-    const normalized = this.pixelToNormalized(scaled.x, scaled.y, resolution);
-
-    const params = new URLSearchParams();
-    params.set('to_x', normalized.x.toString());
-    params.set('to_y', normalized.y.toString());
-
-    await this.request('POST', `/hid/events/send_mouse_move?${params}`);
-
-    return { calibrationInvalidated };
+  /**
+   * Move in screen pixels. Calibration applies. The click frame does not.
+   * Auto-calibrate verification uses this so a prior preview stays put.
+   */
+  async mouseMoveScreen(x: number, y: number): Promise<{ calibrationInvalidated: boolean }> {
+    return this.postMouseMove(x, y);
   }
 
   /**

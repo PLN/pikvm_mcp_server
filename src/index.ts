@@ -7,6 +7,8 @@
 // Modified 2026-10 by PLN: pikvm-mcp-server pin (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: device registry (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: fatal errors go through redactUrl (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: probe OCR at startup (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: OCR probes start after listen (GPL-3.0; see NOTICE).
 /**
  * PiKVM MCP Server
  *
@@ -22,7 +24,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { PiKVMClient } from './pikvm/client.js';
 import { loadConfig, type Config } from './config.js';
 import { BusyLock } from './pikvm/lock.js';
-import { buildFleet } from './devices.js';
+import { buildFleet, startOcrProbes } from './devices.js';
 import { createMcpServer, type McpServerDeps } from './server.js';
 import { startHttpServer } from './http.js';
 import { pinCommand } from './pin.js';
@@ -85,7 +87,9 @@ async function main() {
       armGateEnforced: config.http ? !config.http.armHid : false,
       msdArmGateEnforced: config.http ? !config.http.armMsd : false,
       msd: config.msd,
+      screenshot: config.screenshot,
     });
+    startOcrProbes(fleet.devices.values());
     return;
   }
 
@@ -108,7 +112,9 @@ async function main() {
     armGateEnforced,
     msdArmGateEnforced,
     msd: config.msd,
+    screenshot: config.screenshot,
   });
+  startOcrProbes([{ name: 'default', client: pikvm }]);
 }
 
 const started = process.argv[2] === 'pin'

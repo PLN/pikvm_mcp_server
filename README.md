@@ -19,6 +19,7 @@
 <!-- Modified 2026-10 by PLN: pin the leaf, expiry wording, and Node >=22.9.0 (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: kvmd redirects are not followed (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: calibration and scale are shared across HTTP sessions (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: screenshot defaults, crop, and optional OCR (GPL-3.0; see NOTICE) -->
 
 # PiKVM MCP Server
 
@@ -98,6 +99,9 @@ PIKVM_VERIFY_SSL=false
 PIKVM_TLS_MODE=insecure
 PIKVM_DEFAULT_KEYMAP=en-us
 PIKVM_REQUEST_TIMEOUT_MS=5000
+PIKVM_SCREENSHOT_MAX_WIDTH=960
+PIKVM_SCREENSHOT_MAX_HEIGHT=600
+PIKVM_SCREENSHOT_QUALITY=70
 PIKVM_MSD_JOB_TIMEOUT_MS=21600000
 PIKVM_MSD_IDLE_TIMEOUT_MS=60000
 ```
@@ -171,7 +175,7 @@ If `PIKVM_HOST` is also set, the registry is used and one stderr line says `PIKV
 
 A host is normalised to an http(s) origin. A path, query, or fragment is dropped. Userinfo is an error. There is no IP-range restriction, so a Tailscale `100.64.0.0/10` address or a MagicDNS name is a normal host. `tls.mode` is `verify`, `pin`, or `insecure`. If it is omitted, the device uses `insecure` and stderr names that device and `pikvm-mcp-server pin <device>`. `pin` requires `tls.certFile` and an https origin. `verify` requires https. `PIKVM_TLS_MODE` does not apply to registry devices.
 
-`armHid` and `armMsd` on a device can only narrow the process ceiling. In stdio the ceiling is armed. In HTTP the ceiling is `PIKVM_MCP_ARM_HID` and `PIKVM_MCP_ARM_MSD` (default disarmed). An omitted device flag leaves the ceiling. `true` cannot arm a device the ceiling has disarmed. `msdLocalDir` overrides `PIKVM_MSD_LOCAL_DIR` for that device. `hwTest` must be true before the hardware suite will use the device.
+`armHid` and `armMsd` on a device can only narrow the process ceiling. In stdio the ceiling is armed. In HTTP the ceiling is `PIKVM_MCP_ARM_HID` and `PIKVM_MCP_ARM_MSD` (default disarmed). An omitted device flag leaves the ceiling. `true` cannot arm a device the ceiling has disarmed. `msdLocalDir` overrides `PIKVM_MSD_LOCAL_DIR` for that device. `hwTest` must be true before the hardware suite will use the device. `screenshot` is optional and may set `maxWidth`, `maxHeight`, and `quality`. An omitted field uses `PIKVM_SCREENSHOT_MAX_WIDTH`, `PIKVM_SCREENSHOT_MAX_HEIGHT`, or `PIKVM_SCREENSHOT_QUALITY`. Unknown keys are a startup error.
 
 Each device has its own client, busy lock, MSD job lock, calibration, and arm state. Calibration and the screenshot scale are stored on the device and shared by every HTTP session that uses that device. Per-session state is deferred. Every `pikvm_*` tool except `pikvm_devices` takes an optional `device` argument. Omitted means the registry default. An unknown name is an error that lists the known names and does not open a connection. While a registry is active, tool output names the device that was used. `pikvm_devices` lists names, origins, TLS mode, and arm state. It does not return passwords or secret file paths.
 
@@ -421,8 +425,32 @@ Or if using the .env file:
 ## Available Tools
 
 ### Display
-- **`pikvm_screenshot`** - Capture current screen as JPEG (optional: maxWidth, maxHeight, quality)
+- **`pikvm_screenshot`** - Capture the screen as a JPEG preview (optional: maxWidth, maxHeight, quality, region). Defaults are 960×600 at quality 70.
+- **`pikvm_read_text`** - Read on-screen text with kvmd OCR. Listed while a device is enabled or not yet probed. Slow on small boards.
 - **`pikvm_get_resolution`** - Get screen resolution and valid coordinate ranges
+
+`PIKVM_SCREENSHOT_MAX_WIDTH`, `PIKVM_SCREENSHOT_MAX_HEIGHT`, and `PIKVM_SCREENSHOT_QUALITY` default to 960, 600, and 70. `pikvm_screenshot` sends them as kvmd `preview=1`, `preview_max_width`, `preview_max_height`, and `preview_quality`. A registry `screenshot` object overrides an omitted field. A per-call value wins. Quality is an integer from 1 to 100. Width and height are integers from 1 to 10000.
+
+`region` is `{x, y, width, height}` in pixels of that preview. It is cropped locally with `sharp`. The crop must be integers, have a positive size, and lie fully inside the captured image. Out of bounds is an error and the result has no image.
+
+The text result includes coordinate metadata: `width`, `height`, `actualWidth`, `actualHeight`, `scaleX`, `scaleY`, `region` when a crop was applied, `calibration` (`{factorX, factorY}` or `null`), and `hid` (`{min: -32768, max: 32767}`). `width` and `height` are the returned image. `scaleX` and `scaleY` are the full preview's scale onto the screen, including when the image was cropped. Calibration factors are unchanged: they still multiply the unsigned mouse coordinate.
+
+A point `(px, py)` in the image is converted by adding the crop origin, scaling to screen pixels, then calling `pixelToNormalized` in `src/pikvm/client.ts`. With `scaleX` 2, `scaleY` 2, region `{x: 10, y: 20, width: 100, height: 80}`, and point `(30, 40)` on a 1920×1080 screen:
+
+```
+screenX = round((30 + 10) * 2) = 80
+screenY = round((40 + 20) * 2) = 120
+pixelToNormalized(80, 120, {width: 1920, height: 1080}, {factorX: 1.1, factorY: 0.9})
+  = {x: -29763, y: -26209}
+pixelToNormalized(80, 120, {width: 1920, height: 1080}, null)
+  = {x: -30036, y: -25480}
+```
+
+`null` calibration uses factors of 1. An uncropped image uses a crop origin of 0, so `(30, 40)` at scale 2 is screen `(60, 80)`.
+
+Every capture has a random `frameId`. The default click frame is the last full preview, chosen in request order: a slower earlier capture does not replace a later one that already finished. A crop does not change the default. Internal captures, including auto-calibrate's raw screenshots, do not change it either. Mouse tools take an optional `frameId`. With it, `x` and `y` are pixels in that capture and are mapped with that frame's scale, crop origin, and calibration. Without it, they are pixels in the default frame. The tool result echoes `frameId` or `default`, plus width, height, scale, and origin. The device keeps the last 16 captures. An unknown, evicted, or other-device `frameId` is `PIKVM_UNKNOWN_FRAME` and sends no HID event. On a 1920×1080 screen, a 960×540 preview (scale 2) maps a click at `(480, 270)` to screen `(960, 540)`, which is HID `(17, 30)`. A later crop does not change that click. Passing the crop's `frameId` adds the crop origin before the scale.
+
+`pikvm_read_text` is a passthrough to `GET /streamer/snapshot?ocr=1`. After the server is listening, it probes every device's `GET /streamer/ocr` at once, with that device's TLS mode, a 2 second timeout, and no retry. A probe failure is non-fatal, is redacted, and stays unknown. A definite enabled or disabled answer is cached. The tool stays listed while any device is enabled or still unknown, so a client does not need `tools/list_changed`. A call on a device whose OCR is disabled, or whose lazy probe says disabled, returns `PIKVM_OCR_UNAVAILABLE` and does not fetch an image. An unknown device is probed again on that call. `langs` must be a comma-separated list of languages that device reported. `left`, `top`, `right`, and `bottom` are an optional box in preview-frame pixels: the default click frame, or `frameId` when given. They are converted to full-resolution pixels with that frame's scale and origin, then clamped to the source. kvmd crops the source, so the query uses those full-resolution edges. With no capture yet, the box is already in source pixels. `PIKVM_OCR_TIMEOUT_MS` (default 30000) is the deadline for one OCR snapshot. A timeout is not retried. Only a failure before the request is sent may be retried, and only once. The returned text is capped at 64 KiB and a longer result ends with `[truncated]`. Recognition runs on the PiKVM and is slow on small boards.
 
 ### Keyboard
 - **`pikvm_type`** - Type text with keymap-aware special character handling (required: text; optional: keymap, slow, delay)
@@ -430,9 +458,9 @@ Or if using the .env file:
 - **`pikvm_shortcut`** - Send multiple keys pressed simultaneously (required: keys array)
 
 ### Mouse
-- **`pikvm_mouse_move`** - Move cursor to absolute pixel position or relative delta (required: x, y; optional: relative)
-- **`pikvm_mouse_click`** - Click a mouse button, optionally at a position (optional: button, x, y, state)
-- **`pikvm_mouse_scroll`** - Scroll the mouse wheel (required: deltaY; optional: deltaX)
+- **`pikvm_mouse_move`** - Move cursor in the default click frame, or in `frameId` (required: x, y; optional: relative, frameId)
+- **`pikvm_mouse_click`** - Click a mouse button, optionally at a position in that frame (optional: button, x, y, state, frameId)
+- **`pikvm_mouse_scroll`** - Scroll the mouse wheel (required: deltaY; optional: deltaX, frameId)
 
 ### Calibration
 - **`pikvm_auto_calibrate`** - Automatically detect cursor and compute calibration factors *(preferred)*

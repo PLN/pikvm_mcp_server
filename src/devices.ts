@@ -1,4 +1,6 @@
 // Modified 2026-10 by PLN: per-device client, lock, and arm (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: per-device screenshot defaults (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: OCR probes run together (GPL-3.0; see NOTICE).
 
 /**
  * One PiKVMClient, BusyLock, and arm state per registry device.
@@ -10,6 +12,7 @@ import type { Config } from './config.js';
 import { BusyLock } from './pikvm/lock.js';
 import { PiKVMClient } from './pikvm/client.js';
 import type { DeviceRegistry } from './registry.js';
+import type { ScreenshotSettings } from './screenshot.js';
 import type { TlsMode } from './tls.js';
 
 export interface FleetDevice {
@@ -23,6 +26,7 @@ export interface FleetDevice {
   msdLocalDir?: string;
   hwTest: boolean;
   tlsMode: TlsMode;
+  screenshot: ScreenshotSettings;
 }
 
 export interface Fleet {
@@ -54,6 +58,7 @@ export function buildFleet(config: Config, ceiling: FleetCeiling): Fleet {
       requestTimeoutMs: config.pikvm.requestTimeoutMs,
       msdJobTimeoutMs: config.pikvm.msdJobTimeoutMs,
       msdIdleTimeoutMs: config.pikvm.msdIdleTimeoutMs,
+      ocrTimeoutMs: config.pikvm.ocrTimeoutMs,
     });
     passwords.push(device.password);
     devices.set(name, {
@@ -66,6 +71,7 @@ export function buildFleet(config: Config, ceiling: FleetCeiling): Fleet {
       msdLocalDir: device.msdLocalDir,
       hwTest: device.hwTest,
       tlsMode: device.tls.mode,
+      screenshot: device.screenshot,
     });
   }
   return {
@@ -85,6 +91,14 @@ export function resolveFleetDevice(args: { device?: unknown }, fleet: Fleet): Fl
     throw new Error(`unknown device ${shown}. Known devices: ${known}`);
   }
   return fleet.devices.get(name) as FleetDevice;
+}
+
+/**
+ * Probe OCR on every device at once. Not awaited: a dead device must
+ * not delay startup. A failure stays unknown. A definite answer is cached.
+ */
+export function startOcrProbes(devices: Iterable<{ name: string; client: PiKVMClient }>): void {
+  void Promise.all([...devices].map((device) => device.client.probeOcr(device.name)));
 }
 
 export async function closeFleet(fleet: Fleet): Promise<void> {

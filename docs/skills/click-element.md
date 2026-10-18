@@ -16,6 +16,7 @@ Click a mouse button, optionally moving to a position first. Supports left, righ
 | x | number | *(current)* | X pixel coordinate to move to before clicking |
 | y | number | *(current)* | Y pixel coordinate to move to before clicking |
 | state | "click" \| "press" \| "release" | click | Button state |
+| frameId | string | default frame | Capture whose pixels x and y are in. Unknown sends no HID |
 
 ## Example Calls
 

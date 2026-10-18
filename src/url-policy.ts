@@ -4,6 +4,8 @@
 // Modified 2026-10 by PLN: normalized fetch host, named allowlist errors (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: redact an error chain (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: redact a non-Error cause (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: a throwing getter and a deep cause stay redacted (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: a throwing toString and a long array stay bounded (GPL-3.0; see NOTICE).
 
 /**
  * https allowlist and address checks for pikvm_msd_fetch_url.
@@ -96,42 +98,97 @@ interface CodedError extends Error {
   type?: unknown;
 }
 
+/** Nested causes stop here so a very deep object cannot overflow the stack. */
+const REDACT_DEPTH_CAP = 32;
+
+/** One object or array contributes at most this many entries. */
+const REDACT_ENTRY_CAP = 256;
+
 /** Copy an error with userinfo and query removed, keeping code and cause. */
 export function redactError(err: unknown): Error {
-  return copyRedacted(err, new Map());
+  return copyRedacted(err, new Map(), 0);
 }
 
-function copyRedacted(err: unknown, seen: Map<object, unknown>): Error {
+/**
+ * Text from a caught value. message and toString are each guarded, so a
+ * getter that throws cannot escape or leave its secret in the result.
+ */
+function caughtText(err: unknown): string {
+  if (err instanceof Error) {
+    try {
+      const message = err.message;
+      if (typeof message === 'string') return redactUrl(message);
+    } catch {
+      // The message getter threw. Fall through to toString.
+    }
+  }
+  try {
+    return redactUrl(String(err));
+  } catch {
+    return 'unreadable';
+  }
+}
+
+function readProperty(source: object, key: string): unknown {
+  try {
+    return (source as Record<string, unknown>)[key];
+  } catch (err) {
+    return `[unreadable: ${caughtText(err)}]`;
+  }
+}
+
+function copyRedacted(err: unknown, seen: Map<object, unknown>, depth: number): Error {
   if (!(err instanceof Error)) return new Error(redactUrl(String(err)));
   const existing = seen.get(err);
   if (existing instanceof Error) return existing;
-  const copy = new Error(redactUrl(err.message));
+  const message = readProperty(err, 'message');
+  const copy = new Error(typeof message === 'string' ? redactUrl(message) : redactUrl(String(message)));
   seen.set(err, copy);
-  copy.name = err.name;
-  const coded = err as CodedError;
-  if (typeof coded.code === 'string') (copy as CodedError).code = coded.code;
-  if (typeof coded.type === 'string') (copy as CodedError).type = coded.type;
-  if (err.cause !== undefined) copy.cause = redactValue(err.cause, seen);
+  const name = readProperty(err, 'name');
+  if (typeof name === 'string' && name !== '') copy.name = name;
+  const code = readProperty(err, 'code');
+  const type = readProperty(err, 'type');
+  if (typeof code === 'string') (copy as CodedError).code = code;
+  if (typeof type === 'string') (copy as CodedError).type = type;
+  const cause = readProperty(err, 'cause');
+  if (cause !== undefined) copy.cause = redactValue(cause, seen, depth + 1);
   return copy;
 }
 
-function redactValue(value: unknown, seen: Map<object, unknown>): unknown {
+function redactValue(value: unknown, seen: Map<object, unknown>, depth: number): unknown {
+  if (depth > REDACT_DEPTH_CAP) return '[depth]';
   if (typeof value === 'string') return redactUrl(value);
-  if (value instanceof Error) return copyRedacted(value, seen);
+  if (value instanceof Error) return copyRedacted(value, seen, depth);
   if (value === null || typeof value !== 'object') return value;
   const existing = seen.get(value);
   if (existing !== undefined) return existing;
   if (Array.isArray(value)) {
     const copy: unknown[] = [];
     seen.set(value, copy);
-    for (const item of value) copy.push(redactValue(item, seen));
+    const length = readProperty(value, 'length');
+    const count = typeof length === 'number' && Number.isInteger(length) && length > 0
+      ? Math.min(length, REDACT_ENTRY_CAP)
+      : 0;
+    for (let index = 0; index < count; index += 1) {
+      copy.push(redactValue(readProperty(value, String(index)), seen, depth + 1));
+    }
+    if (typeof length === 'number' && length > REDACT_ENTRY_CAP) copy.push('[length]');
     return copy;
   }
   const copy: Record<string, unknown> = {};
   seen.set(value, copy);
-  for (const key of Object.keys(value)) {
-    copy[key] = redactValue((value as Record<string, unknown>)[key], seen);
+  let keys: string[] = [];
+  try {
+    keys = Object.keys(value);
+  } catch (err) {
+    copy.value = `[unreadable: ${caughtText(err)}]`;
+    return copy;
   }
+  const limited = keys.length > REDACT_ENTRY_CAP ? keys.slice(0, REDACT_ENTRY_CAP) : keys;
+  for (const key of limited) {
+    copy[key] = redactValue(readProperty(value, key), seen, depth + 1);
+  }
+  if (keys.length > REDACT_ENTRY_CAP) copy['[length]'] = '[length]';
   return copy;
 }
 

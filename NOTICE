@@ -28,6 +28,11 @@ Modified 2026-10 by PLN: listed host is an origin (GPL-3.0; see below).
 Modified 2026-10 by PLN: duplicate devices, a shared origin, and a per-device job cap (GPL-3.0; see below).
 Modified 2026-10 by PLN: test certificate serials are minimal DER (GPL-3.0; see below).
 Modified 2026-10 by PLN: redact a non-Error cause, and one host across schemes (GPL-3.0; see below).
+Modified 2026-10 by PLN: a throwing getter and a deep cause stay redacted (GPL-3.0; see below).
+Modified 2026-10 by PLN: screenshot defaults, local crop, and optional OCR (GPL-3.0; see below).
+Modified 2026-10 by PLN: click frames stay on the full preview (GPL-3.0; see below).
+Modified 2026-10 by PLN: OCR is not retried after it is sent (GPL-3.0; see below).
+Modified 2026-10 by PLN: redaction stays bounded, and sharp refuses an oversized image (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -636,4 +641,68 @@ No code from another pikvm_mcp_server fork was added for these methods.
   object cause, including a url. A cause that points at itself is
   copied once. http://h and https://h are the same device, and so are
   two schemes on the same explicit port. The error names both devices.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  redactError reads each cause property inside try/catch. A getter
+  that throws is replaced with a placeholder, and that message is
+  redacted. A cause deeper than 32 levels is replaced with [depth],
+  so a chain of about 20k objects does not overflow the stack.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  pikvm_screenshot sends preview=1 with preview_max_width,
+  preview_max_height, and preview_quality. The defaults are 960, 600,
+  and 70, from PIKVM_SCREENSHOT_MAX_WIDTH, PIKVM_SCREENSHOT_MAX_HEIGHT,
+  and PIKVM_SCREENSHOT_QUALITY. A registry screenshot object may set
+  maxWidth, maxHeight, and quality. An omitted field uses the
+  environment value. A per-call value wins. Quality is 1-100.
+  region is cropped locally with sharp().extract, the technique in
+  dvaerum/pikvm_mcp_server src/pikvm/snapshot.ts at 2d6fa16 (GPL-3.0).
+  The call here is written fresh. No other code from that file was
+  copied. sharp 0.33.5 is Apache-2.0, which can be combined with
+  GPL-3.0-only. Out of bounds returns an error and no image.
+  Every capture reports width, height, actual size, scale, optional
+  region, calibration factors, and the HID range -32768 to 32767.
+  pikvm_read_text passes through GET /streamer/snapshot?ocr=1.
+  Startup probes GET /streamer/ocr per device, with that device's TLS
+  mode, a short timeout, and redacted errors. The tool is registered
+  only when at least one device reports OCR enabled. A disabled or
+  unknown device returns PIKVM_OCR_UNAVAILABLE and does not fetch an
+  image. OCR is slow on small boards. No code from another
+  pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  The default click frame is the last full preview, stored in request
+  order. A capture that finishes later does not replace a newer
+  request. A crop is stored under its own frameId and does not become
+  the default. Auto-calibrate's raw screenshots pass track:false, so
+  they never enter the store. Mouse tools take an optional frameId.
+  Coordinates are mapped with that frame's scale, crop origin, and
+  calibration. The device keeps 16 captures. An unknown, evicted, or
+  other-device id is PIKVM_UNKNOWN_FRAME and sends no HID event.
+  The tool result echoes frameId or default, width, height, scale,
+  and origin. No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  PIKVM_OCR_TIMEOUT_MS defaults to 30 seconds. An OCR snapshot is not
+  retried after a timeout or after the request was sent. A pre-send
+  unreachable error is retried once. The OCR probe runs in parallel
+  after listen, with no retry. A definite enabled or disabled answer
+  is cached. Unknown is probed again on pikvm_read_text. The tool
+  stays listed while any device is enabled or unknown, and a disabled
+  device returns PIKVM_OCR_UNAVAILABLE without fetching an image.
+  The OCR box is in preview-frame pixels and is converted to full
+  resolution with that frame's scale and origin. Returned text is
+  capped at 64 KiB and ends with [truncated] when it is cut.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  redactError guards the message read and the toString read inside
+  the catch. A getter that throws, or a toString that throws, becomes
+  a placeholder and cannot leak the thrown text. An array or object
+  contributes at most 256 entries, then [length]. A sparse array of
+  length 2^25 stays inside that cap. sharp decodes for a crop and for
+  auto-calibrate use limitInputPixels 8192*8192. An image above that
+  is an error and does not replace the click frame.
   No code from another pikvm_mcp_server fork was copied.

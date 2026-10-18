@@ -9,6 +9,9 @@
 // Modified 2026-10 by PLN: pikvm_type delay is milliseconds (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: per-device client, lock, arm, and pikvm_devices (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: pikvm_devices lists an origin (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: screenshot metadata, crop, and optional OCR (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: click frames and frameId (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: OCR stays listed until a device says disabled (GPL-3.0; see NOTICE).
 
 /**
  * MCP server factory for PiKVM tools
@@ -27,10 +30,21 @@ import {
   GetPromptRequestSchema,
   Tool,
 } from '@modelcontextprotocol/sdk/types.js';
-import { type PiKVMClient, KvmdError, redactionPassword } from './pikvm/client.js';
+import { type PiKVMClient, type FrameEcho, KvmdError, redactionPassword } from './pikvm/client.js';
 import { redactSecrets } from './redact.js';
 import type { BusyLock } from './pikvm/lock.js';
 import { type Fleet, type FleetDevice, resolveFleetDevice } from './devices.js';
+import {
+  defaultScreenshotSettings,
+  OcrUnavailableError,
+  UnknownFrameError,
+  parseOcrBox,
+  parseOcrLangs,
+  parseRegion,
+  requireScreenshotInteger,
+  SCREENSHOT_DIMENSION_MAX,
+  type ScreenshotSettings,
+} from './screenshot.js';
 import { autoCalibrateWithRetries } from './pikvm/auto-calibrate.js';
 import { allPrompts, getPromptByName } from './prompts/index.js';
 import { skillTools, isSkillTool, handleSkillToolCall } from './prompts/skill-tools.js';
@@ -79,6 +93,8 @@ export interface McpServerDeps {
    * default, using pikvm and lock, with registryActive false.
    */
   fleet?: Fleet;
+  /** Legacy preview defaults. Registry devices carry their own. */
+  screenshot?: ScreenshotSettings;
 }
 
 /**
@@ -266,6 +282,8 @@ export function formatToolError(error: unknown, password = ''): string {
     error instanceof MsdPreflightError
     || error instanceof MsdUploadBusyError
     || error instanceof MsdUrlPolicyError
+    || error instanceof OcrUnavailableError
+    || error instanceof UnknownFrameError
   ) {
     const message = redact(error.message);
     const details = JSON.stringify({ type: error.type, message });
@@ -330,6 +348,18 @@ function jsonText(value: unknown) {
   };
 }
 
+function withFrame(text: string, echo: FrameEcho): string {
+  return `${text}\n${JSON.stringify(echo)}`;
+}
+
+function parseFrameId(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || value === '') {
+    throw new UnknownFrameError(typeof value === 'string' ? value : typeof value);
+  }
+  return value;
+}
+
 /** Tool-output origin. A legacy host may still carry userinfo, a path, and a query. */
 function outputOrigin(host: string): string {
   return new URL(host).origin;
@@ -348,6 +378,7 @@ function implicitFleet(deps: McpServerDeps): Fleet {
     armMsd: deps.msdArmGateEnforced !== true,
     hwTest: false,
     tlsMode: legacyClient.tlsMode(),
+    screenshot: deps.screenshot ?? defaultScreenshotSettings(),
   };
   return {
     registryActive: false,
@@ -416,21 +447,53 @@ function tagFleetResult<T extends { content?: Array<{ type?: string; text?: stri
 const tools: Tool[] = [
   {
     name: 'pikvm_screenshot',
-    description: 'Capture a screenshot from the PiKVM video stream. Returns the current screen as a JPEG image.',
+    description: 'Capture a screenshot from the PiKVM video stream. Returns a JPEG plus coordinate metadata, including frameId. Defaults are PIKVM_SCREENSHOT_MAX_WIDTH 960, PIKVM_SCREENSHOT_MAX_HEIGHT 600, and PIKVM_SCREENSHOT_QUALITY 70, unless the device registry sets screenshot. A per-call value wins. region crops the captured image locally and must lie inside it. The default click frame is the last full preview, in request order rather than completion order. A crop does not change it. Pass that capture\'s frameId to a mouse tool to click in the crop.',
     inputSchema: {
       type: 'object',
       properties: {
         maxWidth: {
           type: 'number',
-          description: 'Maximum width of the screenshot in pixels (optional, for preview)',
+          description: 'Maximum preview width in pixels (1-10000). Omitted uses the device default.',
         },
         maxHeight: {
           type: 'number',
-          description: 'Maximum height of the screenshot in pixels (optional, for preview)',
+          description: 'Maximum preview height in pixels (1-10000). Omitted uses the device default.',
         },
         quality: {
           type: 'number',
-          description: 'JPEG quality 1-100 (optional, default 80)',
+          description: 'JPEG quality 1-100. Omitted uses the device default (70 unless configured).',
+        },
+        region: {
+          type: 'object',
+          description: 'Crop in screenshot pixels: x, y, width, height. Must lie fully inside the captured image.',
+          properties: {
+            x: { type: 'number' },
+            y: { type: 'number' },
+            width: { type: 'number' },
+            height: { type: 'number' },
+          },
+          required: ['x', 'y', 'width', 'height'],
+        },
+      },
+    },
+  },
+  {
+    name: 'pikvm_read_text',
+    description: 'Read text from the PiKVM screen with kvmd OCR (GET /streamer/snapshot?ocr=1). Listed while any device is enabled or not yet probed. A disabled device returns PIKVM_OCR_UNAVAILABLE and does not fetch an image. Slow on small boards. langs must be a language that device reported. left, top, right, and bottom are an optional box in preview-frame pixels (the default click frame, or frameId). They are converted to full resolution for kvmd. Text is capped at 64 KiB.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        langs: {
+          type: 'string',
+          description: 'Comma-separated OCR languages, each one reported by the device. Omitted uses the kvmd default.',
+        },
+        left: { type: 'number', description: 'Left edge of the OCR box in preview-frame pixels.' },
+        top: { type: 'number', description: 'Top edge of the OCR box in preview-frame pixels.' },
+        right: { type: 'number', description: 'Right edge of the OCR box in preview-frame pixels.' },
+        bottom: { type: 'number', description: 'Bottom edge of the OCR box in preview-frame pixels.' },
+        frameId: {
+          type: 'string',
+          description: 'Capture whose pixels the box is in. Omitted uses the default click frame. Unknown sends no OCR request.',
         },
       },
     },
@@ -510,7 +573,7 @@ const tools: Tool[] = [
   },
   {
     name: 'pikvm_mouse_move',
-    description: 'Move the mouse cursor to a position on the remote machine. For absolute moves, coordinates are in screen pixels (0,0 = top-left). For relative moves, deltas are clamped to -127 to 127.',
+    description: 'Move the mouse cursor. Absolute coordinates are pixels in the default click frame, which is the last full preview in request order. Pass frameId to use that capture, including a crop: the point is mapped with that frame\'s scale, crop origin, and calibration. An unknown, evicted, or other-device frameId is PIKVM_UNKNOWN_FRAME and sends no HID event. Relative deltas are clamped to -127 to 127 and are not mapped through the frame. The result echoes frameId or default, width, height, scale, and origin.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -526,13 +589,17 @@ const tools: Tool[] = [
           type: 'boolean',
           description: 'If true, move relative to current position (delta -127 to 127). Default: false (absolute pixel position)',
         },
+        frameId: {
+          type: 'string',
+          description: 'Capture whose pixels x and y are in. Omitted uses the default click frame (last full preview, request order).',
+        },
       },
       required: ['x', 'y'],
     },
   },
   {
     name: 'pikvm_mouse_click',
-    description: 'Click a mouse button on the remote machine. Optionally move to a pixel position first.',
+    description: 'Click a mouse button. Optional x and y are pixels in the default click frame (the last full preview, in request order). Pass frameId to move in that capture, including a crop. An unknown, evicted, or other-device frameId is PIKVM_UNKNOWN_FRAME and sends no HID event. The result echoes frameId or default, width, height, scale, and origin.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -554,12 +621,16 @@ const tools: Tool[] = [
           enum: ['press', 'release', 'click'],
           description: 'Button state: press (hold), release, or click (default)',
         },
+        frameId: {
+          type: 'string',
+          description: 'Capture whose pixels x and y are in. Omitted uses the default click frame (last full preview, request order).',
+        },
       },
     },
   },
   {
     name: 'pikvm_mouse_scroll',
-    description: 'Scroll the mouse wheel on the remote machine.',
+    description: 'Scroll the mouse wheel. frameId is checked when given: an unknown, evicted, or other-device id is PIKVM_UNKNOWN_FRAME and sends no HID event. The result echoes frameId or default, width, height, scale, and origin.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -570,6 +641,10 @@ const tools: Tool[] = [
         deltaY: {
           type: 'number',
           description: 'Vertical scroll amount (negative = up, positive = down)',
+        },
+        frameId: {
+          type: 'string',
+          description: 'Checked when given. Omitted echoes the default click frame.',
         },
       },
       required: ['deltaY'],
@@ -891,6 +966,15 @@ export function createMcpServer(deps: McpServerDeps): Server {
     const visible = tools.filter((tool) => {
       if (tool.name === 'pikvm_msd_upload' && !uploadReady) return false;
       if (tool.name === 'pikvm_msd_fetch_url' && !fetchReady) return false;
+      if (tool.name === 'pikvm_read_text') {
+        // Probes run after listen, so startup sees unknown. Hide the tool
+        // only once every device has reported disabled. A call still
+        // returns PIKVM_OCR_UNAVAILABLE when that device is disabled.
+        return [...fleet.devices.values()].some((device) => {
+          const status = device.client.ocrState().status;
+          return status === 'enabled' || status === 'unknown';
+        });
+      }
       return true;
     });
     return { tools: visible };
@@ -944,19 +1028,40 @@ export function createMcpServer(deps: McpServerDeps): Server {
       const produced = await (async () => {
       switch (name) {
         case 'pikvm_screenshot': {
-          const result = await deviceClient.screenshot({
-            maxWidth: validateNumber(args.maxWidth, 1, 10000),
-            maxHeight: validateNumber(args.maxHeight, 1, 10000),
-            quality: validateNumber(args.quality, 1, 100),
-          });
+          const settings = active.screenshot;
+          const maxWidth = args.maxWidth === undefined
+            ? settings.maxWidth
+            : requireScreenshotInteger(args.maxWidth, 'maxWidth', 1, SCREENSHOT_DIMENSION_MAX);
+          const maxHeight = args.maxHeight === undefined
+            ? settings.maxHeight
+            : requireScreenshotInteger(args.maxHeight, 'maxHeight', 1, SCREENSHOT_DIMENSION_MAX);
+          const quality = args.quality === undefined
+            ? settings.quality
+            : requireScreenshotInteger(args.quality, 'quality', 1, 100);
+          const region = parseRegion(args.region);
+          const result = await deviceClient.screenshot({ maxWidth, maxHeight, quality, region });
+          const meta = {
+            frameId: result.frameId,
+            width: result.width,
+            height: result.height,
+            actualWidth: result.actualWidth,
+            actualHeight: result.actualHeight,
+            scaleX: result.scaleX,
+            scaleY: result.scaleY,
+            ...(result.region ? { region: result.region } : {}),
+            calibration: result.calibration,
+            hid: result.hid,
+          };
 
-          // Build informative message about the screenshot
           let infoText = `Screenshot captured (${result.screenshotWidth}x${result.screenshotHeight}`;
           if (result.scaleX !== 1 || result.scaleY !== 1) {
             infoText += `, scaled from ${result.actualWidth}x${result.actualHeight}`;
             infoText += `, scale factor: ${result.scaleX.toFixed(2)}x${result.scaleY.toFixed(2)}`;
           }
-          infoText += '). Mouse coordinates from this image will be auto-scaled.';
+          infoText += result.region
+            ? '). This crop does not change the default click frame. Pass frameId to click in this image.'
+            : '). This full preview is the default click frame, in request order.';
+          infoText += `\n${JSON.stringify(meta)}`;
 
           return {
             content: [
@@ -970,6 +1075,28 @@ export function createMcpServer(deps: McpServerDeps): Server {
                 mimeType: 'image/jpeg',
               },
             ],
+          };
+        }
+
+        case 'pikvm_read_text': {
+          let ocr = deviceClient.ocrState();
+          if (ocr.status === 'unknown') {
+            ocr = await deviceClient.probeOcr(active.name);
+          }
+          if (ocr.status !== 'enabled') {
+            throw new OcrUnavailableError(active.name);
+          }
+          const langs = parseOcrLangs(args.langs, ocr.langs, active.name);
+          const box = parseOcrBox({
+            left: args.left,
+            top: args.top,
+            right: args.right,
+            bottom: args.bottom,
+          });
+          const frameId = parseFrameId(args.frameId);
+          const text = await deviceClient.readText({ langs, box, frameId });
+          return {
+            content: [{ type: 'text', text }],
           };
         }
 
@@ -1050,15 +1177,18 @@ export function createMcpServer(deps: McpServerDeps): Server {
           const x = requireNumber(args.x, 'x');
           const y = requireNumber(args.y, 'y');
           const relative = validateBoolean(args.relative) ?? false;
+          const frameId = parseFrameId(args.frameId);
+          const described = deviceClient.describeFrame(frameId);
           let calibrationWarning = '';
           if (relative) {
-            // Relative moves are clamped to -127 to 127 in the client
+            // Relative moves are clamped to -127 to 127 in the client.
+            // The frame is checked and echoed, and the delta is not scaled.
             await deviceClient.mouseMoveRelative(x, y);
           } else {
             // Absolute moves should be positive pixel coordinates
             const clampedX = Math.max(0, Math.round(x));
             const clampedY = Math.max(0, Math.round(y));
-            const result = await deviceClient.mouseMove(clampedX, clampedY);
+            const result = await deviceClient.mouseMove(clampedX, clampedY, frameId);
             if (result.calibrationInvalidated) {
               calibrationWarning = '\n⚠️ Resolution changed - calibration has been cleared. Recalibrate with pikvm_auto_calibrate (preferred) or pikvm_calibrate.';
             }
@@ -1067,9 +1197,9 @@ export function createMcpServer(deps: McpServerDeps): Server {
             content: [
               {
                 type: 'text',
-                text: (relative
+                text: withFrame((relative
                   ? `Moved mouse by (${x}, ${y})`
-                  : `Moved mouse to pixel (${Math.max(0, Math.round(x))}, ${Math.max(0, Math.round(y))})`) + calibrationWarning,
+                  : `Moved mouse to pixel (${Math.max(0, Math.round(x))}, ${Math.max(0, Math.round(y))})`) + calibrationWarning, described.echo),
               },
             ],
           };
@@ -1079,10 +1209,12 @@ export function createMcpServer(deps: McpServerDeps): Server {
           const button = validateEnum(args.button, VALID_BUTTONS, 'left');
           const clickX = validateNumber(args.x, 0);
           const clickY = validateNumber(args.y, 0);
+          const frameId = parseFrameId(args.frameId);
+          const described = deviceClient.describeFrame(frameId);
 
           // Move to position first if specified
           if (clickX !== undefined && clickY !== undefined) {
-            await deviceClient.mouseMove(Math.round(clickX), Math.round(clickY));
+            await deviceClient.mouseMove(Math.round(clickX), Math.round(clickY), frameId);
           }
 
           const state = validateEnum(args.state, VALID_KEY_STATES, 'click');
@@ -1095,19 +1227,21 @@ export function createMcpServer(deps: McpServerDeps): Server {
           }
 
           return {
-            content: [{ type: 'text', text: `${button} click` }],
+            content: [{ type: 'text', text: withFrame(`${button} click`, described.echo) }],
           };
         }
 
         case 'pikvm_mouse_scroll': {
           const deltaY = requireNumber(args.deltaY, 'deltaY');
           const deltaX = validateNumber(args.deltaX) ?? 0;
+          const frameId = parseFrameId(args.frameId);
+          const described = deviceClient.describeFrame(frameId);
           await deviceClient.mouseScroll(deltaX, deltaY);
           return {
             content: [
               {
                 type: 'text',
-                text: `Scrolled (${deltaX}, ${deltaY})`,
+                text: withFrame(`Scrolled (${deltaX}, ${deltaY})`, described.echo),
               },
             ],
           };

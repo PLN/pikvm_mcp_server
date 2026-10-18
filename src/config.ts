@@ -12,6 +12,8 @@
 // Modified 2026-10 by PLN: TLS verify, pin, and insecure modes (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: device registry (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a logged host is an origin (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: screenshot preview defaults (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: PIKVM_OCR_TIMEOUT_MS (GPL-3.0; see NOTICE).
 // Env read adapted from dtrukr/pikvm_mcp_server src/config.ts @ d120243 (GPL-3.0).
 
 /**
@@ -34,6 +36,7 @@ import {
 } from './request-timeout.js';
 import { resolveSecret } from './secrets.js';
 import { loadDeviceRegistry, type DeviceRegistry } from './registry.js';
+import { parseOcrTimeoutMs, parseScreenshotEnv, type ScreenshotSettings } from './screenshot.js';
 import {
   readPinnedCert,
   type DeviceTls,
@@ -164,6 +167,8 @@ export interface Config {
     msdJobTimeoutMs: number;
     /** Idle gap for an MSD upload, from PIKVM_MSD_IDLE_TIMEOUT_MS. Default 60 seconds, max 1 hour. */
     msdIdleTimeoutMs: number;
+    /** One OCR snapshot, from PIKVM_OCR_TIMEOUT_MS. Default 30s. Not retried on timeout. */
+    ocrTimeoutMs: number;
   };
   calibration: {
     rounds: number;
@@ -171,6 +176,8 @@ export interface Config {
     moveDelayMs: number;
   };
   msd: MsdConfig;
+  /** Preview defaults from PIKVM_SCREENSHOT_MAX_WIDTH, _MAX_HEIGHT, and _QUALITY. */
+  screenshot: ScreenshotSettings;
   /** Present only when PIKVM_MCP_PORT is set (HTTP mode). */
   http?: HttpConfig;
   /**
@@ -239,6 +246,7 @@ interface RuntimeConfig {
   requestTimeoutMs: number;
   msdJobTimeoutMs: number;
   msdIdleTimeoutMs: number;
+  ocrTimeoutMs: number;
   defaultKeymap: string;
   calibration: Config['calibration'];
   msd: MsdConfig;
@@ -282,6 +290,7 @@ function readRuntimeConfig(): RuntimeConfig {
     requestTimeoutMs,
     msdJobTimeoutMs,
     msdIdleTimeoutMs,
+    ocrTimeoutMs: parseOcrTimeoutMs(process.env.PIKVM_OCR_TIMEOUT_MS),
     defaultKeymap: process.env.PIKVM_DEFAULT_KEYMAP || 'en-us',
     calibration: {
       rounds: parseInt(process.env.PIKVM_CALIBRATION_ROUNDS || '5', 10),
@@ -311,6 +320,7 @@ function pikvmFrom(host: string, username: string, password: string, deviceTls: 
     requestTimeoutMs: runtime.requestTimeoutMs,
     msdJobTimeoutMs: runtime.msdJobTimeoutMs,
     msdIdleTimeoutMs: runtime.msdIdleTimeoutMs,
+    ocrTimeoutMs: runtime.ocrTimeoutMs,
   };
 }
 
@@ -333,6 +343,7 @@ function loadLegacyConfig(): Config {
     pikvm: pikvmFrom(host, process.env.PIKVM_USERNAME || 'admin', password, deviceTls, runtime),
     calibration: runtime.calibration,
     msd: runtime.msd,
+    screenshot: parseScreenshotEnv(),
     http: runtime.http,
   };
 }
@@ -347,6 +358,7 @@ function loadConfigFromRegistry(registry: DeviceRegistry): Config {
     pikvm: pikvmFrom(device.host, device.username, device.password, device.tls, runtime),
     calibration: runtime.calibration,
     msd: runtime.msd,
+    screenshot: parseScreenshotEnv(),
     http: runtime.http,
     registry,
   };

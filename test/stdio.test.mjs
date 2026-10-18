@@ -100,7 +100,8 @@ test('stdio: initialize works and mouse click dispatches (no arm-gate in stdio)'
     const click = await waitForResponse(2);
     assert.equal(click.result.isError, undefined, JSON.stringify(click.result));
     assert.doesNotMatch(click.result.content[0].text, /arm-gate/, 'stdio mode must NOT be arm-gated');
-    assert.equal(click.result.content[0].text, 'left click');
+    assert.equal(click.result.content[0].text.split('\n')[0], 'left click');
+    assert.equal(JSON.parse(click.result.content[0].text.split('\n')[1]).frameId, 'default');
 
     const buttons = mock.calls.filter((c) => c.path === '/api/hid/events/send_mouse_button');
     assert.equal(buttons.length, 2, 'click dispatched to the mock (press + release)');

@@ -345,7 +345,8 @@ test('HTTP: armed (PIKVM_MCP_ARM_HID=1) -> pikvm_mouse_click dispatches to KVMD 
     });
     const body = await res.json();
     assert.equal(body.result.isError, undefined, JSON.stringify(body));
-    assert.equal(body.result.content[0].text, 'left click');
+    assert.equal(body.result.content[0].text.split('\n')[0], 'left click');
+    assert.equal(JSON.parse(body.result.content[0].text.split('\n')[1]).frameId, 'default');
     const buttons = mock.calls.filter((c) => c.path === '/api/hid/events/send_mouse_button');
     assert.equal(buttons.length, 2, 'click = press + release');
     assert.match(buttons[0].query, /button=left/);

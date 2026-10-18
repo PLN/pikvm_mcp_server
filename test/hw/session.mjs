@@ -4,6 +4,7 @@
 // Modified 2026-10 by PLN: kvmd GET does not follow redirects (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: hardware session uses the registry device (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: hardware logs go through redactUrl (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: probe OCR before the hardware session (GPL-3.0; see NOTICE).
 
 /**
  * In-process MCP HTTP session aimed at one PiKVMClient.
@@ -69,7 +70,7 @@ async function openSession(base, token) {
   return sessionId;
 }
 
-export async function openToolSession({ pikvm, msd, armHid, armMsd, calibration, fleet }) {
+export async function openToolSession({ pikvm, msd, armHid, armMsd, calibration, fleet, screenshot }) {
   const token = randomBytes(24).toString('hex');
   const lock = fleet ? fleet.devices.get(fleet.defaultName).lock : new BusyLock();
   const httpServer = await startHttpServer({
@@ -84,6 +85,7 @@ export async function openToolSession({ pikvm, msd, armHid, armMsd, calibration,
       armGateEnforced: armHid !== true,
       msdArmGateEnforced: armMsd !== true,
       msd,
+      screenshot,
     }),
   });
   const address = httpServer.address();
@@ -128,6 +130,9 @@ export async function openHardwareSession(overrides = {}) {
         `PIKVM_HW_TEST_DEVICE=${JSON.stringify(requested.name)} is not in the registry`,
       );
     }
+    for (const device of fleet.devices.values()) {
+      await device.client.probeOcr(device.name);
+    }
     const spec = config.registry.devices.get(requested.name);
     const session = await openToolSession({
       pikvm: ctx.client,
@@ -136,6 +141,7 @@ export async function openHardwareSession(overrides = {}) {
       armHid: ceilingHid,
       armMsd: ceilingMsd,
       calibration: config.calibration,
+      screenshot: config.screenshot,
     });
     const deviceConfig = {
       ...config,
@@ -173,12 +179,14 @@ export async function openHardwareSession(overrides = {}) {
       `resolveDevice returned ${JSON.stringify(resolved.name)}; only the legacy default device is supported`,
     );
   }
+  await pikvm.probeOcr(resolved.name);
   const session = await openToolSession({
     pikvm: resolved.client,
     msd: { ...config.msd, ...overrides.msd },
     armHid: ceilingHid,
     armMsd: ceilingMsd,
     calibration: config.calibration,
+    screenshot: config.screenshot,
   });
   return {
     ...session,

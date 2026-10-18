@@ -15,11 +15,12 @@ Move the mouse cursor to an absolute pixel position or by a relative delta.
 | x | number | *(required)* | X coordinate (absolute) or delta (relative) |
 | y | number | *(required)* | Y coordinate (absolute) or delta (relative) |
 | relative | boolean | false | If true, move relative to current position |
+| frameId | string | default frame | Capture whose pixels x and y are in |
 
 ## Coordinate Space
 
-- **Absolute mode** (default): (0, 0) is the top-left corner. Maximum values are (width-1, height-1) from `pikvm_get_resolution`.
-- **Relative mode**: Deltas are clamped to -127 to 127 per call. Use multiple calls for larger relative moves.
+- **Absolute mode** (default): pixels in the default click frame, the last full preview in request order. Pass `frameId` to use that capture, including a crop. The point is mapped with that frame's scale, crop origin, and calibration.
+- **Relative mode**: Deltas are clamped to -127 to 127 per call. They are not mapped through the frame. An unknown `frameId` is still rejected.
 
 ## Example Calls
 
