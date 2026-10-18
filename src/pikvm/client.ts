@@ -2,6 +2,7 @@
 // Modified 2026-10 by PLN: client MSD methods (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: MSD deadline caps and upload error codes (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: source-error flag and partial-image message (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: remove_incomplete defaults on (GPL-3.0; see NOTICE).
 // AbortSignal.timeout and PIKVM_UNREACHABLE / PIKVM_AUTH_FAILED no-retry codes
 // adapted from dtrukr/pikvm_mcp_server src/pikvm/client.ts @ d120243 (GPL-3.0).
 // Snapshot HTTP 503 retry-once adapted from dvaerum/pikvm_mcp_server
@@ -226,7 +227,10 @@ export interface MsdState {
 }
 
 export interface MsdWriteOptions {
-  /** kvmd remove_incomplete. Default false, matching kvmd. */
+  /**
+   * kvmd remove_incomplete. Default true so a failed upload does not
+   * leave a partial image. Pass false to keep kvmd's own default.
+   */
   removeIncomplete?: boolean;
 }
 
@@ -1356,7 +1360,7 @@ export class PiKVMClient {
     }
     const query = new URLSearchParams();
     query.set('image', image);
-    query.set('remove_incomplete', kvmdBool(options.removeIncomplete === true));
+    query.set('remove_incomplete', kvmdBool(options.removeIncomplete !== false));
     const outcome = await this.msdPost(
       `/msd/write?${query}`,
       'POST /api/msd/write',
@@ -1387,7 +1391,7 @@ export class PiKVMClient {
     const query = new URLSearchParams();
     query.set('url', url);
     query.set('verify', '1');
-    query.set('remove_incomplete', kvmdBool(options.removeIncomplete === true));
+    query.set('remove_incomplete', kvmdBool(options.removeIncomplete !== false));
     if (options.image !== undefined) query.set('image', options.image);
     if (options.timeout !== undefined) query.set('timeout', String(options.timeout));
     const endpoint = 'POST /api/msd/write_remote';

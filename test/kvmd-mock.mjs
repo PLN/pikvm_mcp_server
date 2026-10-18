@@ -3,6 +3,7 @@
 // Modified 2026-10 by PLN: incomplete images and kvmd error classes (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: pauseWrite and seeded images (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: holdMutations for the MSD mutex test (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: upload busy flag and resetDuringWrite (GPL-3.0; see NOTICE).
 
 /**
  * Minimal KVMD REST mock implementing exactly the routes src/pikvm/client.ts
@@ -24,7 +25,9 @@
  * `legacyFreeShape`, `writeHoldMs`, `pauseWrite`, and `remote` (`lines`,
  * `chunks`, `gapMs`, `headerDelayMs`, `stallAfterHeadersMs`, `redirectTo`).
  * `pauseWrite` accepts POST /api/msd/write, pauses the request, and does
- * not read the body until the socket closes. `holdMutations` is how many
+ * not read the body until the socket closes. `resetDuringWrite` destroys
+ * the socket after the first body chunk. A write in progress sets
+ * `state.busy` and `state.uploading`. `holdMutations` is how many
  * MSD set_params calls wait until `releaseHold()`. `images` seeds storage
  * (`'name.img'` or `{name,size,complete}`). `drive` sets the initial
  * selection (`image` is a seeded name or null, plus connected/cdrom/rw).
@@ -93,16 +96,21 @@ async function sendRoute(req, res, route) {
   res.end(payload);
 }
 
-function readIncoming(req) {
+function readIncoming(req, onProgress) {
   return new Promise((resolve) => {
     const chunks = [];
+    let received = 0;
     let settled = false;
     const finish = () => {
       if (settled) return;
       settled = true;
       resolve(Buffer.concat(chunks));
     };
-    req.on('data', (c) => chunks.push(c));
+    req.on('data', (c) => {
+      chunks.push(c);
+      received += c.length;
+      if (onProgress) onProgress(received);
+    });
     req.on('end', finish);
     req.on('error', finish);
     req.on('close', finish);
@@ -189,6 +197,7 @@ export async function startKvmdMock(options = {}) {
   const freeBytes = Number.isInteger(options.free) ? options.free : 1024 * 1024 * 1024;
   const legacyFreeShape = options.legacyFreeShape === true;
   let busyRemaining = Number.isInteger(options.busyFor) ? options.busyFor : 0;
+  let writeBusy = false;
   const bytes = new Map();
   const uploads = [];
   const state = {
@@ -239,7 +248,7 @@ export async function startKvmdMock(options = {}) {
   }
 
   function syncBusy() {
-    state.busy = busyRemaining > 0;
+    state.busy = busyRemaining > 0 || writeBusy;
   }
 
   function storageImages() {
@@ -294,8 +303,8 @@ export async function startKvmdMock(options = {}) {
   }
 
   function guardMutation(res) {
-    if (busyRemaining > 0) {
-      busyRemaining -= 1;
+    if (busyRemaining > 0 || writeBusy) {
+      if (busyRemaining > 0) busyRemaining -= 1;
       syncBusy();
       kvmdFail(res, 409, 'MsdIsBusyError', MSD_BUSY);
       return true;
@@ -405,16 +414,34 @@ export async function startKvmdMock(options = {}) {
       return true;
     }
     if (req.method === 'POST' && u.pathname === '/api/msd/write') {
-      if (options.pauseWrite) {
-        req.pause();
-        await new Promise((resolve) => {
-          const finish = () => resolve();
-          req.once('aborted', finish);
-          req.once('close', finish);
-          req.socket?.once('close', finish);
-        });
-        if (!res.writableEnded && !res.destroyed) res.destroy();
+      if (options.resetDuringWrite) {
+        req.once('data', () => req.socket.destroy());
+        req.resume();
         return true;
+      }
+      if (options.pauseWrite) {
+        writeBusy = true;
+        syncBusy();
+        state.uploading = {
+          name: u.searchParams.get('image') || '',
+          size: Number(req.headers['content-length']) || 0,
+          written: 0,
+        };
+        try {
+          req.pause();
+          await new Promise((resolve) => {
+            const finish = () => resolve();
+            req.once('aborted', finish);
+            req.once('close', finish);
+            req.socket?.once('close', finish);
+          });
+          if (!res.writableEnded && !res.destroyed) res.destroy();
+          return true;
+        } finally {
+          writeBusy = false;
+          state.uploading = null;
+          syncBusy();
+        }
       }
       const transferEncoding = req.headers['transfer-encoding'] ?? null;
       const contentLength = req.headers['content-length'] ?? null;
@@ -448,44 +475,55 @@ export async function startKvmdMock(options = {}) {
         );
         return true;
       }
-      const buf = await readIncoming(req);
       const declared = Number(contentLength);
-      const full = buf.length === declared;
-      uploads.push({
-        image,
-        body: buf,
-        contentLength,
-        transferEncoding,
-        removeIncomplete,
-        complete: full && !options.failMidWrite,
-      });
-      const keepIncomplete = () => {
-        if (removeIncomplete || !image) return;
-        state.images[image] = imageMeta(image, buf.length, false);
-        bytes.set(image, buf);
-      };
-      const keepComplete = () => {
-        state.images[image] = imageMeta(image, buf.length, true);
-        bytes.set(image, buf);
-        state.parts[''].free = Math.max(0, state.parts[''].free - buf.length);
-      };
-      if (options.failMidWrite) {
-        keepIncomplete();
+      writeBusy = true;
+      syncBusy();
+      state.uploading = { name: image, size: declared, written: 0 };
+      try {
+        const buf = await readIncoming(req, (n) => {
+          if (state.uploading) state.uploading.written = n;
+        });
+        const full = buf.length === declared;
+        uploads.push({
+          image,
+          body: buf,
+          contentLength,
+          transferEncoding,
+          removeIncomplete,
+          complete: full && !options.failMidWrite,
+        });
+        const keepIncomplete = () => {
+          if (removeIncomplete || !image) return;
+          state.images[image] = imageMeta(image, buf.length, false);
+          bytes.set(image, buf);
+        };
+        const keepComplete = () => {
+          state.images[image] = imageMeta(image, buf.length, true);
+          bytes.set(image, buf);
+          state.parts[''].free = Math.max(0, state.parts[''].free - buf.length);
+        };
+        if (options.failMidWrite) {
+          keepIncomplete();
+          if (clientGone(req, res)) return true;
+          kvmdFail(res, 400, 'MsdOperationError', 'write failed');
+          return true;
+        }
+        if (!full) {
+          keepIncomplete();
+          if (clientGone(req, res)) return true;
+          kvmdFail(res, 400, 'ValidatorError', 'Content-Length does not match the body');
+          return true;
+        }
+        if (options.writeHoldMs) await waitOrSocketClose(req, options.writeHoldMs);
+        keepComplete();
         if (clientGone(req, res)) return true;
-        kvmdFail(res, 400, 'MsdOperationError', 'write failed');
+        kvmdOk(res, { image: { name: image, size: buf.length, written: buf.length } });
         return true;
+      } finally {
+        writeBusy = false;
+        state.uploading = null;
+        syncBusy();
       }
-      if (!full) {
-        keepIncomplete();
-        if (clientGone(req, res)) return true;
-        kvmdFail(res, 400, 'ValidatorError', 'Content-Length does not match the body');
-        return true;
-      }
-      if (options.writeHoldMs) await waitOrSocketClose(req, options.writeHoldMs);
-      keepComplete();
-      if (clientGone(req, res)) return true;
-      kvmdOk(res, { image: { name: image, size: buf.length, written: buf.length } });
-      return true;
     }
     if (req.method === 'POST' && u.pathname === '/api/msd/write_remote') {
       if (guardMutation(res)) return true;

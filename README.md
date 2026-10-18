@@ -3,6 +3,7 @@
 <!-- Modified 2026-10 by PLN: cap MSD job at 7 days and idle at 1 hour (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: PIKVM_MCP_ARM_MSD and MSD status, mount, eject (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: mount expectImage and MSD preflight (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: MSD upload jobs and remove (GPL-3.0; see NOTICE) -->
 
 # PiKVM MCP Server
 
@@ -132,9 +133,12 @@ PIKVM_MCP_NO_DOTENV=0
   mode is never gated — local callers gate on their own side.
 - **`PIKVM_MCP_ARM_MSD`** — the MSD arm-gate, separate from HID. HTTP mode
   defaults to **disarmed**: every `pikvm_msd_*` tool except the read-only
-  allowlist (`pikvm_msd_status`) returns a typed error naming this variable
-  and no mass-storage change reaches the device. `PIKVM_MCP_ARM_HID=1` does
-  not arm them. Set `1` to arm. stdio mode is never gated.
+  allowlist (`pikvm_msd_status`, `pikvm_msd_job`) returns a typed error naming
+  this variable and no mass-storage change reaches the device.
+  `PIKVM_MCP_ARM_HID=1` does not arm them. Set `1` to arm. stdio mode is never gated.
+- **`PIKVM_MSD_LOCAL_DIR`** — directory `pikvm_msd_upload` may read, by bare
+  file name only. Unset hides that tool.
+- **`PIKVM_MSD_MAX_BYTES`** — per-transfer cap. Default 16 GiB.
 - **`PIKVM_MCP_NO_DOTENV`** — set `1` to skip `.env` loading entirely (for
   systemd/gateway units that export env directly; a stray `.env` on disk must
   not win). Only read from the real process environment, so a `.env` cannot
@@ -240,10 +244,13 @@ Or if using the .env file:
 
 ### Mass storage
 - **`pikvm_msd_status`** - Read mass-storage state (optional: device). Read-only.
-- **`pikvm_msd_mount`** - Select an image and connect the virtual drive (required: image, mode `cdrom` or `flash`, confirmImage; optional: rw, connect, expectImage, device). `confirmImage` must equal `image`. When a drive is already connected, `expectImage` must equal that image or the mount is refused and the drive stays connected. The image must already be in storage and complete. Returns the drive re-read after the change. On failure the previous selection is restored. An NBD or URL snapshot image cannot be restored, because `set_params` refuses a name that contains `://`.
+- **`pikvm_msd_mount`** - Select an image and connect the virtual drive (required: image, mode `cdrom` or `flash`, confirmImage; optional: rw, connect, expectImage, device). `confirmImage` must equal `image`. When a drive is already connected, `expectImage` must equal that image or the mount is refused and the drive stays connected. An `expectImage` supplied while the drive is disconnected must equal the snapshot image too. The image must already be in storage and complete. Returns the drive re-read after the change. On failure the previous selection is restored. An NBD or URL snapshot image cannot be restored, because `set_params` refuses a name that contains `://`.
 - **`pikvm_msd_eject`** - Disconnect the virtual drive (required: expectImage; optional: device). `expectImage` must equal the current image name, or `""` when none is selected. A second eject returns `alreadyDisconnected`. Any other kvmd error is returned as an error.
+- **`pikvm_msd_upload`** - Upload a bare file name from `PIKVM_MSD_LOCAL_DIR` (required: file, confirmImage; optional: sha256, device). Returns `{jobId}` after the local hash and pre-check. The transfer does not change the drive. Hidden while `PIKVM_MSD_LOCAL_DIR` is unset.
+- **`pikvm_msd_job`** - Read that job: `{state, bytes, total, sha256?, error?}`. Read-only.
+- **`pikvm_msd_remove`** - Remove a stored image (required: image, confirmImage; optional: device). Refuses while the drive is connected and does not disconnect it.
 
-In HTTP mode, MSD changes stay disarmed until `PIKVM_MCP_ARM_MSD=1`. Status stays available. stdio is not gated. Mount and eject run one at a time per device.
+In HTTP mode, MSD changes stay disarmed until `PIKVM_MCP_ARM_MSD=1`. Status and job stay available. stdio is not gated. Mount and eject share one lock per device. Uploads use a separate job lock, so a transfer does not queue mount or eject.
 
 ## Skills (Prompts & Skill Tools)
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 // Modified 2026-10 by PLN: MSD arm-gate (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: MSD local upload directory (GPL-3.0; see NOTICE).
 /**
  * PiKVM MCP Server
  *
@@ -52,6 +53,7 @@ async function main() {
         calibrationConfig,
         armGateEnforced,
         msdArmGateEnforced,
+        msd: config.msd,
       }),
     });
     console.error(
@@ -67,6 +69,7 @@ async function main() {
     calibrationConfig,
     armGateEnforced: false,
     msdArmGateEnforced: false,
+    msd: config.msd,
   });
   const transport = new StdioServerTransport();
   await server.connect(transport);

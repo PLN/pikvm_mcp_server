@@ -87,10 +87,19 @@ test('msdWrite sends an exact Content-Length, no chunked encoding, and the same 
   });
 });
 
+test('msdWrite defaults remove_incomplete to 1', async () => {
+  await withMock({}, async (mock, client) => {
+    await client.msdWrite('disk.img', bodyOf('ab'), 2);
+    const call = mock.calls.find((c) => c.path === '/api/msd/write');
+    assert.match(call.query, /remove_incomplete=1/);
+    assert.equal(mock.state.images['disk.img'].complete, true);
+  });
+});
+
 test('a body that ends short of Content-Length is a mismatch and leaves an incomplete image', async () => {
   await withMock({}, async (mock, client) => {
     await assert.rejects(
-      () => client.msdWrite('short.img', bodyOf('ab'), 6),
+      () => client.msdWrite('short.img', bodyOf('ab'), 6, { removeIncomplete: false }),
       (err) => {
         assert.ok(err instanceof KvmdError);
         assert.equal(err.type, 'PIKVM_CONTENT_LENGTH_MISMATCH');
@@ -742,7 +751,7 @@ test('a mid-body abort keeps a complete:false image unless remove_incomplete', {
   };
   await withMock({}, async (mock, client) => {
     await assert.rejects(
-      () => client.msdWrite('part.img', stalled(), 8),
+      () => client.msdWrite('part.img', stalled(), 8, { removeIncomplete: false }),
       (err) => {
         assert.ok(err instanceof KvmdError);
         assert.equal(err.type, 'PIKVM_MSD_STATE_UNKNOWN');
