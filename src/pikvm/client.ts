@@ -3,6 +3,7 @@
 // Modified 2026-10 by PLN: MSD deadline caps and upload error codes (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: source-error flag and partial-image message (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: remove_incomplete defaults on (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: write_remote timeout is the connect timeout (GPL-3.0; see NOTICE).
 // AbortSignal.timeout and PIKVM_UNREACHABLE / PIKVM_AUTH_FAILED no-retry codes
 // adapted from dtrukr/pikvm_mcp_server src/pikvm/client.ts @ d120243 (GPL-3.0).
 // Snapshot HTTP 503 retry-once adapted from dvaerum/pikvm_mcp_server
@@ -250,7 +251,10 @@ export interface MsdSetParams {
 export interface MsdWriteRemoteOptions {
   /** Storage name. Omitted lets kvmd take the name from the URL. */
   image?: string;
-  /** kvmd downloader timeout in seconds. Omitted sends kvmd's own default. */
+  /**
+   * kvmd downloader connect timeout in seconds (aiohttp sock_connect).
+   * The job wall clock stays on msdJobTimeoutMs. Omitted sends kvmd's own default.
+   */
   timeout?: number;
   removeIncomplete?: boolean;
 }

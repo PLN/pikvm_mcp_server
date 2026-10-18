@@ -3,7 +3,12 @@ Modified 2026-10 by PLN: MSD tools, ARM_MSD, and source-error flag (GPL-3.0; see
 Modified 2026-10 by PLN: mount expectImage, preflight, and MSD mutex (GPL-3.0; see below).
 Modified 2026-10 by PLN: MSD upload jobs and remove (GPL-3.0; see below).
 Modified 2026-10 by PLN: hashing jobs, bad-image cleanup, upload try-lock (GPL-3.0; see below).
+Modified 2026-10 by PLN: URL fetch allowlist and Tailscale opt-in (GPL-3.0; see below).
+Modified 2026-10 by PLN: metadata embeddings, connect timeout, and fetch cleanup (GPL-3.0; see below).
+Modified 2026-10 by PLN: deny local NAT64 and non-global wrapped IPv4 (GPL-3.0; see below).
+Modified 2026-10 by PLN: normalized fetch host and named allowlist errors (GPL-3.0; see below).
 Modified 2026-10 by PLN: close the upload file handle once (GPL-3.0; see below).
+Modified 2026-10 by PLN: the upload double close was the EBADF (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -275,20 +280,104 @@ No code from another pikvm_mcp_server fork was added for these methods.
   No code from another pikvm_mcp_server fork was added.
 
 2026-10, by PLN:
+  Added pikvm_msd_fetch_url. It returns a jobId after the https URL
+  and image name are accepted, then runs DNS, the address check, the
+  kvmd pre-check, and write_remote in that job. The call sends
+  remove_incomplete=1, verify=1, and timeout= from the job ceiling
+  in seconds. insecure is never sent. The image name is the explicit
+  image or the URL's last path segment, checked with the same bare-name
+  rule as upload, and confirmImage must echo it. A second upload or
+  fetch fails immediately with MsdUploadBusyError. On failure an
+  incomplete image is removed the same way as a bad upload.
+  PIKVM_MSD_STATE_UNKNOWN from msdWrite and msdWriteRemote skips that
+  cleanup. Mount of an image with an active upload or fetch returns
+  MsdImageTransferError and makes no POST.
+  PIKVM_MSD_URL_ALLOWLIST is comma-separated https://host[:port]/path-prefix
+  entries plus optional CIDRs inside 100.64.0.0/10 or
+  fd7a:115c:a1e0::/48. Those CIDRs are the only Tailscale opt-in.
+  PIKVM_MSD_URL_ALLOW_PRIVATE=1 allows the other private ranges for an
+  allowlisted host. 169.254.0.0/16, fe80::/10, and IPv4-mapped forms of
+  denied ranges stay denied. Logs omit URL userinfo and the query
+  string. Error text has userinfo removed. This server does not send
+  a redirect manual HEAD. kvmd's downloader (v4.227, already cited)
+  follows redirects and resolves DNS itself, so an allowlisted host can
+  still redirect. No code from another pikvm_mcp_server fork was added.
+
+2026-10, by PLN:
+  Always-deny now includes fd00:ec2::254, Tailscale service addresses
+  100.100.100.100, 100.100.100.200, and fd7a:115c:a1e0::53, checked
+  before the Tailscale opt-in and before ALLOW_PRIVATE. IPv4 embedded
+  in ::/96, 64:ff9b::/96, 64:ff9b:1::/48, and 2002::/16 is extracted
+  and classified with the IPv4 policy, so a metadata embedding stays
+  denied and a private embedding follows ALLOW_PRIVATE. Reserved and
+  documentation ranges are denied. A literal allowlist host in an
+  always-denied range is rejected at config load. write_remote
+  timeout= is the downloader connect timeout (default 30 seconds,
+  PIKVM_MSD_URL_CONNECT_TIMEOUT_SEC), not the 6 hour job wall clock.
+  Cleanup runs only after an NDJSON progress line for this image.
+  A short stream is PIKVM_MSD_STATE_UNKNOWN and still skips cleanup.
+  MsdUnknownImageError from remove means the image is already gone.
+  Error text drops URL userinfo and the query string. kvmd logs the
+  full URL in the PiKVM journal. No code from another pikvm_mcp_server
+  fork was added.
+
+2026-10, by PLN:
+  64:ff9b:1::/48 is denied outright, including a /96-layout embedding
+  such as 64:ff9b:1::a9fe:a9fe, and an allowlist literal in that prefix
+  is rejected at config load. IPv4 wrapped in ::/96, 64:ff9b::/96, or
+  2002::/16 is allowed only when the inner address is globally public.
+  ALLOW_PRIVATE and a Tailscale CIDR do not cover a wrapped form.
+  :: and ::1 stay plain IPv6. ::ffff:0:0/96 stays plain IPv4, because
+  that is how a socket presents an IPv4 address. No code from another
+  pikvm_mcp_server fork was added.
+
+2026-10, by PLN:
+  A trailing-dot hostname is normalized before DNS and before the URL
+  is sent to kvmd, so both use the same host. An always-denied allowlist
+  entry, including a Tailscale CIDR such as 100.100.100.100/32, is
+  rejected at config load and the error names that entry with userinfo
+  and the query removed. A non-numeric
+  PIKVM_MSD_URL_CONNECT_TIMEOUT_SEC uses the 30 second default and logs
+  a warning. That connect timeout stays independent of the 60 second
+  idle timeout and is not clamped to it. No code from another
+  pikvm_mcp_server fork was added.
+
+2026-10, by PLN:
+  A body shorter than Content-Length makes Node emit
+  HPE_INVALID_EOF_STATE from socketOnEnd. That uncaught exception
+  existed only while a socket error listener rethrew it. The listener
+  was added while the upload double close was mistaken for a mock
+  race. With that listener gone, Node's own clientError handling
+  covers the short body. The mock does not install its own. No code
+  from another pikvm_mcp_server fork was added.
+
+2026-10, by PLN:
+  The EBADF seen in CI on this branch was not a mock socket race.
+  The upload passed a numeric FileHandle descriptor to
+  fs.createReadStream. After a mid-read abort the stream's close ran
+  again once the in-flight read finished, and that second close threw
+  EBADF: bad file descriptor, close. That is fixed on main in PR 7
+  (1b13ffc): the upload reads through FileHandle.createReadStream, and
+  while a read is in flight fh.close() waits for the stream's close
+  rather than doing nothing. The test
+  mock no longer ignores EBADF. No code from another pikvm_mcp_server
+  fork was added.
+
+2026-10, by PLN:
   The upload stream was fs.createReadStream with the numeric
-  FileHandle descriptor and autoClose false. destroy() still closes
-  a numeric descriptor. closeUpload then called fh.close() on that
-  same descriptor. After a mid-read abort the second close threw
+  FileHandle descriptor and autoClose false. destroy() closes that
+  descriptor. While a read was still in flight, the stream's close
+  ran after the read returned. That second close threw
   EBADF: bad file descriptor, close. Nothing handled it, so the
   process exited. When the descriptor number had been reused, that
-  second close applied to some other file or socket.
+  close applied to some other file or socket.
   The upload now reads through FileHandle.createReadStream with
   autoClose false, start 0, and end size - 1. The stream holds one
-  ref on the handle. destroy() releases it and closes the descriptor
-  once. A later fh.close() does nothing once the descriptor is
-  closed, and it is the only close when the stream was never created.
-  A connection reset, an idle timeout, and a source read error each
-  take that path. hashFd still uses positioned FileHandle.read and
-  does not open a stream. No other path passes a raw fd to
-  createReadStream.
+  ref on the handle. While a read is in flight, fh.close() waits for
+  the stream's close rather than doing nothing, and the descriptor
+  is closed once, after the read. When the stream was never created,
+  only fh.close() runs. A connection reset, an idle timeout, and a
+  source read error each take that path. hashFd still uses positioned
+  FileHandle.read and does not open a stream. No other path passes a
+  raw fd to createReadStream.
   No code from another pikvm_mcp_server fork was added.

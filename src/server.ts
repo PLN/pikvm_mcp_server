@@ -3,7 +3,9 @@
 // Modified 2026-10 by PLN: MSD read-only allowlist and expectImage (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: upload, job, and remove tools (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: hashing jobs and typed upload errors (GPL-3.0; see NOTICE).
-// Modified 2026-10 by PLN: upload source-read test hook (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: URL fetch tool and transfer mount block (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: write_remote connect timeout (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: redactUrl on tool errors (GPL-3.0; see NOTICE).
 
 /**
  * MCP server factory for PiKVM tools
@@ -28,19 +30,27 @@ import type { BusyLock } from './pikvm/lock.js';
 import { autoCalibrateWithRetries } from './pikvm/auto-calibrate.js';
 import { allPrompts, getPromptByName } from './prompts/index.js';
 import { skillTools, isSkillTool, handleSkillToolCall } from './prompts/skill-tools.js';
-import { MSD_EXTENSIONS_DEFAULT, MSD_MAX_BYTES_DEFAULT, type MsdConfig } from './config.js';
+import {
+  MSD_EXTENSIONS_DEFAULT,
+  MSD_MAX_BYTES_DEFAULT,
+  MSD_URL_CONNECT_TIMEOUT_DEFAULT_SEC,
+  type MsdConfig,
+} from './config.js';
 import {
   ejectMsd,
   mountMsd,
   MsdExpectImageError,
+  MsdImageTransferError,
   MsdPreflightError,
   MsdUploadBusyError,
   publicMsdState,
   readMsdJob,
   removeMsd,
   resolveDevice,
+  startMsdFetch,
   startMsdUpload,
 } from './msd.js';
+import { MsdUrlPolicyError, redactUrl } from './url-policy.js';
 
 export interface McpServerDeps {
   pikvm: PiKVMClient;
@@ -70,11 +80,12 @@ export interface McpServerDeps {
 export interface MsdServerConfig extends MsdConfig {
   beforeHash?: () => Promise<void>;
   beforeUploadStream?: () => Promise<void>;
+  beforeFetch?: () => Promise<void>;
+  /** Hostname to addresses. Unset uses DNS, and does not resolve IP literals. */
+  resolveUrl?: (hostname: string) => Promise<string[]>;
   uploadPollMs?: number;
   jobLimit?: number;
   jobTtlMs?: number;
-  /** Test-only. Unset in production. */
-  failSourceRead?: boolean;
 }
 
 // ============================================================================
@@ -230,18 +241,24 @@ export function msdToolRequiresArm(name: string): boolean {
 
 /**
  * Tool failure text. KvmdError keeps status, type, message, and endpoint.
- * MsdExpectImageError names the connected image. MsdPreflightError and
- * MsdUploadBusyError keep their type. Other errors stay `Error: <message>`.
+ * MsdExpectImageError names the connected image. MsdImageTransferError
+ * names the image with an active transfer. MsdPreflightError,
+ * MsdUploadBusyError, and MsdUrlPolicyError keep their type. URL userinfo
+ * is removed from every message. Other errors stay `Error: <message>`.
  */
 export function formatToolError(error: unknown, password = ''): string {
-  const redact = (value: string) => redactSecrets(value, password);
-  if (error instanceof MsdExpectImageError) {
+  const redact = (value: string) => redactUrl(redactSecrets(value, password));
+  if (error instanceof MsdExpectImageError || error instanceof MsdImageTransferError) {
     const message = redact(error.message);
     const image = redact(error.image);
     const details = JSON.stringify({ type: error.type, image, message });
     return `Error [${error.type}]: ${message}\n${details}`;
   }
-  if (error instanceof MsdPreflightError || error instanceof MsdUploadBusyError) {
+  if (
+    error instanceof MsdPreflightError
+    || error instanceof MsdUploadBusyError
+    || error instanceof MsdUrlPolicyError
+  ) {
     const message = redact(error.message);
     const details = JSON.stringify({ type: error.type, message });
     return `Error [${error.type}]: ${message}\n${details}`;
@@ -562,7 +579,7 @@ const tools: Tool[] = [
   },
   {
     name: 'pikvm_msd_mount',
-    description: 'Select a mass-storage image and, by default, connect the virtual drive. confirmImage must equal image. When a drive is already connected, expectImage must equal that image name or the mount is refused and nothing is ejected. mode is cdrom or flash. rw is for flash and defaults to false; kvmd may force rw false, and the returned drive is a re-read after the change. On failure the previous drive selection is restored. An NBD or URL image in that snapshot cannot be restored, because set_params refuses names containing ://.',
+    description: 'Select a mass-storage image and, by default, connect the virtual drive. confirmImage must equal image. Refuses while that image has an active upload or fetch, and makes no POST. When a drive is already connected, expectImage must equal that image name or the mount is refused and nothing is ejected. mode is cdrom or flash. rw is for flash and defaults to false; kvmd may force rw false, and the returned drive is a re-read after the change. On failure the previous drive selection is restored. An NBD or URL image in that snapshot cannot be restored, because set_params refuses names containing ://.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -644,14 +661,40 @@ const tools: Tool[] = [
     },
   },
   {
+    name: 'pikvm_msd_fetch_url',
+    description: 'Download an image from an allowlisted https URL into PiKVM storage and return a jobId immediately. The URL must be https, have no userinfo, and match PIKVM_MSD_URL_ALLOWLIST. image defaults to the last path segment. confirmImage must equal the final name. DNS, the address check, the kvmd pre-check, and the download run in the job. A second transfer while one is running is refused. The drive is not changed. Poll pikvm_msd_job. Hidden while the allowlist has no https entry.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        device: {
+          type: 'string',
+          description: 'Device name. Ignored until more than one device exists.',
+        },
+        url: {
+          type: 'string',
+          description: 'https URL whose host and path match PIKVM_MSD_URL_ALLOWLIST. No userinfo.',
+        },
+        image: {
+          type: 'string',
+          description: 'Storage name. Defaults to the URL path last segment. Same bare-name rules as upload.',
+        },
+        confirmImage: {
+          type: 'string',
+          description: 'Must equal the final image name.',
+        },
+      },
+      required: ['url', 'confirmImage'],
+    },
+  },
+  {
     name: 'pikvm_msd_job',
-    description: 'Read an in-memory MSD upload job. Returns state hashing, running, done, or failed, plus bytes, total, and sha256 when known. A failed upload that stored the wrong bytes includes removed. Finished jobs are dropped after 24 hours. Does not change the drive.',
+    description: 'Read an in-memory MSD upload or URL fetch job. Returns state hashing, running, done, or failed, plus bytes, total, and sha256 when known. A failed transfer that stored the wrong or incomplete bytes includes removed, except PIKVM_MSD_STATE_UNKNOWN, which skips cleanup. Finished jobs are dropped after 24 hours. Does not change the drive.',
     inputSchema: {
       type: 'object',
       properties: {
         jobId: {
           type: 'string',
-          description: 'Job id returned by pikvm_msd_upload.',
+          description: 'Job id returned by pikvm_msd_upload or pikvm_msd_fetch_url.',
         },
       },
       required: ['jobId'],
@@ -733,9 +776,12 @@ export function createMcpServer(deps: McpServerDeps): Server {
 
   // Handle list tools request
   server.setRequestHandler(ListToolsRequestSchema, async () => {
-    const visible = deps.msd?.localDir
-      ? tools
-      : tools.filter((tool) => tool.name !== 'pikvm_msd_upload');
+    const fetchReady = (deps.msd?.urlAllow?.entries.length ?? 0) > 0;
+    const visible = tools.filter((tool) => {
+      if (tool.name === 'pikvm_msd_upload' && !deps.msd?.localDir) return false;
+      if (tool.name === 'pikvm_msd_fetch_url' && !fetchReady) return false;
+      return true;
+    });
     return { tools: visible };
   });
 
@@ -1110,7 +1156,32 @@ export function createMcpServer(deps: McpServerDeps): Server {
             uploadPollMs: deps.msd?.uploadPollMs,
             jobLimit: deps.msd?.jobLimit,
             jobTtlMs: deps.msd?.jobTtlMs,
-            failSourceRead: deps.msd?.failSourceRead,
+          });
+          return jsonText(outcome);
+        }
+
+        case 'pikvm_msd_fetch_url': {
+          const allow = deps.msd?.urlAllow;
+          if (!allow || allow.entries.length === 0) {
+            throw new Error('pikvm_msd_fetch_url is unavailable until PIKVM_MSD_URL_ALLOWLIST is set');
+          }
+          const resolved = resolveDevice(args, deps.pikvm);
+          const url = requireString(args.url, 'url');
+          const confirmImage = requireString(args.confirmImage, 'confirmImage');
+          const image = args.image === undefined ? undefined : requireString(args.image, 'image');
+          const outcome = await startMsdFetch(resolved.client, {
+            device: resolved.name,
+            url,
+            image,
+            confirmImage,
+            extensions: deps.msd?.extensions ?? MSD_EXTENSIONS_DEFAULT,
+            allow,
+            allowPrivate: deps.msd?.allowPrivate === true,
+            connectTimeoutSec: deps.msd?.connectTimeoutSec ?? MSD_URL_CONNECT_TIMEOUT_DEFAULT_SEC,
+            resolveUrl: deps.msd?.resolveUrl,
+            beforeFetch: deps.msd?.beforeFetch,
+            jobLimit: deps.msd?.jobLimit,
+            jobTtlMs: deps.msd?.jobTtlMs,
           });
           return jsonText(outcome);
         }

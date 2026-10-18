@@ -4,6 +4,9 @@
 // Modified 2026-10 by PLN: pauseWrite and seeded images (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: holdMutations for the MSD mutex test (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: upload busy flag and resetDuringWrite (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: storeIncomplete for fetch cleanup tests (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: kvmd removes an incomplete download unless storeIncomplete (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: the upload double close was the EBADF, not this mock (GPL-3.0; see NOTICE).
 
 /**
  * Minimal KVMD REST mock implementing exactly the routes src/pikvm/client.ts
@@ -23,7 +26,10 @@
  * image bytes. Options: `free`, `busyFor` (how many MSD mutations
  * answer MsdIsBusyError), `failMidWrite`, `failSetConnected`,
  * `legacyFreeShape`, `writeHoldMs`, `pauseWrite`, and `remote` (`lines`,
- * `chunks`, `gapMs`, `headerDelayMs`, `stallAfterHeadersMs`, `redirectTo`).
+ * `chunks`, `gapMs`, `headerDelayMs`, `stallAfterHeadersMs`, `redirectTo`,
+ * `storeIncomplete`). `redirectTo` answers 302 and does not follow it.
+ * An error line does not leave an image: kvmd removes the incomplete
+ * file itself. `storeIncomplete` keeps that file so a test can see our remove.
  * `pauseWrite` accepts POST /api/msd/write, pauses the request, and does
  * not read the body until the socket closes. `resetDuringWrite` destroys
  * the socket after the first body chunk. A write in progress sets
@@ -565,6 +571,10 @@ export async function startKvmdMock(options = {}) {
         JSON.stringify({ ok: true, result: { image: { name, size: 4, written: 2 } } }),
         JSON.stringify({ ok: true, result: { image: { name, size: 4, written: 4 } } }),
       ];
+      if (remote.storeIncomplete) {
+        state.images[name] = imageMeta(name, 4, false);
+        bytes.set(name, Buffer.from('part'));
+      }
       for (const line of lines) {
         if (remote.gapMs) await waitOrClose(req, remote.gapMs);
         if (req.destroyed || res.writableEnded) return true;
@@ -636,7 +646,6 @@ export async function startKvmdMock(options = {}) {
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'mock: unknown route' }));
   });
-
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const port = server.address().port;
 

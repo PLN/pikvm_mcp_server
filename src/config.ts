@@ -3,6 +3,9 @@
 // Modified 2026-10 by PLN: cap MSD job at 7 days and idle at 1 hour (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: PIKVM_MCP_ARM_MSD (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: PIKVM_MSD_LOCAL_DIR and PIKVM_MSD_MAX_BYTES (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: PIKVM_MSD_URL_ALLOWLIST and URL private opt-in (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: write_remote connect timeout (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: warn on a junk connect timeout (GPL-3.0; see NOTICE).
 // Env read adapted from dtrukr/pikvm_mcp_server src/config.ts @ d120243 (GPL-3.0).
 
 /**
@@ -23,6 +26,7 @@ import {
   parseMsdTimeoutMs,
   parseRequestTimeoutMs,
 } from './request-timeout.js';
+import { parseUrlAllowlist, type UrlAllowlist } from './url-policy.js';
 
 // Load .env file from project root
 // - quiet: true prevents stdout output that would corrupt MCP protocol
@@ -99,6 +103,34 @@ export interface MsdConfig {
   localDir?: string;
   maxBytes: number;
   extensions: readonly string[];
+  /** No https entry hides pikvm_msd_fetch_url. */
+  urlAllow: UrlAllowlist;
+  /** Allows other private ranges. Never link-local, metadata, or Tailscale. */
+  allowPrivate: boolean;
+  /** kvmd write_remote connect timeout in seconds. Not the job wall clock. */
+  connectTimeoutSec: number;
+}
+
+/** aiohttp sock_connect budget sent as write_remote timeout=. Default 30s. */
+export const MSD_URL_CONNECT_TIMEOUT_DEFAULT_SEC = 30;
+export const MSD_URL_CONNECT_TIMEOUT_MAX_SEC = 120;
+
+export function parseUrlConnectTimeoutSec(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === '' || raw.trim() === '0') {
+    return MSD_URL_CONNECT_TIMEOUT_DEFAULT_SEC;
+  }
+  const trimmed = raw.trim();
+  if (!/^[0-9]+$/.test(trimmed)) {
+    console.error(JSON.stringify({
+      event: 'msd_config',
+      ok: false,
+      error: 'PIKVM_MSD_URL_CONNECT_TIMEOUT_SEC is not a number of seconds; using the default',
+    }));
+    return MSD_URL_CONNECT_TIMEOUT_DEFAULT_SEC;
+  }
+  const sec = Number(trimmed);
+  if (sec > MSD_URL_CONNECT_TIMEOUT_MAX_SEC) return MSD_URL_CONNECT_TIMEOUT_MAX_SEC;
+  return sec;
 }
 
 export interface Config {
@@ -179,6 +211,9 @@ export function loadConfig(): Config {
       localDir: parseMsdLocalDir(process.env.PIKVM_MSD_LOCAL_DIR),
       maxBytes: parseMsdMaxBytes(process.env.PIKVM_MSD_MAX_BYTES),
       extensions: parseMsdExtensions(process.env.PIKVM_MSD_EXTENSIONS),
+      urlAllow: parseUrlAllowlist(process.env.PIKVM_MSD_URL_ALLOWLIST),
+      allowPrivate: process.env.PIKVM_MSD_URL_ALLOW_PRIVATE === '1',
+      connectTimeoutSec: parseUrlConnectTimeoutSec(process.env.PIKVM_MSD_URL_CONNECT_TIMEOUT_SEC),
     },
     http,
   };

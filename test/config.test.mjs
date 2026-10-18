@@ -4,6 +4,10 @@
  * Modified 2026-10 by PLN: cap MSD job at 7 days and idle at 1 hour (GPL-3.0; see NOTICE).
  * Modified 2026-10 by PLN: PIKVM_MCP_ARM_MSD (GPL-3.0; see NOTICE).
  * Modified 2026-10 by PLN: PIKVM_MSD_LOCAL_DIR and PIKVM_MSD_MAX_BYTES (GPL-3.0; see NOTICE).
+ * Modified 2026-10 by PLN: PIKVM_MSD_URL_ALLOWLIST and URL private opt-in (GPL-3.0; see NOTICE).
+ * Modified 2026-10 by PLN: write_remote connect timeout (GPL-3.0; see NOTICE).
+ * Modified 2026-10 by PLN: local NAT64 allowlist literals (GPL-3.0; see NOTICE).
+ * Modified 2026-10 by PLN: junk connect timeout warning (GPL-3.0; see NOTICE).
  *
  * loadEnvFile unit tests — verify PIKVM_MCP_NO_DOTENV=1 makes .env lose to
  * explicitly-set process env (the gateway systemd landmine fix).
@@ -280,6 +284,100 @@ test('PIKVM_MCP_ARM_MSD defaults off and ARM_HID does not arm it', () => {
     process.env.PIKVM_MCP_ARM_MSD = 'true';
     assert.equal(loadConfig().http.armMsd, false);
   } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+});
+
+test('PIKVM_MSD_URL_ALLOWLIST is empty by default and ALLOW_PRIVATE is off', () => {
+  const keys = [
+    'PIKVM_HOST',
+    'PIKVM_PASSWORD',
+    'PIKVM_MSD_URL_ALLOWLIST',
+    'PIKVM_MSD_URL_ALLOW_PRIVATE',
+    'PIKVM_MSD_URL_CONNECT_TIMEOUT_SEC',
+    'PIKVM_MSD_JOB_TIMEOUT_MS',
+  ];
+  const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  process.env.PIKVM_HOST = 'http://mock.test';
+  process.env.PIKVM_PASSWORD = 'testpw';
+  try {
+    delete process.env.PIKVM_MSD_URL_ALLOWLIST;
+    delete process.env.PIKVM_MSD_URL_ALLOW_PRIVATE;
+    delete process.env.PIKVM_MSD_URL_CONNECT_TIMEOUT_SEC;
+    delete process.env.PIKVM_MSD_JOB_TIMEOUT_MS;
+    const empty = loadConfig().msd;
+    assert.equal(empty.urlAllow.entries.length, 0);
+    assert.equal(empty.allowPrivate, false);
+    assert.equal(empty.connectTimeoutSec, 30);
+    process.env.PIKVM_MSD_URL_ALLOWLIST = 'https://images.example/iso,100.64.0.0/10';
+    process.env.PIKVM_MSD_URL_ALLOW_PRIVATE = '1';
+    process.env.PIKVM_MSD_JOB_TIMEOUT_MS = '90000';
+    const set = loadConfig().msd;
+    assert.equal(set.urlAllow.entries[0].host, 'images.example');
+    assert.equal(set.urlAllow.entries[0].pathPrefix, '/iso');
+    assert.equal(set.urlAllow.tailscale.check('100.101.102.103', 'ipv4'), true);
+    assert.equal(set.allowPrivate, true);
+    assert.equal(set.connectTimeoutSec, 30);
+    process.env.PIKVM_MSD_URL_CONNECT_TIMEOUT_SEC = '45';
+    assert.equal(loadConfig().msd.connectTimeoutSec, 45);
+    process.env.PIKVM_MSD_URL_CONNECT_TIMEOUT_SEC = '9999';
+    assert.equal(loadConfig().msd.connectTimeoutSec, 120);
+    process.env.PIKVM_MSD_URL_ALLOWLIST = '10.0.0.0/8';
+    assert.throws(() => loadConfig(), /tailscale opt-in/);
+    process.env.PIKVM_MSD_URL_ALLOWLIST = 'https://169.254.169.254/iso';
+    assert.throws(() => loadConfig(), /always denied/);
+    process.env.PIKVM_MSD_URL_ALLOWLIST = 'https://[64:ff9b:1::a9fe:a9fe]/';
+    assert.throws(() => loadConfig(), /always denied/);
+    process.env.PIKVM_MSD_URL_ALLOWLIST = '100.100.100.100/32';
+    assert.throws(() => loadConfig(), /100\.100\.100\.100\/32 is always denied/);
+    process.env.PIKVM_MSD_URL_ALLOWLIST = 'https://alice:s3cret@169.254.169.254/iso?token=keep';
+    assert.throws(() => loadConfig(), (err) => {
+      assert.equal(err instanceof Error, true);
+      assert.match(err.message, /169\.254\.169\.254\/iso is always denied/);
+      assert.equal(err.message.includes('s3cret'), false);
+      assert.equal(err.message.includes('token'), false);
+      return true;
+    });
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+});
+
+test('a non-numeric connect timeout uses the default and warns', () => {
+  const keys = [
+    'PIKVM_HOST',
+    'PIKVM_PASSWORD',
+    'PIKVM_MSD_URL_CONNECT_TIMEOUT_SEC',
+  ];
+  const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  const orig = console.error;
+  const logged = [];
+  console.error = (line) => {
+    logged.push(String(line));
+  };
+  process.env.PIKVM_HOST = 'http://mock.test';
+  process.env.PIKVM_PASSWORD = 'testpw';
+  try {
+    process.env.PIKVM_MSD_URL_CONNECT_TIMEOUT_SEC = '30s';
+    assert.equal(loadConfig().msd.connectTimeoutSec, 30);
+    assert.equal(logged.some((line) => line.includes('30s')), false);
+    assert.ok(logged.some((line) => line.includes('msd_config') && line.includes('using the default')));
+    logged.length = 0;
+    process.env.PIKVM_MSD_URL_CONNECT_TIMEOUT_SEC = '';
+    assert.equal(loadConfig().msd.connectTimeoutSec, 30);
+    process.env.PIKVM_MSD_URL_CONNECT_TIMEOUT_SEC = '0';
+    assert.equal(loadConfig().msd.connectTimeoutSec, 30);
+    process.env.PIKVM_MSD_URL_CONNECT_TIMEOUT_SEC = '9999';
+    assert.equal(loadConfig().msd.connectTimeoutSec, 120);
+    assert.equal(logged.length, 0);
+  } finally {
+    console.error = orig;
     for (const [k, v] of Object.entries(saved)) {
       if (v === undefined) delete process.env[k];
       else process.env[k] = v;

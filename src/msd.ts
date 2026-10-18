@@ -2,7 +2,11 @@
 // Modified 2026-10 by PLN: expectImage, preflight, and MSD mutex (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: upload jobs, remove, and job lock (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: hashing jobs, bad-image cleanup, upload try-lock (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: URL fetch jobs and mount block during a transfer (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: fetch cleanup only after our progress line (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: redactUrl on MSD errors (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: close the upload file handle once (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: fh.close waits for the in-flight read (GPL-3.0; see NOTICE).
 
 /**
  * Policy for MSD status, mount, eject, upload, and remove.
@@ -10,8 +14,9 @@
  * and mount rollback live here.
  * Mount and eject share a per-device mutex so one session's rollback
  * cannot run in the middle of another's change. An upload takes a
- * fail-fast try-lock, so a second upload is refused and a transfer
- * does not queue mount or eject.
+ * fail-fast try-lock, so a second upload or URL fetch is refused and a
+ * transfer does not queue mount or eject. Mount refuses an image that
+ * already has an active transfer.
  */
 
 import { createHash, randomBytes } from 'node:crypto';
@@ -24,8 +29,17 @@ import {
   KvmdError,
   type MsdDriveState,
   type MsdState,
+  type MsdWriteResult,
   type PiKVMClient,
 } from './pikvm/client.js';
+import {
+  assertResolvedAddresses,
+  inspectFetchUrl,
+  MsdUrlPolicyError,
+  redactUrl,
+  resolveFetchHost,
+  type UrlAllowlist,
+} from './url-policy.js';
 
 export interface ResolvedDevice {
   name: string;
@@ -103,13 +117,25 @@ export class MsdPreflightError extends Error {
   }
 }
 
-/** Another upload already holds this device. The caller is not queued. */
+/** Another upload or URL fetch already holds this device. The caller is not queued. */
 export class MsdUploadBusyError extends Error {
   readonly type = 'MsdUploadBusyError';
 
   constructor() {
     super('upload already running');
     this.name = 'MsdUploadBusyError';
+  }
+}
+
+/** Mount of an image that still has an upload or fetch job. No kvmd call is made. */
+export class MsdImageTransferError extends Error {
+  readonly type = 'MsdImageTransferError';
+  readonly image: string;
+
+  constructor(image: string) {
+    super(`image ${JSON.stringify(image)} has an active transfer`);
+    this.name = 'MsdImageTransferError';
+    this.image = image;
   }
 }
 
@@ -174,7 +200,7 @@ function errorFields(err: unknown): ErrorFields {
     return {
       status: err.status,
       type: err.type,
-      message: err.message,
+      message: redactUrl(err.message),
       endpoint: err.endpoint,
     };
   }
@@ -182,18 +208,20 @@ function errorFields(err: unknown): ErrorFields {
     err instanceof MsdExpectImageError
     || err instanceof MsdPreflightError
     || err instanceof MsdUploadBusyError
+    || err instanceof MsdImageTransferError
+    || err instanceof MsdUrlPolicyError
   ) {
     return {
       status: 0,
       type: err.type,
-      message: err.message,
+      message: redactUrl(err.message),
       endpoint: '',
     };
   }
   return {
     status: 0,
     type: 'Error',
-    message: err instanceof Error ? err.message : 'MSD operation failed',
+    message: redactUrl(err instanceof Error ? err.message : 'MSD operation failed'),
     endpoint: '',
   };
 }
@@ -339,6 +367,7 @@ async function mountMsdLocked(client: PiKVMClient, request: MountRequest): Promi
   if (image.includes('://')) {
     throw new Error('image must not contain ://');
   }
+  assertNoActiveTransfer(device, image);
   const state = await client.getMsdState();
   // Offline hides the drive, so there is no snapshot image to compare.
   if (!state.online) {
@@ -432,6 +461,8 @@ interface JobRecord {
   state: JobState;
   bytes: number;
   total: number;
+  device: string;
+  image: string;
   sha256?: string;
   error?: ErrorFields;
   removed?: boolean;
@@ -440,6 +471,15 @@ interface JobRecord {
 }
 
 const jobs = new Map<string, JobRecord>();
+
+function assertNoActiveTransfer(device: string, image: string): void {
+  for (const job of jobs.values()) {
+    if (job.device !== device || job.image !== image) continue;
+    if (job.state === 'hashing' || job.state === 'running') {
+      throw new MsdImageTransferError(image);
+    }
+  }
+}
 
 function jobLimitOf(value: number | undefined): number {
   return value !== undefined && Number.isSafeInteger(value) && value > 0 ? value : JOB_CAP;
@@ -503,11 +543,6 @@ export interface UploadRequest {
   jobLimit?: number;
   /** Finished-job TTL in ms. Default 24h. Unset in production. */
   jobTtlMs?: number;
-  /**
-   * Test-only. After the first byte is queued, the upload body throws
-   * EIO. Unset in production.
-   */
-  failSourceRead?: boolean;
 }
 
 export interface RemoveResult {
@@ -613,11 +648,12 @@ async function assertUploadAllowed(client: PiKVMClient, image: string, size: num
 }
 
 /**
- * One owner. fh.createReadStream holds a ref on the handle, and
- * destroy() drops it. That closes the descriptor once. fh.close()
- * does nothing after that, and it is the only close when the stream
- * was never opened. A numeric fd passed to fs.createReadStream is
- * closed again by destroy(), and the second close throws EBADF.
+ * One owner. fh.createReadStream holds a ref on the handle.
+ * The second close was the stream's delayed close after the
+ * in-flight read. While a read is in flight, fh.close() waits for
+ * that close rather than doing nothing, and the descriptor is
+ * closed once, after the read. When the stream was never created,
+ * only fh.close() runs.
  */
 function closeUpload(stream: Readable | undefined, fh: FileHandle): Promise<void> {
   stream?.destroy();
@@ -633,6 +669,9 @@ async function removeUploadedImage(
     await withMsdLock(device, () => client.msdRemove(image));
     return { removed: true };
   } catch (err) {
+    if (err instanceof KvmdError && err.type === 'MsdUnknownImageError') {
+      return { removed: true };
+    }
     return { removed: false, removeError: errorFields(err) };
   }
 }
@@ -679,14 +718,6 @@ async function runUpload(
       if (request.beforeUploadStream) await request.beforeUploadStream();
       for await (const chunk of source) {
         const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-        if (request.failSourceRead) {
-          const head = buf.subarray(0, 1);
-          hash.update(head);
-          sent.n += head.length;
-          job.bytes = sent.n;
-          yield head;
-          throw Object.assign(new Error('disk read failed'), { code: 'EIO' });
-        }
         hash.update(buf);
         sent.n += buf.length;
         job.bytes = sent.n;
@@ -761,6 +792,8 @@ export async function startMsdUpload(
     state: 'hashing',
     bytes: 0,
     total: opened.size,
+    device,
+    image: file,
   };
   const jobId = randomBytes(16).toString('hex');
   jobs.set(jobId, job);
@@ -802,4 +835,114 @@ export async function removeMsd(
       throw err;
     }
   });
+}
+
+export interface FetchRequest {
+  device: string;
+  url: string;
+  image?: string;
+  confirmImage: string;
+  extensions: readonly string[];
+  allow: UrlAllowlist;
+  allowPrivate: boolean;
+  /** kvmd downloader connect timeout in seconds. Not the job wall clock. */
+  connectTimeoutSec: number;
+  resolveUrl?: (hostname: string) => Promise<string[]>;
+  /** Awaited in the job before DNS. Unset in production. */
+  beforeFetch?: () => Promise<void>;
+  jobLimit?: number;
+  jobTtlMs?: number;
+}
+
+async function assertFetchAllowed(client: PiKVMClient, image: string): Promise<void> {
+  const state = await client.getMsdState();
+  if (!state.online) throw new MsdPreflightError('MsdOfflineError', 'kvmd MSD is offline');
+  if (state.busy) throw new MsdPreflightError('MsdBusyError', 'kvmd MSD is busy');
+  if (state.drive?.connected === true) throw new MsdPreflightError('MsdConnectedError', 'drive is connected');
+  if (state.images[image]) throw new MsdPreflightError('MsdImageExistsError', 'image already exists');
+}
+
+function isStateUnknown(err: unknown): boolean {
+  return err instanceof KvmdError && err.type === 'PIKVM_MSD_STATE_UNKNOWN';
+}
+
+async function runFetch(
+  client: PiKVMClient,
+  request: FetchRequest,
+  inspected: { href: string; hostname: string },
+  image: string,
+  job: JobRecord,
+): Promise<void> {
+  const { device } = request;
+  let sawOurImage = false;
+  try {
+    if (request.beforeFetch) await request.beforeFetch();
+    const addresses = await resolveFetchHost(inspected.hostname, request.resolveUrl);
+    assertResolvedAddresses(addresses, request.allow, request.allowPrivate);
+    await assertFetchAllowed(client, image);
+    let last: MsdWriteResult | undefined;
+    for await (const row of client.msdWriteRemote(inspected.href, {
+      image,
+      removeIncomplete: true,
+      timeout: request.connectTimeoutSec,
+    })) {
+      last = row;
+      if (row.name === image) sawOurImage = true;
+      job.bytes = row.written;
+      job.total = row.size;
+    }
+    // msdWriteRemote throws PIKVM_MSD_STATE_UNKNOWN when the stream ends
+    // with written !== size. That happens before this line, and the catch
+    // below does not remove the image for that error.
+    if (!last || !sawOurImage) {
+      throw new Error('write_remote ended without progress for this image');
+    }
+    job.bytes = last.written;
+    job.total = last.size;
+    job.state = 'done';
+    job.finishedAt = Date.now();
+    logMsd('msd_fetch', device, image, true, undefined, { bytes: last.written });
+  } catch (err) {
+    if (sawOurImage && !isStateUnknown(err)) {
+      const cleanup = await removeUploadedImage(client, image, device);
+      job.removed = cleanup.removed;
+      if (cleanup.removeError) job.removeError = cleanup.removeError;
+    }
+    failJob(job, err);
+    logMsd('msd_fetch', device, image, false, job.error?.type ?? 'Error', {
+      bytes: job.bytes,
+      ...(job.removed !== undefined ? { removed: job.removed } : {}),
+    });
+  } finally {
+    pruneJobs(jobLimitOf(request.jobLimit), jobTtlOf(request.jobTtlMs));
+  }
+}
+
+/**
+ * Accept the URL and image name, then return a jobId. DNS, the address
+ * policy, the kvmd pre-check, and write_remote run in the job. A second
+ * transfer while one is running throws before any kvmd call.
+ */
+export async function startMsdFetch(
+  client: PiKVMClient,
+  request: FetchRequest,
+): Promise<{ jobId: string }> {
+  const inspected = inspectFetchUrl(request.url, request.allow);
+  const image = request.image ?? inspected.imageFromPath;
+  assertBareName(image, request.extensions);
+  if (request.confirmImage !== image) throw new Error('confirmImage does not match image');
+  acquireUpload(request.device);
+  const job: JobRecord = {
+    state: 'running',
+    bytes: 0,
+    total: 0,
+    device: request.device,
+    image,
+  };
+  const jobId = randomBytes(16).toString('hex');
+  jobs.set(jobId, job);
+  pruneJobs(jobLimitOf(request.jobLimit), jobTtlOf(request.jobTtlMs));
+  void runFetch(client, request, inspected, image, job)
+    .finally(() => releaseUpload(request.device));
+  return { jobId };
 }
