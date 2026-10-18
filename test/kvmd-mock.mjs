@@ -6,6 +6,7 @@
 // Modified 2026-10 by PLN: upload busy flag and resetDuringWrite (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: storeIncomplete for fetch cleanup tests (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: kvmd removes an incomplete download unless storeIncomplete (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: ignore EBADF while a mock socket closes (GPL-3.0; see NOTICE).
 
 /**
  * Minimal KVMD REST mock implementing exactly the routes src/pikvm/client.ts
@@ -644,6 +645,14 @@ export async function startKvmdMock(options = {}) {
     }
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'mock: unknown route' }));
+  });
+  // closeAllConnections can emit EBADF when the fd is already gone.
+  // An error listener keeps that race from failing the test.
+  server.on('connection', (socket) => {
+    socket.on('error', (err) => {
+      if (err?.code === 'EBADF') return;
+      throw err;
+    });
   });
 
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));

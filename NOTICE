@@ -7,6 +7,7 @@ Modified 2026-10 by PLN: URL fetch allowlist and Tailscale opt-in (GPL-3.0; see 
 Modified 2026-10 by PLN: metadata embeddings, connect timeout, and fetch cleanup (GPL-3.0; see below).
 Modified 2026-10 by PLN: deny local NAT64 and non-global wrapped IPv4 (GPL-3.0; see below).
 Modified 2026-10 by PLN: normalized fetch host and named allowlist errors (GPL-3.0; see below).
+Modified 2026-10 by PLN: ignore EBADF when a mock socket is already closed (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -337,5 +338,6 @@ No code from another pikvm_mcp_server fork was added for these methods.
   and the query removed. A non-numeric
   PIKVM_MSD_URL_CONNECT_TIMEOUT_SEC uses the 30 second default and logs
   a warning. That connect timeout stays independent of the 60 second
-  idle timeout and is not clamped to it. No code from another
+  idle timeout and is not clamped to it. The kvmd test mock ignores
+  EBADF on a socket that is already closed. No code from another
   pikvm_mcp_server fork was added.
