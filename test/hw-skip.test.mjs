@@ -1,4 +1,5 @@
 // Modified 2026-10 by PLN: hardware suite self-skip (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: the net marker is on TAP stdout (GPL-3.0; see NOTICE).
 
 /**
  * The hardware files must not run during npm test, and with
@@ -29,6 +30,7 @@ test('npm test and CI do not run the hardware suite', () => {
   assert.match(pkg.scripts.test, /test\/\*\.test\.mjs/);
   assert.doesNotMatch(pkg.scripts.test, /test:hw|test\/hw/);
   assert.match(pkg.scripts['test:hw'], /test\/hw\/\*\.hw\.test\.mjs/);
+  assert.match(pkg.scripts['test:hw'], /--test-concurrency=1/);
   const ci = readFileSync(join(repo, '.github/workflows/ci.yml'), 'utf8');
   assert.match(ci, /npm test/);
   assert.doesNotMatch(ci, /test:hw/);
@@ -62,17 +64,26 @@ test('only the legacy default device is accepted', () => {
 describe('hardware suite process', () => {
   test('unset device skips every hardware test with no network', async () => {
     const guard = join(repo, 'test', 'hw-net-guard.mjs');
+    const discovered = join(repo, 'test', 'hw-discovered-reporter.mjs');
     const env = {
       PATH: process.env.PATH,
       HOME: process.env.HOME ?? '/tmp',
       TMPDIR: process.env.TMPDIR ?? '/tmp',
       PIKVM_MCP_NO_DOTENV: '1',
-      NODE_OPTIONS: `--import ${guard}`,
     };
     // Node 22.14 treats `node --test test/hw` as a directory import when
     // package.json says "type": "module", so the files are not discovered.
     // `node --test` with this directory as cwd finds *.hw.test.mjs.
-    const child = spawn(process.execPath, ['--test', '--test-reporter', 'tap'], {
+    // --import is an argv so a path with spaces is one argument.
+    // The stock TAP reporter does not name discovered files. This reporter
+    // lists them and still emits the "# tests N" summary, including a
+    // child file's stderr (where the net marker is written).
+    const child = spawn(process.execPath, [
+      '--import', guard,
+      '--test',
+      '--test-reporter', discovered,
+      '--test-concurrency=1',
+    ], {
       cwd: join(repo, 'test', 'hw'),
       env,
     });
@@ -86,13 +97,17 @@ describe('hardware suite process', () => {
       child.once('error', reject);
       child.once('close', resolve);
     });
-    assert.equal(stderr.includes('HW_NET_CALL'), false, stderr);
-    assert.equal(code, 0, `${stderr}\n${stdout}`);
+    const combined = `${stdout}\n${stderr}`;
+    assert.equal(combined.includes('HW_NET_CALL'), false, combined);
+    assert.equal(code, 0, combined);
     assert.equal(summaryCount(stdout, 'fail'), 0);
     assert.equal(summaryCount(stdout, 'cancelled'), 0);
     assert.equal(summaryCount(stdout, 'pass'), 0);
-    assert.ok(summaryCount(stdout, 'tests') > 0);
-    assert.equal(summaryCount(stdout, 'skipped'), summaryCount(stdout, 'tests'));
+    assert.equal(summaryCount(stdout, 'tests'), 7);
+    assert.equal(summaryCount(stdout, 'skipped'), 7);
+    for (const name of ['readonly.hw.test.mjs', 'msd.hw.test.mjs', 'hid.hw.test.mjs']) {
+      assert.match(stdout, new RegExp(name));
+    }
     assert.match(stdout, /PIKVM_HW_TEST_DEVICE is unset/);
   });
 });
