@@ -1,0 +1,78 @@
+Modified 2026-10 by PLN: added this NOTICE (GPL-3.0; see below).
+
+pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
+
+Licence
+-------
+
+This program is free software: you can redistribute it and/or modify it
+under the terms of the GNU General Public License, version 3. The licence
+text is the file LICENSE, unchanged from upstream.
+
+This fork is GPL-3.0-only. The upstream statement is GPL-3.0 and does not
+grant the option of any later version, so this fork does not add one.
+Upstream package.json said "MIT" while LICENSE and README said GPL-3.0.
+This fork follows LICENSE.
+
+Origins
+-------
+
+Upstream project:
+  KultivatorConsulting/pikvm_mcp_server
+  branch main at a859da7a7d9f2679e7728da46c387c24e5348296
+  Licence: GPL-3.0
+
+The Streamable HTTP transport, bearer auth, and HID arm-gate are carried
+unchanged from:
+  woodwosj/pikvm_mcp_server
+  branch feat/http-transport-armgate
+  at c292659fe70e548eb0cb19de2023ff298f9a9798
+  Licence: GPL-3.0
+
+The five commits on that branch after
+a859da7a7d9f2679e7728da46c387c24e5348296 are attributed in the public git
+history to the kultivator-consulting account:
+
+  745623c228387189b64023d3b37e7c5584128fda
+    Add Streamable HTTP transport, bearer auth, and HID arm-gate
+  dc948d05d4b1b90be8514af03ff5b2efd1688f87
+    Apply reviewer amendments: bind host, no SSE, full HID gate, dotenv belts
+  fe200461398a4c831339547c0b8b96aee5cc62b7
+    Docs: drop 0.0.0.0 as a bind option per hardened fleet contract
+  bf15f476ec319e40c6e08ea34070648f4924147c
+    Docs: record /healthz exposure posture in security notes
+  c292659fe70e548eb0cb19de2023ff298f9a9798
+    Close review findings 1 and 4: idle-session reaper, fail-closed test
+
+CI
+--
+
+The GitHub Actions test job is adapted from the test job only of
+dvaerum/pikvm_mcp_server .github/workflows/ci.yml at
+00cbfc0207c1be2b28b25679019e7fe9bd9d9654 (GPL-3.0). This fork's workflow
+runs on Node 22: npm ci, npm run typecheck, then npm test.
+
+Files that cannot carry a comment header
+----------------------------------------
+
+package.json and package-lock.json have no comment syntax. The 2026-10
+edits to those files are covered here: the root package "license" field
+is GPL-3.0-only, and engines.node is >=22. No dependency version was
+changed. The root package entry in package-lock.json matches. The
+runtime needs Node.js >=20.18.1 (undici 7.24.1). The quoted npm test
+glob needs Node.js >=21. engines.node is >=22 because Node.js 20 is
+end-of-life.
+
+Modification log (GPLv3 §5a)
+----------------------------
+
+2026-10, by PLN:
+  Added this NOTICE. Set the package licence to GPL-3.0-only and
+  engines.node to >=22 in package.json and in the root package entry of
+  package-lock.json. The runtime needs Node.js >=20.18.1 (undici
+  7.24.1). The quoted npm test glob needs Node.js >=21. engines.node is
+  >=22 because Node.js 20 is end-of-life. Added
+  .github/workflows/ci.yml, a test job adapted from the dvaerum workflow
+  cited above, then pinned its actions to the current v5 commits and
+  set the runner to ubuntu-24.04. Noted the same Node.js facts and the
+  GPL-3.0-only licence line in README.md.
