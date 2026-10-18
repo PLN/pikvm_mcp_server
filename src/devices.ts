@@ -1,4 +1,5 @@
 // Modified 2026-10 by PLN: per-device client, lock, and arm (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: per-device screenshot defaults (GPL-3.0; see NOTICE).
 
 /**
  * One PiKVMClient, BusyLock, and arm state per registry device.
@@ -10,6 +11,7 @@ import type { Config } from './config.js';
 import { BusyLock } from './pikvm/lock.js';
 import { PiKVMClient } from './pikvm/client.js';
 import type { DeviceRegistry } from './registry.js';
+import type { ScreenshotSettings } from './screenshot.js';
 import type { TlsMode } from './tls.js';
 
 export interface FleetDevice {
@@ -23,6 +25,7 @@ export interface FleetDevice {
   msdLocalDir?: string;
   hwTest: boolean;
   tlsMode: TlsMode;
+  screenshot: ScreenshotSettings;
 }
 
 export interface Fleet {
@@ -66,6 +69,7 @@ export function buildFleet(config: Config, ceiling: FleetCeiling): Fleet {
       msdLocalDir: device.msdLocalDir,
       hwTest: device.hwTest,
       tlsMode: device.tls.mode,
+      screenshot: device.screenshot,
     });
   }
   return {

@@ -1,6 +1,7 @@
 // Modified 2026-10 by PLN: device registry (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: reject a duplicate device key and a shared origin (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: http and https on one host are the same device (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: per-device screenshot preview defaults (GPL-3.0; see NOTICE).
 // Host normalisation follows the idea of dtrukr/pikvm_mcp_server
 // normalizeHost at 097b529 (GPL-3.0, a fork of
 // KultivatorConsulting/pikvm_mcp_server). This file is written fresh.
@@ -15,6 +16,12 @@
 
 import { readCappedFile, readSecretAtPath, credentialFilePath, SECRET_MAX_BYTES } from './secrets.js';
 import { readPinnedCert, type DeviceTls, type TlsMode } from './tls.js';
+import {
+  mergeScreenshot,
+  parseScreenshotEnv,
+  parseScreenshotOverride,
+  type ScreenshotSettings,
+} from './screenshot.js';
 
 export const REGISTRY_MAX_BYTES = SECRET_MAX_BYTES;
 
@@ -32,6 +39,7 @@ const DEVICE_KEYS = [
   'armMsd',
   'msdLocalDir',
   'hwTest',
+  'screenshot',
 ] as const;
 
 export interface RegistryDevice {
@@ -44,6 +52,8 @@ export interface RegistryDevice {
   armMsd?: boolean;
   msdLocalDir?: string;
   hwTest: boolean;
+  /** Environment defaults with this device's screenshot fields applied. */
+  screenshot: ScreenshotSettings;
 }
 
 export interface DeviceRegistry {
@@ -239,6 +249,7 @@ function parseDevice(name: string, raw: unknown, env: NodeJS.ProcessEnv, require
     msdLocalDir = raw.msdLocalDir;
   }
   const hwTest = optionalBoolean(name, 'hwTest', raw.hwTest) === true;
+  const screenshot = mergeScreenshot(parseScreenshotEnv(env), parseScreenshotOverride(name, raw.screenshot));
   return {
     host,
     username: raw.username,
@@ -248,6 +259,7 @@ function parseDevice(name: string, raw: unknown, env: NodeJS.ProcessEnv, require
     armMsd: optionalBoolean(name, 'armMsd', raw.armMsd),
     msdLocalDir,
     hwTest,
+    screenshot,
   };
 }
 

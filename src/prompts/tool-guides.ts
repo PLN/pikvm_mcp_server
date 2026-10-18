@@ -1,6 +1,7 @@
 /**
  * Tool guide prompts — one per PiKVM tool that agents commonly use.
  * Modified 2026-10 by PLN: pikvm_type delay is milliseconds (GPL-3.0; see NOTICE).
+ * Modified 2026-10 by PLN: screenshot defaults are 960, 600, and 70 (GPL-3.0; see NOTICE).
  */
 
 import type { PromptDefinition } from './types.js';
@@ -24,9 +25,10 @@ Capture the current screen of the remote machine as a JPEG image. This is your p
 ## Parameters
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| maxWidth | number | *(native)* | Maximum width in pixels — image is scaled down if the screen is wider |
-| maxHeight | number | *(native)* | Maximum height in pixels — image is scaled down if the screen is taller |
-| quality | number | 80 | JPEG quality (1-100) |
+| maxWidth | number | 960 | Maximum preview width. Omitted uses the device default |
+| maxHeight | number | 600 | Maximum preview height. Omitted uses the device default |
+| quality | number | 70 | JPEG quality (1-100). Omitted uses the device default |
+| region | object | | Crop \`{x, y, width, height}\` in preview pixels. Must lie inside the image |
 
 Scaling preserves aspect ratio. When you scale a screenshot, the server tracks the scale factor so that mouse coordinates you derive from the image are automatically mapped back to native resolution.
 
@@ -39,7 +41,7 @@ Scaling preserves aspect ratio. When you scale a screenshot, the server tracks t
 \`\`\`
 
 ## Tips
-- Omit maxWidth/maxHeight to get the full native resolution — best for reading small text.
+- Omit nothing when you need the configured preview. The defaults are 960×600 at quality 70, not the native frame.
 - Use lower quality (50-60) when you only need layout/position information to save bandwidth.
 - Always take a screenshot **after** performing an action to verify the result.
 - The response includes a text line describing dimensions and any scaling that was applied.`,

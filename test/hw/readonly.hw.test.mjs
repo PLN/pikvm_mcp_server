@@ -2,6 +2,7 @@
 // Modified 2026-10 by PLN: closed-port probe uses 65000 (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: reject fetch bad ports (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: log the TLS mode (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: screenshot region and optional OCR (GPL-3.0; see NOTICE).
 
 /**
  * Read-only checks. Nothing here changes the drive.
@@ -34,6 +35,13 @@ function modelOf(hw) {
     if (typeof platform[key] === 'string' && platform[key] !== '') return platform[key];
   }
   return undefined;
+}
+
+function metadataOf(result) {
+  const text = result.content?.find((part) => part.type === 'text')?.text ?? '';
+  const line = text.split('\n').find((item) => item.startsWith('{'));
+  assert.ok(line, text);
+  return JSON.parse(line);
 }
 
 describe('read-only hardware', { concurrency: false }, () => {
@@ -164,6 +172,54 @@ describe('read-only hardware', { concurrency: false }, () => {
       } finally {
         await probe.close();
       }
+    } finally {
+      await session.close();
+    }
+  });
+
+  test('screenshot region and coordinate metadata', { skip }, async () => {
+    const session = await openHardwareSession();
+    try {
+      const full = await session.call('pikvm_screenshot', {});
+      assert.notEqual(full.isError, true, full.content?.[0]?.text);
+      const meta = metadataOf(full);
+      assert.equal(meta.hid.min, -32768);
+      assert.equal(meta.hid.max, 32767);
+      assert.equal(typeof meta.actualWidth, 'number');
+      assert.ok(meta.width >= 1 && meta.height >= 1);
+      assert.equal(typeof meta.scaleX, 'number');
+      assert.equal(typeof meta.scaleY, 'number');
+      const cropped = await session.call('pikvm_screenshot', {
+        region: { x: 0, y: 0, width: 1, height: 1 },
+      });
+      assert.notEqual(cropped.isError, true, cropped.content?.[0]?.text);
+      const regionMeta = metadataOf(cropped);
+      assert.deepEqual(regionMeta.region, { x: 0, y: 0, width: 1, height: 1 });
+      assert.equal(regionMeta.width, 1);
+      assert.equal(regionMeta.height, 1);
+      assert.equal(regionMeta.actualWidth, meta.actualWidth);
+      assert.equal(regionMeta.actualHeight, meta.actualHeight);
+      const image = cropped.content.find((part) => part.type === 'image');
+      assert.equal(image?.mimeType, 'image/jpeg');
+      assert.equal(typeof image?.data, 'string');
+      assert.ok(image.data.length > 0);
+    } finally {
+      await session.close();
+    }
+  });
+
+  test('OCR reads text when the device enables it', { skip }, async (t) => {
+    const session = await openHardwareSession();
+    try {
+      const state = session.pikvm.ocrState();
+      if (state.status !== 'enabled') {
+        t.skip('OCR is disabled on this device');
+        return;
+      }
+      const args = state.langs.length > 0 ? { langs: state.langs[0] } : {};
+      const result = await session.call('pikvm_read_text', args);
+      assert.notEqual(result.isError, true, result.content?.[0]?.text);
+      assert.equal(typeof result.content?.[0]?.text, 'string');
     } finally {
       await session.close();
     }

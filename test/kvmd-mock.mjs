@@ -6,6 +6,7 @@
 // Modified 2026-10 by PLN: upload busy flag and resetDuringWrite (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: storeIncomplete for fetch cleanup tests (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: kvmd removes an incomplete download unless storeIncomplete (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: preview sizing and OCR routes (GPL-3.0; see NOTICE).
 
 /**
  * Minimal KVMD REST mock implementing exactly the routes src/pikvm/client.ts
@@ -47,6 +48,8 @@ import http from 'node:http';
 import sharp from 'sharp';
 
 let jpegCache = null;
+const previewCache = new Map();
+
 async function tinyJpeg() {
   if (!jpegCache) {
     jpegCache = await sharp({
@@ -54,6 +57,30 @@ async function tinyJpeg() {
     }).jpeg().toBuffer();
   }
   return jpegCache;
+}
+
+/** Fit a 1920x1080 frame inside the preview limits, preserving aspect ratio. */
+function previewSize(maxWidth, maxHeight) {
+  const srcW = 1920;
+  const srcH = 1080;
+  const limitW = maxWidth > 0 ? maxWidth : srcW;
+  const limitH = maxHeight > 0 ? maxHeight : srcH;
+  const scale = Math.min(limitW / srcW, limitH / srcH, 1);
+  return {
+    width: Math.max(1, Math.round(srcW * scale)),
+    height: Math.max(1, Math.round(srcH * scale)),
+  };
+}
+
+async function previewJpeg(maxWidth, maxHeight) {
+  const size = previewSize(maxWidth, maxHeight);
+  const key = `${size.width}x${size.height}`;
+  if (!previewCache.has(key)) {
+    previewCache.set(key, await sharp({
+      create: { width: size.width, height: size.height, channels: 3, background: '#111111' },
+    }).jpeg().toBuffer());
+  }
+  return previewCache.get(key);
 }
 
 function waitOrClose(req, ms) {
@@ -628,7 +655,44 @@ export async function startKvmdMock(options = {}) {
       }));
       return;
     }
+    if (req.method === 'GET' && u.pathname === '/api/streamer/ocr') {
+      const spec = options.ocr ?? { enabled: false, langs: [] };
+      const available = Array.isArray(spec.langs) ? spec.langs : [];
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true,
+        result: {
+          ocr: {
+            enabled: spec.enabled === true,
+            langs: { available, default: available.slice(0, 1) },
+          },
+        },
+      }));
+      return;
+    }
     if (req.method === 'GET' && u.pathname === '/api/streamer/snapshot') {
+      const ocr = u.searchParams.get('ocr');
+      if (ocr === '1' || ocr === 'true') {
+        if (typeof options.ocrError === 'string') {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            ok: false,
+            result: { error: 'OcrError', error_msg: options.ocrError },
+          }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end(options.ocrText ?? 'screen text');
+        return;
+      }
+      if (u.searchParams.get('preview') === '1') {
+        const maxWidth = Number(u.searchParams.get('preview_max_width') || 0);
+        const maxHeight = Number(u.searchParams.get('preview_max_height') || 0);
+        const jpeg = await previewJpeg(maxWidth, maxHeight);
+        res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Content-Length': jpeg.length });
+        res.end(jpeg);
+        return;
+      }
       const jpeg = await tinyJpeg();
       res.writeHead(200, { 'Content-Type': 'image/jpeg', 'Content-Length': jpeg.length });
       res.end(jpeg);

@@ -9,6 +9,7 @@
 // Modified 2026-10 by PLN: pikvm_type delay is milliseconds (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: per-device client, lock, arm, and pikvm_devices (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: pikvm_devices lists an origin (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: screenshot metadata, crop, and optional OCR (GPL-3.0; see NOTICE).
 
 /**
  * MCP server factory for PiKVM tools
@@ -31,6 +32,16 @@ import { type PiKVMClient, KvmdError, redactionPassword } from './pikvm/client.j
 import { redactSecrets } from './redact.js';
 import type { BusyLock } from './pikvm/lock.js';
 import { type Fleet, type FleetDevice, resolveFleetDevice } from './devices.js';
+import {
+  defaultScreenshotSettings,
+  OcrUnavailableError,
+  parseOcrBox,
+  parseOcrLangs,
+  parseRegion,
+  requireScreenshotInteger,
+  SCREENSHOT_DIMENSION_MAX,
+  type ScreenshotSettings,
+} from './screenshot.js';
 import { autoCalibrateWithRetries } from './pikvm/auto-calibrate.js';
 import { allPrompts, getPromptByName } from './prompts/index.js';
 import { skillTools, isSkillTool, handleSkillToolCall } from './prompts/skill-tools.js';
@@ -79,6 +90,8 @@ export interface McpServerDeps {
    * default, using pikvm and lock, with registryActive false.
    */
   fleet?: Fleet;
+  /** Legacy preview defaults. Registry devices carry their own. */
+  screenshot?: ScreenshotSettings;
 }
 
 /**
@@ -266,6 +279,7 @@ export function formatToolError(error: unknown, password = ''): string {
     error instanceof MsdPreflightError
     || error instanceof MsdUploadBusyError
     || error instanceof MsdUrlPolicyError
+    || error instanceof OcrUnavailableError
   ) {
     const message = redact(error.message);
     const details = JSON.stringify({ type: error.type, message });
@@ -348,6 +362,7 @@ function implicitFleet(deps: McpServerDeps): Fleet {
     armMsd: deps.msdArmGateEnforced !== true,
     hwTest: false,
     tlsMode: legacyClient.tlsMode(),
+    screenshot: deps.screenshot ?? defaultScreenshotSettings(),
   };
   return {
     registryActive: false,
@@ -416,22 +431,50 @@ function tagFleetResult<T extends { content?: Array<{ type?: string; text?: stri
 const tools: Tool[] = [
   {
     name: 'pikvm_screenshot',
-    description: 'Capture a screenshot from the PiKVM video stream. Returns the current screen as a JPEG image.',
+    description: 'Capture a screenshot from the PiKVM video stream. Returns a JPEG plus coordinate metadata. Defaults are PIKVM_SCREENSHOT_MAX_WIDTH 960, PIKVM_SCREENSHOT_MAX_HEIGHT 600, and PIKVM_SCREENSHOT_QUALITY 70, unless the device registry sets screenshot. A per-call value wins. region crops the captured image locally and must lie inside it.',
     inputSchema: {
       type: 'object',
       properties: {
         maxWidth: {
           type: 'number',
-          description: 'Maximum width of the screenshot in pixels (optional, for preview)',
+          description: 'Maximum preview width in pixels (1-10000). Omitted uses the device default.',
         },
         maxHeight: {
           type: 'number',
-          description: 'Maximum height of the screenshot in pixels (optional, for preview)',
+          description: 'Maximum preview height in pixels (1-10000). Omitted uses the device default.',
         },
         quality: {
           type: 'number',
-          description: 'JPEG quality 1-100 (optional, default 80)',
+          description: 'JPEG quality 1-100. Omitted uses the device default (70 unless configured).',
         },
+        region: {
+          type: 'object',
+          description: 'Crop in screenshot pixels: x, y, width, height. Must lie fully inside the captured image.',
+          properties: {
+            x: { type: 'number' },
+            y: { type: 'number' },
+            width: { type: 'number' },
+            height: { type: 'number' },
+          },
+          required: ['x', 'y', 'width', 'height'],
+        },
+      },
+    },
+  },
+  {
+    name: 'pikvm_read_text',
+    description: 'Read text from the PiKVM screen with kvmd OCR (GET /streamer/snapshot?ocr=1). Registered only when at least one device reports OCR enabled. Slow on small boards. langs must be a language that device reported. left, top, right, and bottom are an optional box in image pixels.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        langs: {
+          type: 'string',
+          description: 'Comma-separated OCR languages, each one reported by the device. Omitted uses the kvmd default.',
+        },
+        left: { type: 'number', description: 'Left edge of the OCR box in image pixels.' },
+        top: { type: 'number', description: 'Top edge of the OCR box in image pixels.' },
+        right: { type: 'number', description: 'Right edge of the OCR box in image pixels.' },
+        bottom: { type: 'number', description: 'Bottom edge of the OCR box in image pixels.' },
       },
     },
   },
@@ -891,6 +934,9 @@ export function createMcpServer(deps: McpServerDeps): Server {
     const visible = tools.filter((tool) => {
       if (tool.name === 'pikvm_msd_upload' && !uploadReady) return false;
       if (tool.name === 'pikvm_msd_fetch_url' && !fetchReady) return false;
+      if (tool.name === 'pikvm_read_text') {
+        return [...fleet.devices.values()].some((device) => device.client.ocrState().status === 'enabled');
+      }
       return true;
     });
     return { tools: visible };
@@ -944,19 +990,37 @@ export function createMcpServer(deps: McpServerDeps): Server {
       const produced = await (async () => {
       switch (name) {
         case 'pikvm_screenshot': {
-          const result = await deviceClient.screenshot({
-            maxWidth: validateNumber(args.maxWidth, 1, 10000),
-            maxHeight: validateNumber(args.maxHeight, 1, 10000),
-            quality: validateNumber(args.quality, 1, 100),
-          });
+          const settings = active.screenshot;
+          const maxWidth = args.maxWidth === undefined
+            ? settings.maxWidth
+            : requireScreenshotInteger(args.maxWidth, 'maxWidth', 1, SCREENSHOT_DIMENSION_MAX);
+          const maxHeight = args.maxHeight === undefined
+            ? settings.maxHeight
+            : requireScreenshotInteger(args.maxHeight, 'maxHeight', 1, SCREENSHOT_DIMENSION_MAX);
+          const quality = args.quality === undefined
+            ? settings.quality
+            : requireScreenshotInteger(args.quality, 'quality', 1, 100);
+          const region = parseRegion(args.region);
+          const result = await deviceClient.screenshot({ maxWidth, maxHeight, quality, region });
+          const meta = {
+            width: result.width,
+            height: result.height,
+            actualWidth: result.actualWidth,
+            actualHeight: result.actualHeight,
+            scaleX: result.scaleX,
+            scaleY: result.scaleY,
+            ...(result.region ? { region: result.region } : {}),
+            calibration: result.calibration,
+            hid: result.hid,
+          };
 
-          // Build informative message about the screenshot
           let infoText = `Screenshot captured (${result.screenshotWidth}x${result.screenshotHeight}`;
           if (result.scaleX !== 1 || result.scaleY !== 1) {
             infoText += `, scaled from ${result.actualWidth}x${result.actualHeight}`;
             infoText += `, scale factor: ${result.scaleX.toFixed(2)}x${result.scaleY.toFixed(2)}`;
           }
           infoText += '). Mouse coordinates from this image will be auto-scaled.';
+          infoText += `\n${JSON.stringify(meta)}`;
 
           return {
             content: [
@@ -970,6 +1034,24 @@ export function createMcpServer(deps: McpServerDeps): Server {
                 mimeType: 'image/jpeg',
               },
             ],
+          };
+        }
+
+        case 'pikvm_read_text': {
+          const ocr = deviceClient.ocrState();
+          if (ocr.status !== 'enabled') {
+            throw new OcrUnavailableError(active.name);
+          }
+          const langs = parseOcrLangs(args.langs, ocr.langs, active.name);
+          const box = parseOcrBox({
+            left: args.left,
+            top: args.top,
+            right: args.right,
+            bottom: args.bottom,
+          });
+          const text = await deviceClient.readText({ langs, box });
+          return {
+            content: [{ type: 'text', text }],
           };
         }
 
