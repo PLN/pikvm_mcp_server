@@ -1,0 +1,645 @@
+// Modified 2026-10 by PLN: MSD client tests (GPL-3.0; see NOTICE).
+
+/**
+ * Plain kvmd MSD client methods against the mock. No MCP tools.
+ * Also pins undici 7.24.1 Content-Length and timer behaviour.
+ */
+
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import http from 'node:http';
+import { Readable } from 'node:stream';
+import { Agent, request } from 'undici';
+import { KvmdError, PiKVMClient } from '../dist/pikvm/client.js';
+import { startKvmdMock } from './kvmd-mock.mjs';
+
+function makeClient(mock, extra = {}) {
+  return new PiKVMClient({
+    host: mock.url,
+    username: 'admin',
+    password: 'testpw',
+    verifySsl: false,
+    requestTimeoutMs: 1000,
+    msdJobTimeoutMs: 10000,
+    msdIdleTimeoutMs: 10000,
+    ...extra,
+  });
+}
+
+async function withMock(options, fn, clientExtra) {
+  const mock = await startKvmdMock(options);
+  const client = makeClient(mock, clientExtra);
+  try {
+    await fn(mock, client);
+  } finally {
+    await mock.close();
+  }
+}
+
+function bodyOf(text) {
+  return Readable.from([Buffer.from(text)]);
+}
+
+function count(mock, method, path) {
+  return mock.calls.filter((c) => c.method === method && c.path === path).length;
+}
+
+function listen(handler) {
+  const server = http.createServer(handler);
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => {
+      const { port } = server.address();
+      resolve({
+        origin: `http://127.0.0.1:${port}`,
+        close: () => new Promise((done) => server.close(done)),
+      });
+    });
+  });
+}
+
+test('msdWrite sends an exact Content-Length, no chunked encoding, and the same bytes', async () => {
+  const payload = 'hello-msd-image';
+  await withMock({}, async (mock, client) => {
+    const result = await client.msdWrite('disk.img', bodyOf(payload), payload.length, {
+      removeIncomplete: true,
+    });
+    assert.deepEqual(result, { name: 'disk.img', size: payload.length, written: payload.length });
+    const call = mock.calls.find((c) => c.path === '/api/msd/write');
+    assert.equal(call.contentLength, String(payload.length));
+    assert.equal(call.transferEncoding, null);
+    assert.match(call.query, /remove_incomplete=1/);
+    assert.equal(mock.uploads.length, 1);
+    assert.equal(mock.uploads[0].body.toString(), payload);
+    assert.equal(mock.bytes.get('disk.img').toString(), payload);
+    assert.equal(mock.state.images['disk.img'].complete, true);
+    assert.equal(count(mock, 'POST', '/api/msd/write'), 1);
+  });
+});
+
+test('a short or long body is PIKVM_CONTENT_LENGTH_MISMATCH and stores nothing', async () => {
+  await withMock({}, async (mock, client) => {
+    await assert.rejects(
+      () => client.msdWrite('short.img', bodyOf('ab'), 6),
+      (err) => {
+        assert.ok(err instanceof KvmdError);
+        assert.equal(err.type, 'PIKVM_CONTENT_LENGTH_MISMATCH');
+        assert.equal(err.status, 0);
+        assert.equal(err.endpoint, 'POST /api/msd/write');
+        return true;
+      },
+    );
+    await assert.rejects(
+      () => client.msdWrite('long.img', bodyOf('abcdefghij'), 6),
+      (err) => {
+        assert.ok(err instanceof KvmdError);
+        assert.equal(err.type, 'PIKVM_CONTENT_LENGTH_MISMATCH');
+        return true;
+      },
+    );
+    assert.equal(mock.state.images['short.img'], undefined);
+    assert.equal(mock.state.images['long.img'], undefined);
+  });
+});
+
+test('undici rejects a Content-Length mismatch and otherwise chunks a stream', async () => {
+  const agent = new Agent({ headersTimeout: 0, bodyTimeout: 0 });
+  const seen = [];
+  const srv = await listen(async (req, res) => {
+    const chunks = [];
+    try {
+      for await (const chunk of req) chunks.push(chunk);
+    } catch {
+      // A Content-Length mismatch aborts the socket from the client side.
+      return;
+    }
+    if (res.destroyed || res.writableEnded) return;
+    seen.push({
+      cl: req.headers['content-length'] ?? null,
+      te: req.headers['transfer-encoding'] ?? null,
+      body: Buffer.concat(chunks).toString(),
+    });
+    res.writeHead(200, { 'content-type': 'text/plain', 'content-length': '2' });
+    res.end('ok');
+  });
+  try {
+    const exact = await request(`${srv.origin}/exact`, {
+      method: 'POST',
+      dispatcher: agent,
+      headers: { 'content-length': '6' },
+      body: Readable.from([Buffer.from('abcdef')]),
+    });
+    assert.equal(exact.statusCode, 200);
+    await exact.body.text();
+    assert.deepEqual(seen.at(-1), { cl: '6', te: null, body: 'abcdef' });
+
+    await assert.rejects(
+      () => request(`${srv.origin}/short`, {
+        method: 'POST',
+        dispatcher: agent,
+        headers: { 'content-length': '6' },
+        body: Readable.from([Buffer.from('ab')]),
+      }),
+      (err) => {
+        assert.equal(err.code, 'UND_ERR_REQ_CONTENT_LENGTH_MISMATCH');
+        assert.equal(err.name, 'RequestContentLengthMismatchError');
+        return true;
+      },
+    );
+    await assert.rejects(
+      () => request(`${srv.origin}/long`, {
+        method: 'POST',
+        dispatcher: agent,
+        headers: { 'content-length': '4' },
+        body: Readable.from([Buffer.from('abcdef')]),
+      }),
+      (err) => {
+        assert.equal(err.code, 'UND_ERR_REQ_CONTENT_LENGTH_MISMATCH');
+        return true;
+      },
+    );
+  } finally {
+    await srv.close();
+    await agent.close();
+  }
+});
+
+test('the mock rejects a chunked or missing Content-Length write', async () => {
+  await withMock({}, async (mock) => {
+    const agent = new Agent({ headersTimeout: 0, bodyTimeout: 0 });
+    try {
+      const res = await request(`${mock.url}/api/msd/write?image=a.img`, {
+        method: 'POST',
+        dispatcher: agent,
+        body: Readable.from([Buffer.from('abc')]),
+      });
+      const body = await res.body.json();
+      assert.equal(body.ok, false);
+      assert.equal(body.result.error, 'ValidatorError');
+      assert.equal(mock.state.images['a.img'], undefined);
+      const call = mock.calls.find((c) => c.path === '/api/msd/write');
+      assert.equal(call.contentLength, null);
+      assert.equal(call.transferEncoding, 'chunked');
+    } finally {
+      await agent.close();
+    }
+  });
+});
+
+test('typed errors: connected, busy, exists, and no image', async () => {
+  await withMock({}, async (mock, client) => {
+    await client.msdWrite('disk.img', bodyOf('abcd'), 4);
+    await client.msdSetParams({ image: 'disk.img', cdrom: false, rw: false });
+    await client.msdSetConnected(true);
+    await assert.rejects(
+      () => client.msdSetParams({ rw: true }),
+      (err) => {
+        assert.ok(err instanceof KvmdError);
+        assert.equal(err.type, 'MsdConnectedError');
+        assert.equal(err.status, 400);
+        assert.equal(err.endpoint, 'POST /api/msd/set_params');
+        return true;
+      },
+    );
+    await assert.rejects(
+      () => client.msdWrite('other.img', bodyOf('abcd'), 4),
+      (err) => {
+        assert.ok(err instanceof KvmdError);
+        assert.equal(err.type, 'MsdConnectedError');
+        return true;
+      },
+    );
+  });
+
+  await withMock({}, async (_mock, client) => {
+    await client.msdWrite('disk.img', bodyOf('abcd'), 4);
+    await assert.rejects(
+      () => client.msdWrite('disk.img', bodyOf('abcd'), 4),
+      (err) => {
+        assert.ok(err instanceof KvmdError);
+        assert.equal(err.type, 'MsdImageExistsError');
+        assert.equal(err.status, 400);
+        return true;
+      },
+    );
+  });
+
+  await withMock({ busyFor: 1 }, async (mock, client) => {
+    await assert.rejects(
+      () => client.msdRemove('disk.img'),
+      (err) => {
+        assert.ok(err instanceof KvmdError);
+        assert.equal(err.type, 'MsdIsBusyError');
+        assert.equal(err.status, 409);
+        return true;
+      },
+    );
+    assert.equal(count(mock, 'POST', '/api/msd/remove'), 1);
+    assert.equal(mock.state.busy, false);
+  });
+
+  await withMock({}, async (mock, client) => {
+    await assert.rejects(
+      () => client.msdRemove('missing.iso'),
+      (err) => {
+        assert.ok(err instanceof KvmdError);
+        assert.equal(err.type, 'MsdUnknownImageError');
+        assert.equal(err.endpoint, 'POST /api/msd/remove');
+        return true;
+      },
+    );
+    await assert.rejects(
+      () => client.msdSetConnected(true),
+      (err) => {
+        assert.equal(err.type, 'MsdImageNotSelected');
+        return true;
+      },
+    );
+    await assert.rejects(
+      () => client.msdSetConnected(false),
+      (err) => {
+        assert.equal(err.type, 'MsdDisconnectedError');
+        return true;
+      },
+    );
+    assert.equal(count(mock, 'POST', '/api/msd/remove'), 1);
+    assert.equal(count(mock, 'POST', '/api/msd/set_connected'), 2);
+  });
+});
+
+test('getMsdState reads the parts map and legacy storage.free', async () => {
+  await withMock({ free: 111 }, async (mock, client) => {
+    const state = await client.getMsdState();
+    assert.equal(state.free, 111);
+    assert.equal(state.parts[''].free, 111);
+    assert.equal(state.parts[''].writable, true);
+    assert.equal(state.online, true);
+    assert.equal(state.drive.connected, false);
+    assert.equal(state.uploading, null);
+    assert.equal(state.downloading, null);
+    assert.equal(mock.state.parts[''].free, 111);
+  });
+
+  await withMock({ free: 222, legacyFreeShape: true }, async (_mock, client) => {
+    const state = await client.getMsdState();
+    assert.equal(state.free, 222);
+    assert.equal(state.parts, null);
+    assert.deepEqual(state.images, {});
+    assert.equal(state.uploading, null);
+  });
+
+  await withMock({
+    routes: {
+      'GET /api/msd': {
+        status: 200,
+        body: {
+          ok: true,
+          result: {
+            enabled: true,
+            online: true,
+            busy: false,
+            drive: { image: null, connected: false, cdrom: true, rw: false },
+            storage: {
+              free: 1,
+              parts: {
+                a: { size: 10, free: 3, writable: true },
+                b: { size: 10, free: 4, writable: false },
+              },
+              images: { 'x.img': { size: 8, complete: true, removable: true } },
+              uploading: { name: 'x.img', size: 8, written: 2 },
+            },
+          },
+        },
+      },
+    },
+  }, async (_mock, client) => {
+    const state = await client.getMsdState();
+    assert.equal(state.free, 7);
+    assert.equal(state.parts.a.free, 3);
+    assert.equal(state.images['x.img'].complete, true);
+    assert.deepEqual(state.uploading, { name: 'x.img', size: 8, written: 2 });
+  });
+});
+
+test('msdWriteRemote yields NDJSON progress and throws on an error line', async () => {
+  await withMock({}, async (mock, client) => {
+    const progress = [];
+    for await (const row of client.msdWriteRemote('https://example.test/pics/a.iso', {
+      removeIncomplete: true,
+      timeout: 10,
+    })) {
+      progress.push(row);
+    }
+    assert.deepEqual(progress, [
+      { name: 'a.iso', size: 4, written: 2 },
+      { name: 'a.iso', size: 4, written: 4 },
+    ]);
+    const call = mock.calls.find((c) => c.path === '/api/msd/write_remote');
+    assert.match(call.query, /verify=1/);
+    assert.match(call.query, /remove_incomplete=1/);
+    assert.match(call.query, /timeout=10/);
+    assert.doesNotMatch(call.query, /insecure/);
+    assert.equal(mock.state.images['a.iso'].complete, true);
+    assert.equal(count(mock, 'POST', '/api/msd/write_remote'), 1);
+  });
+
+  await withMock({
+    remote: {
+      lines: [
+        JSON.stringify({ ok: true, result: { image: { name: 'a.iso', size: 9, written: 3 } } }),
+        JSON.stringify({ ok: false, result: { error: 'MsdOfflineError', error_msg: 'MSD is not found' } }),
+      ],
+    },
+  }, async (_mock, client) => {
+    const progress = [];
+    await assert.rejects(
+      async () => {
+        for await (const row of client.msdWriteRemote('https://example.test/pics/a.iso')) {
+          progress.push(row);
+        }
+      },
+      (err) => {
+        assert.ok(err instanceof KvmdError);
+        assert.equal(err.type, 'MsdOfflineError');
+        assert.equal(err.message, 'MSD is not found');
+        assert.equal(err.endpoint, 'POST /api/msd/write_remote');
+        assert.equal(err.endpoint.includes('?'), false);
+        return true;
+      },
+    );
+    assert.deepEqual(progress, [{ name: 'a.iso', size: 9, written: 3 }]);
+  });
+});
+
+test('remove_incomplete drops a failed write and keeps an incomplete image otherwise', async () => {
+  await withMock({ failMidWrite: true }, async (mock, client) => {
+    await assert.rejects(
+      () => client.msdWrite('gone.img', bodyOf('abcdef'), 6, { removeIncomplete: true }),
+      (err) => {
+        assert.ok(err instanceof KvmdError);
+        assert.equal(err.type, 'MsdIoError');
+        return true;
+      },
+    );
+    assert.equal(mock.state.images['gone.img'], undefined);
+    assert.equal(mock.bytes.has('gone.img'), false);
+    assert.equal(count(mock, 'POST', '/api/msd/write'), 1);
+  });
+
+  await withMock({ failMidWrite: true }, async (mock, client) => {
+    await assert.rejects(
+      () => client.msdWrite('kept.img', bodyOf('abcdef'), 6, { removeIncomplete: false }),
+      (err) => {
+        assert.equal(err.type, 'MsdIoError');
+        return true;
+      },
+    );
+    assert.equal(mock.state.images['kept.img'].complete, false);
+    assert.equal(mock.bytes.get('kept.img').toString(), 'abcdef');
+  });
+});
+
+test('MSD POSTs are not retried and a remote redirect is not followed', async () => {
+  const kvmdBody = (error, errorMsg) => ({ ok: false, result: { error, error_msg: errorMsg } });
+  await withMock({
+    routes: {
+      'POST /api/msd/remove': { status: 502, body: kvmdBody('BadGateway', 'proxy') },
+      'POST /api/msd/set_connected': { status: 503, body: kvmdBody('UnavailableError', 'down') },
+    },
+  }, async (mock, client) => {
+    await assert.rejects(() => client.msdRemove('a.img'), (err) => {
+      assert.equal(err.status, 502);
+      assert.equal(err.type, 'BadGateway');
+      return true;
+    });
+    await assert.rejects(() => client.msdSetConnected(false), (err) => {
+      assert.equal(err.status, 503);
+      assert.equal(err.type, 'UnavailableError');
+      return true;
+    });
+    assert.equal(count(mock, 'POST', '/api/msd/remove'), 1);
+    assert.equal(count(mock, 'POST', '/api/msd/set_connected'), 1);
+  });
+
+  await withMock({
+    routes: {
+      'GET /api/msd': { status: 503, body: kvmdBody('UnavailableError', 'down') },
+    },
+  }, async (mock, client) => {
+    await assert.rejects(() => client.getMsdState(), (err) => {
+      assert.equal(err.type, 'UnavailableError');
+      assert.equal(err.status, 503);
+      return true;
+    });
+    assert.equal(count(mock, 'GET', '/api/msd'), 3);
+  });
+
+  await withMock({ remote: { redirectTo: 'https://example.test/elsewhere' } }, async (mock, client) => {
+    await assert.rejects(
+      () => client.msdWriteRemote('https://example.test/pics/a.iso')[Symbol.asyncIterator]().next(),
+      (err) => {
+        assert.ok(err instanceof KvmdError);
+        assert.equal(err.status, 302);
+        assert.equal(err.type, 'PIKVM_HTTP_ERROR');
+        assert.equal(err.endpoint, 'POST /api/msd/write_remote');
+        return true;
+      },
+    );
+    assert.equal(count(mock, 'POST', '/api/msd/write_remote'), 1);
+    assert.equal(mock.calls.some((c) => c.path === '/elsewhere'), false);
+  });
+});
+
+test('msdSetParams never sends a URL and shows cdrom rw coercion', async () => {
+  await withMock({}, async (mock, client) => {
+    await assert.rejects(
+      () => client.msdSetParams({ image: 'https://example.test/a.iso' }),
+      /does not accept a URL/,
+    );
+    assert.equal(count(mock, 'POST', '/api/msd/set_params'), 0);
+    await client.msdSetParams({ cdrom: true, rw: true });
+    const state = await client.getMsdState();
+    assert.equal(state.drive.cdrom, true);
+    assert.equal(state.drive.rw, false);
+  });
+});
+
+test('an upload is not killed by the ordinary request timeout', async () => {
+  await withMock({ writeHoldMs: 700 }, async (_mock, client) => {
+    const result = await client.msdWrite('slow.img', bodyOf('abcd'), 4);
+    assert.equal(result.written, 4);
+  }, { requestTimeoutMs: 150, msdJobTimeoutMs: 8000, msdIdleTimeoutMs: 8000 });
+});
+
+test('the job ceiling aborts a write that never returns headers', { timeout: 15000 }, async () => {
+  const started = Date.now();
+  await withMock({ writeHoldMs: 8000 }, async (_mock, client) => {
+    await assert.rejects(
+      () => client.msdWrite('held.img', bodyOf('abcd'), 4),
+      (err) => {
+        assert.ok(err instanceof KvmdError);
+        assert.equal(err.type, 'PIKVM_TIMEOUT');
+        assert.equal(err.endpoint, 'POST /api/msd/write');
+        return true;
+      },
+    );
+  }, { msdJobTimeoutMs: 500, msdIdleTimeoutMs: 20000 });
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed < 4000, `job ceiling waited too long: ${elapsed}ms`);
+});
+
+test('the idle gap aborts a stalled upload and allows a slow progress stream', { timeout: 15000 }, async () => {
+  const started = Date.now();
+  await withMock({}, async (_mock, client) => {
+    let pushed = false;
+    const stalled = new Readable({
+      read() {
+        if (!pushed) {
+          pushed = true;
+          this.push(Buffer.from('ab'));
+        }
+      },
+    });
+    await assert.rejects(
+      () => client.msdWrite('stall.img', stalled, 4),
+      (err) => {
+        assert.ok(err instanceof KvmdError);
+        assert.equal(err.type, 'PIKVM_TIMEOUT');
+        return true;
+      },
+    );
+  }, { msdJobTimeoutMs: 20000, msdIdleTimeoutMs: 400 });
+  assert.ok(Date.now() - started < 3000, 'idle gap waited for the job ceiling');
+
+  const lines = [0, 1, 2, 3, 4, 5, 6, 7].map((n) => (
+    JSON.stringify({ ok: true, result: { image: { name: 'drip.iso', size: 8, written: n + 1 } } })
+  ));
+  await withMock({ remote: { lines, gapMs: 80 } }, async (_mock, client) => {
+    const progress = [];
+    for await (const row of client.msdWriteRemote('https://example.test/pics/drip.iso')) {
+      progress.push(row.written);
+    }
+    assert.deepEqual(progress, [1, 2, 3, 4, 5, 6, 7, 8]);
+  }, { msdJobTimeoutMs: 20000, msdIdleTimeoutMs: 400 });
+});
+
+test('undici headersTimeout waits for headers and does not cap a writing body', { timeout: 20000 }, async () => {
+  const agent = new Agent({ headersTimeout: 0, bodyTimeout: 0 });
+  const late = await listen(async (req, res) => {
+    for await (const _chunk of req) { /* drain */ }
+    await new Promise((done) => setTimeout(done, 2200));
+    if (res.writableEnded || req.destroyed) return;
+    res.writeHead(200, { 'content-type': 'text/plain', 'content-length': '2' });
+    res.end('ok');
+  });
+  try {
+    const started = Date.now();
+    await assert.rejects(
+      () => request(`${late.origin}/late`, {
+        method: 'POST',
+        dispatcher: agent,
+        headers: { 'content-length': '2' },
+        body: Readable.from([Buffer.from('hi')]),
+        headersTimeout: 700,
+        bodyTimeout: 10000,
+        signal: AbortSignal.timeout(10000),
+      }),
+      (err) => {
+        assert.equal(err.code, 'UND_ERR_HEADERS_TIMEOUT');
+        assert.ok(Date.now() - started < 5000);
+        return true;
+      },
+    );
+  } finally {
+    await late.close();
+  }
+
+  const slow = await listen(async (req, res) => {
+    for await (const _chunk of req) { /* drain */ }
+    res.writeHead(200, { 'content-type': 'text/plain', 'content-length': '2' });
+    res.end('ok');
+  });
+  try {
+    const chunks = Array.from({ length: 6 }, () => Buffer.alloc(32, 0x61));
+    const body = new Readable({
+      async read() {
+        const next = chunks.shift();
+        if (!next) {
+          this.push(null);
+          return;
+        }
+        await new Promise((done) => setTimeout(done, 250));
+        this.push(next);
+      },
+    });
+    const res = await request(`${slow.origin}/slow`, {
+      method: 'POST',
+      dispatcher: agent,
+      headers: { 'content-length': String(6 * 32) },
+      body,
+      headersTimeout: 400,
+      bodyTimeout: 10000,
+      signal: AbortSignal.timeout(10000),
+    });
+    assert.equal(res.statusCode, 200);
+    assert.equal(await res.body.text(), 'ok');
+  } finally {
+    await slow.close();
+    await agent.close();
+  }
+});
+
+test('undici bodyTimeout is the gap between response bytes', { timeout: 20000 }, async () => {
+  const agent = new Agent({ headersTimeout: 0, bodyTimeout: 0 });
+  const stall = await listen(async (_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+    res.flushHeaders();
+    await new Promise((done) => setTimeout(done, 2200));
+    if (res.writableEnded) return;
+    res.end('{"ok":true}\n');
+  });
+  try {
+    const started = Date.now();
+    await assert.rejects(
+      async () => {
+        const res = await request(`${stall.origin}/stall`, {
+          method: 'GET',
+          dispatcher: agent,
+          headersTimeout: 10000,
+          bodyTimeout: 700,
+        });
+        for await (const _chunk of res.body) { /* read */ }
+      },
+      (err) => {
+        assert.equal(err.code, 'UND_ERR_BODY_TIMEOUT');
+        assert.ok(Date.now() - started < 5000);
+        return true;
+      },
+    );
+  } finally {
+    await stall.close();
+  }
+
+  const drip = await listen(async (_req, res) => {
+    res.writeHead(200, { 'content-type': 'application/x-ndjson' });
+    res.flushHeaders();
+    for (let n = 0; n < 6; n += 1) {
+      await new Promise((done) => setTimeout(done, 250));
+      res.write(`{"ok":true,"n":${n}}\n`);
+    }
+    res.end();
+  });
+  try {
+    const res = await request(`${drip.origin}/drip`, {
+      method: 'GET',
+      dispatcher: agent,
+      headersTimeout: 400,
+      bodyTimeout: 700,
+    });
+    let text = '';
+    for await (const chunk of res.body) text += chunk;
+    assert.match(text, /"n":5/);
+  } finally {
+    await drip.close();
+    await agent.close();
+  }
+});

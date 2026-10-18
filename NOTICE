@@ -143,3 +143,33 @@ Modification log (GPLv3 §5a)
   before the request is sent, such as connection refused, stays
   PIKVM_UNREACHABLE. With slow and no delay, a print of 333 characters
   or more is refused (332 still fits). kvmd itself allows 1024.
+
+MSD client
+----------
+
+GET /api/msd, POST /api/msd/write, POST /api/msd/write_remote,
+POST /api/msd/set_params, POST /api/msd/set_connected, and
+POST /api/msd/remove follow the PiKVM MSD HTTP API as documented at
+https://docs.pikvm.org/api/ (read 2026-10-17) and as implemented in
+pikvm/kvmd v4.227
+(https://github.com/pikvm/kvmd/commit/0dd244fabc8ca5731fc594311211a5ab8544c85a),
+in particular kvmd/apps/kvmd/api/msd.py, kvmd/plugins/msd/otg/storage.py,
+kvmd/plugins/msd/__init__.py, and kvmd/htserver.py. Those files were
+read as API facts only. No kvmd source was copied. No code from another
+pikvm_mcp_server fork was added for these methods.
+
+2026-10, by PLN:
+  Added plain kvmd MSD methods on the client: getMsdState (parts map
+  and legacy storage.free), msdWrite (streamed body, exact
+  Content-Length, never chunked), msdRemove, msdSetParams (image,
+  cdrom, and rw only; a URL is refused and not sent), msdSetConnected,
+  and msdWriteRemote (NDJSON progress, verify=1, insecure is never
+  sent). These POSTs are not retried. Uploads do not use the 5 second
+  ordinary deadline. The wall clock is PIKVM_MSD_JOB_TIMEOUT_MS
+  (default 6 hours) and the idle gap is PIKVM_MSD_IDLE_TIMEOUT_MS
+  (default 60 seconds). On undici 7.24.1, headersTimeout does not
+  abort a body that is still being written without socket backpressure,
+  and bodyTimeout is only the gap between response bytes after headers.
+  The AbortSignal is the upload ceiling. A Content-Length mismatch is
+  UND_ERR_REQ_CONTENT_LENGTH_MISMATCH and is reported as
+  PIKVM_CONTENT_LENGTH_MISMATCH. The mock grew an MSD state machine.
