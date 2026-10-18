@@ -3,6 +3,7 @@
 // Modified 2026-10 by PLN: cap MSD job at 7 days and idle at 1 hour (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: PIKVM_MCP_ARM_MSD (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: PIKVM_MSD_LOCAL_DIR and PIKVM_MSD_MAX_BYTES (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: PIKVM_MSD_URL_ALLOWLIST and URL private opt-in (GPL-3.0; see NOTICE).
 // Env read adapted from dtrukr/pikvm_mcp_server src/config.ts @ d120243 (GPL-3.0).
 
 /**
@@ -23,6 +24,7 @@ import {
   parseMsdTimeoutMs,
   parseRequestTimeoutMs,
 } from './request-timeout.js';
+import { parseUrlAllowlist, type UrlAllowlist } from './url-policy.js';
 
 // Load .env file from project root
 // - quiet: true prevents stdout output that would corrupt MCP protocol
@@ -99,6 +101,17 @@ export interface MsdConfig {
   localDir?: string;
   maxBytes: number;
   extensions: readonly string[];
+  /** No https entry hides pikvm_msd_fetch_url. */
+  urlAllow: UrlAllowlist;
+  /** Allows other private ranges. Never link-local, metadata, or Tailscale. */
+  allowPrivate: boolean;
+  /** kvmd write_remote timeout in seconds, from PIKVM_MSD_JOB_TIMEOUT_MS. */
+  remoteTimeoutSec: number;
+}
+
+export function remoteTimeoutSec(ms: number): number {
+  const sec = Math.floor(ms / 1000);
+  return sec > 0 ? sec : 1;
 }
 
 export interface Config {
@@ -179,6 +192,9 @@ export function loadConfig(): Config {
       localDir: parseMsdLocalDir(process.env.PIKVM_MSD_LOCAL_DIR),
       maxBytes: parseMsdMaxBytes(process.env.PIKVM_MSD_MAX_BYTES),
       extensions: parseMsdExtensions(process.env.PIKVM_MSD_EXTENSIONS),
+      urlAllow: parseUrlAllowlist(process.env.PIKVM_MSD_URL_ALLOWLIST),
+      allowPrivate: process.env.PIKVM_MSD_URL_ALLOW_PRIVATE === '1',
+      remoteTimeoutSec: remoteTimeoutSec(msdJobTimeoutMs),
     },
     http,
   };

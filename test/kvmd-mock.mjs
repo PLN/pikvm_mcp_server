@@ -4,6 +4,7 @@
 // Modified 2026-10 by PLN: pauseWrite and seeded images (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: holdMutations for the MSD mutex test (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: upload busy flag and resetDuringWrite (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: storeIncomplete for fetch cleanup tests (GPL-3.0; see NOTICE).
 
 /**
  * Minimal KVMD REST mock implementing exactly the routes src/pikvm/client.ts
@@ -23,7 +24,8 @@
  * image bytes. Options: `free`, `busyFor` (how many MSD mutations
  * answer MsdIsBusyError), `failMidWrite`, `failSetConnected`,
  * `legacyFreeShape`, `writeHoldMs`, `pauseWrite`, and `remote` (`lines`,
- * `chunks`, `gapMs`, `headerDelayMs`, `stallAfterHeadersMs`, `redirectTo`).
+ * `chunks`, `gapMs`, `headerDelayMs`, `stallAfterHeadersMs`, `redirectTo`,
+ * `storeIncomplete`). `redirectTo` answers 302 and does not follow it.
  * `pauseWrite` accepts POST /api/msd/write, pauses the request, and does
  * not read the body until the socket closes. `resetDuringWrite` destroys
  * the socket after the first body chunk. A write in progress sets
@@ -565,6 +567,10 @@ export async function startKvmdMock(options = {}) {
         JSON.stringify({ ok: true, result: { image: { name, size: 4, written: 2 } } }),
         JSON.stringify({ ok: true, result: { image: { name, size: 4, written: 4 } } }),
       ];
+      if (remote.storeIncomplete) {
+        state.images[name] = imageMeta(name, 4, false);
+        bytes.set(name, Buffer.from('part'));
+      }
       for (const line of lines) {
         if (remote.gapMs) await waitOrClose(req, remote.gapMs);
         if (req.destroyed || res.writableEnded) return true;

@@ -5,6 +5,7 @@
 <!-- Modified 2026-10 by PLN: mount expectImage and MSD preflight (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: MSD upload jobs and remove (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: hashing jobs, bad-image cleanup, upload try-lock (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: URL fetch allowlist and Tailscale opt-in (GPL-3.0; see NOTICE) -->
 
 # PiKVM MCP Server
 
@@ -140,6 +141,25 @@ PIKVM_MCP_NO_DOTENV=0
 - **`PIKVM_MSD_LOCAL_DIR`** — directory `pikvm_msd_upload` may read, by bare
   file name only. Unset hides that tool.
 - **`PIKVM_MSD_MAX_BYTES`** — per-transfer cap. Default 16 GiB.
+- **`PIKVM_MSD_URL_ALLOWLIST`** — comma-separated entries. An https entry is
+  `https://host[:port]/path-prefix` (`https://images.example/iso` matches that
+  path and its children, not `isotope`). A Tailscale opt-in is a CIDR inside
+  `100.64.0.0/10` or `fd7a:115c:a1e0::/48`, for example `100.64.0.0/10` or
+  `100.101.102.103/32`. A CIDR does not match URLs by itself; the https entry
+  still has to match, and every resolved address in those ranges must fall in
+  one of the CIDRs. No https entry hides `pikvm_msd_fetch_url`.
+- **`PIKVM_MSD_URL_ALLOW_PRIVATE`** — `1` allows an allowlisted host to resolve
+  to loopback, unspecified (`0.0.0.0/8`, `::`), RFC1918, other ULA (`fc00::/7`
+  outside the Tailscale range), multicast, or broadcast. It does not allow
+  Tailscale/CGNAT (`100.64.0.0/10`, `fd7a:115c:a1e0::/48`); those need a CIDR
+  opt-in. Link-local and metadata (`169.254.0.0/16`, `fe80::/10`, and the
+  IPv4-mapped forms of every denied range) stay denied even when this is `1`
+  and even when the host is allowlisted. Default `0`.
+- **Redirect and DNS rebinding.** kvmd's downloader follows redirects and
+  resolves DNS itself. This server does not send a `redirect: 'manual'` HEAD
+  before the download. Allowlist only operator-controlled hosts that do not
+  redirect. A name that changes address after the check can still be fetched
+  by kvmd.
 - **`PIKVM_MCP_NO_DOTENV`** — set `1` to skip `.env` loading entirely (for
   systemd/gateway units that export env directly; a stray `.env` on disk must
   not win). Only read from the real process environment, so a `.env` cannot
@@ -245,13 +265,14 @@ Or if using the .env file:
 
 ### Mass storage
 - **`pikvm_msd_status`** - Read mass-storage state (optional: device). Read-only.
-- **`pikvm_msd_mount`** - Select an image and connect the virtual drive (required: image, mode `cdrom` or `flash`, confirmImage; optional: rw, connect, expectImage, device). `confirmImage` must equal `image`. When a drive is already connected, `expectImage` must equal that image or the mount is refused and the drive stays connected. An `expectImage` supplied while the drive is disconnected must equal the snapshot image too. The image must already be in storage and complete. Returns the drive re-read after the change. On failure the previous selection is restored. An NBD or URL snapshot image cannot be restored, because `set_params` refuses a name that contains `://`.
+- **`pikvm_msd_mount`** - Select an image and connect the virtual drive (required: image, mode `cdrom` or `flash`, confirmImage; optional: rw, connect, expectImage, device). `confirmImage` must equal `image`. When a drive is already connected, `expectImage` must equal that image or the mount is refused and the drive stays connected. An `expectImage` supplied while the drive is disconnected must equal the snapshot image too. The image must already be in storage and complete. A mount of an image that has an active upload or fetch is refused with `MsdImageTransferError` and no POST. Returns the drive re-read after the change. On failure the previous selection is restored. An NBD or URL snapshot image cannot be restored, because `set_params` refuses a name that contains `://`.
 - **`pikvm_msd_eject`** - Disconnect the virtual drive (required: expectImage; optional: device). `expectImage` must equal the current image name, or `""` when none is selected. A second eject returns `alreadyDisconnected`. Any other kvmd error is returned as an error.
-- **`pikvm_msd_upload`** - Upload a bare file name from `PIKVM_MSD_LOCAL_DIR` (required: file, confirmImage; optional: sha256, device). Returns `{jobId}` immediately after the file is confined. Hashing and the kvmd pre-check run in the job (`hashing`, then `running`). A sha256 mismatch fails the job and makes no upload POST. A second upload while one is running is refused. If a check after the stream fails, the stored image is removed. The transfer does not change the drive. Hidden while `PIKVM_MSD_LOCAL_DIR` is unset.
+- **`pikvm_msd_upload`** - Upload a bare file name from `PIKVM_MSD_LOCAL_DIR` (required: file, confirmImage; optional: sha256, device). Returns `{jobId}` immediately after the file is confined. Hashing and the kvmd pre-check run in the job (`hashing`, then `running`). A sha256 mismatch fails the job and makes no upload POST. A second upload or fetch while one is running is refused. If a check after the stream fails, the stored image is removed. `PIKVM_MSD_STATE_UNKNOWN` from `msdWrite` or `msdWriteRemote` skips that cleanup by design: the server does not know whether kvmd kept the image. The transfer does not change the drive. Hidden while `PIKVM_MSD_LOCAL_DIR` is unset.
+- **`pikvm_msd_fetch_url`** - Download an allowlisted https URL with kvmd `write_remote` (required: url, confirmImage; optional: image, device). Returns `{jobId}` immediately after the URL and image name are accepted. `image` defaults to the URL's last path segment and uses the same bare-name rules as upload. `confirmImage` must equal that name. The job sends `remove_incomplete=1`, `verify=1` (`insecure` is never sent), and `timeout=` from `PIKVM_MSD_JOB_TIMEOUT_MS` in seconds. NDJSON progress becomes `bytes` and `total`. DNS, the address check, and the kvmd pre-check run in the job. Hidden while the allowlist has no https entry. Gated by `PIKVM_MCP_ARM_MSD`.
 - **`pikvm_msd_job`** - Read that job: `{state, bytes, total, sha256?, error?, removed?, removeError?}`. `state` is `hashing`, `running`, `done`, or `failed`. Finished jobs are dropped after 24 hours. Read-only.
 - **`pikvm_msd_remove`** - Remove a stored image (required: image, confirmImage; optional: device). Refuses while the drive is connected and does not disconnect it.
 
-In HTTP mode, MSD changes stay disarmed until `PIKVM_MCP_ARM_MSD=1`. Status and job stay available. stdio is not gated. Mount and eject share one lock per device. A second upload fails immediately instead of queueing, and a transfer does not queue mount or eject.
+In HTTP mode, MSD changes stay disarmed until `PIKVM_MCP_ARM_MSD=1`. Status and job stay available. stdio is not gated. Mount and eject share one lock per device. A second upload or fetch fails immediately instead of queueing, and a transfer does not queue mount or eject. Logs for a fetch are one JSON line and do not include URL userinfo or the query string. Error text has URL userinfo removed.
 
 ## Skills (Prompts & Skill Tools)
 

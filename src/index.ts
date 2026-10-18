@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Modified 2026-10 by PLN: MSD arm-gate (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: MSD local upload directory (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: URL fetch allowlist (GPL-3.0; see NOTICE).
 /**
  * PiKVM MCP Server
  *

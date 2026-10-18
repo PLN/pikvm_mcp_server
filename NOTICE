@@ -3,6 +3,7 @@ Modified 2026-10 by PLN: MSD tools, ARM_MSD, and source-error flag (GPL-3.0; see
 Modified 2026-10 by PLN: mount expectImage, preflight, and MSD mutex (GPL-3.0; see below).
 Modified 2026-10 by PLN: MSD upload jobs and remove (GPL-3.0; see below).
 Modified 2026-10 by PLN: hashing jobs, bad-image cleanup, upload try-lock (GPL-3.0; see below).
+Modified 2026-10 by PLN: URL fetch allowlist and Tailscale opt-in (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -272,3 +273,27 @@ No code from another pikvm_mcp_server fork was added for these methods.
   carry a type field. open uses O_NONBLOCK as well as O_NOFOLLOW.
   Finished jobs are dropped after 24 hours and the map is capped.
   No code from another pikvm_mcp_server fork was added.
+
+2026-10, by PLN:
+  Added pikvm_msd_fetch_url. It returns a jobId after the https URL
+  and image name are accepted, then runs DNS, the address check, the
+  kvmd pre-check, and write_remote in that job. The call sends
+  remove_incomplete=1, verify=1, and timeout= from the job ceiling
+  in seconds. insecure is never sent. The image name is the explicit
+  image or the URL's last path segment, checked with the same bare-name
+  rule as upload, and confirmImage must echo it. A second upload or
+  fetch fails immediately with MsdUploadBusyError. On failure an
+  incomplete image is removed the same way as a bad upload.
+  PIKVM_MSD_STATE_UNKNOWN from msdWrite and msdWriteRemote skips that
+  cleanup. Mount of an image with an active upload or fetch returns
+  MsdImageTransferError and makes no POST.
+  PIKVM_MSD_URL_ALLOWLIST is comma-separated https://host[:port]/path-prefix
+  entries plus optional CIDRs inside 100.64.0.0/10 or
+  fd7a:115c:a1e0::/48. Those CIDRs are the only Tailscale opt-in.
+  PIKVM_MSD_URL_ALLOW_PRIVATE=1 allows the other private ranges for an
+  allowlisted host. 169.254.0.0/16, fe80::/10, and IPv4-mapped forms of
+  denied ranges stay denied. Logs omit URL userinfo and the query
+  string. Error text has userinfo removed. This server does not send
+  a redirect manual HEAD. kvmd's downloader (v4.227, already cited)
+  follows redirects and resolves DNS itself, so an allowlisted host can
+  still redirect. No code from another pikvm_mcp_server fork was added.

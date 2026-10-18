@@ -2,6 +2,7 @@
 // Modified 2026-10 by PLN: expectImage, preflight, and MSD mutex tests (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: upload jobs, remove, and disconnected expectImage (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: hashing jobs, bad-image cleanup, upload try-lock (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: URL fetch jobs and mount block during a transfer (GPL-3.0; see NOTICE).
 
 /**
  * MSD tools against the mock. The HTTP harness matches test/http.test.mjs.
@@ -21,6 +22,7 @@ import { promisify } from 'node:util';
 import { PiKVMClient } from '../dist/pikvm/client.js';
 import { BusyLock } from '../dist/pikvm/lock.js';
 import { createMcpServer, ARM_GATED_TOOLS, MSD_READ_ONLY_TOOLS, msdToolRequiresArm } from '../dist/server.js';
+import { parseUrlAllowlist } from '../dist/url-policy.js';
 import { startHttpServer } from '../dist/http.js';
 import { startKvmdMock } from './kvmd-mock.mjs';
 
@@ -152,6 +154,7 @@ test('MSD arm-gate allows only the read-only list', () => {
   assert.equal(msdToolRequiresArm('pikvm_msd_mount'), true);
   assert.equal(msdToolRequiresArm('pikvm_msd_eject'), true);
   assert.equal(msdToolRequiresArm('pikvm_msd_upload'), true);
+  assert.equal(msdToolRequiresArm('pikvm_msd_fetch_url'), true);
   assert.equal(msdToolRequiresArm('pikvm_msd_remove'), true);
   assert.equal(msdToolRequiresArm('pikvm_type'), false);
   assert.equal(ARM_GATED_TOOLS.has('pikvm_msd_mount'), false);
@@ -159,6 +162,7 @@ test('MSD arm-gate allows only the read-only list', () => {
   assert.equal(ARM_GATED_TOOLS.has('pikvm_msd_status'), false);
   assert.equal(ARM_GATED_TOOLS.has('pikvm_msd_job'), false);
   assert.equal(ARM_GATED_TOOLS.has('pikvm_msd_upload'), false);
+  assert.equal(ARM_GATED_TOOLS.has('pikvm_msd_fetch_url'), false);
   assert.equal(ARM_GATED_TOOLS.has('pikvm_msd_remove'), false);
 });
 
@@ -171,6 +175,7 @@ test('HTTP: MSD disarmed blocks mount and eject, status still reads', async () =
         ['pikvm_msd_mount', { image: 'disk.img', mode: 'flash', confirmImage: 'disk.img' }],
         ['pikvm_msd_eject', { expectImage: '' }],
         ['pikvm_msd_upload', { file: 'disk.img', confirmImage: 'disk.img' }],
+        ['pikvm_msd_fetch_url', { url: 'https://images.example/disk.img', confirmImage: 'disk.img' }],
         ['pikvm_msd_remove', { image: 'disk.img', confirmImage: 'disk.img' }],
       ]) {
         const result = await callTool(base, sessionId, name, args);
@@ -798,7 +803,7 @@ test('expectImage is checked when the drive is disconnected', async () => {
   });
 });
 
-test('upload, remove, and job polling', { timeout: 30000 }, async (t) => {
+test('upload, remove, and job polling', { timeout: 60000 }, async (t) => {
   const body = Buffer.from('abcd');
   const sum = digest(body);
 
@@ -1178,6 +1183,42 @@ test('upload, remove, and job polling', { timeout: 30000 }, async (t) => {
     });
   });
 
+  await t.test('mount of an image with an active upload makes no POST', async () => {
+    await withDir(async (dir) => {
+      await writeFile(join(dir, 'disk.img'), body);
+      let release;
+      const flags = uploadMsd(dir, {
+        beforeHash: () => new Promise((resolve) => { release = resolve; }),
+      });
+      try {
+        await withSession({ images: [] }, flags, async ({ mock, base, sessionId }) => {
+          const started = await callTool(base, sessionId, 'pikvm_msd_upload', {
+            file: 'disk.img',
+            confirmImage: 'disk.img',
+          });
+          const { jobId } = JSON.parse(started.content[0].text);
+          assert.equal(await waitFor(() => typeof release === 'function'), true);
+          const before = mock.calls.length;
+          const refused = await callTool(base, sessionId, 'pikvm_msd_mount', {
+            image: 'disk.img',
+            mode: 'flash',
+            confirmImage: 'disk.img',
+          });
+          assert.equal(refused.isError, true);
+          assert.match(refused.content[0].text, /MsdImageTransferError/);
+          assert.match(refused.content[0].text, /disk\.img/);
+          assert.equal(mock.calls.slice(before).some((call) => call.method === 'POST'), false);
+          release();
+          release = undefined;
+          const done = await pollJob(base, sessionId, jobId);
+          assert.equal(done.state, 'done');
+        });
+      } finally {
+        if (release) release();
+      }
+    });
+  });
+
   await t.test('remove refuses while the drive is connected', async () => {
     await withSession({
       images: ['disk.img'],
@@ -1207,5 +1248,289 @@ test('upload, remove, and job polling', { timeout: 30000 }, async (t) => {
       assert.equal(outcome.drive.connected, false);
       assert.equal(mock.state.images['disk.img'], undefined);
     });
+  });
+
+function fetchFlags(allowRaw, extra = {}) {
+  return {
+    ...OPEN,
+    msd: {
+      maxBytes: 1024 * 1024,
+      extensions: ['.iso', '.img'],
+      urlAllow: parseUrlAllowlist(allowRaw),
+      allowPrivate: false,
+      remoteTimeoutSec: 30,
+      resolveUrl: async () => ['203.0.113.10'],
+      ...extra,
+    },
+  };
+}
+
+const FETCH_ALLOW = 'https://images.example/iso';
+const FETCH_URL = 'https://images.example/iso/disk.img';
+
+async function refusedFetch(base, sessionId, mock, args, pattern) {
+  const result = await callTool(base, sessionId, 'pikvm_msd_fetch_url', args);
+  if (result.isError) {
+    assert.match(result.content[0].text, pattern);
+    assert.deepEqual(mock.calls, []);
+    return result.content[0].text;
+  }
+  const { jobId } = JSON.parse(result.content[0].text);
+  const failed = await pollJob(base, sessionId, jobId);
+  assert.equal(failed.state, 'failed');
+  assert.match(`${failed.error.type} ${failed.error.message}`, pattern);
+  assert.deepEqual(mock.calls, []);
+  return failed.error.message;
+}
+
+  await t.test('pikvm_msd_fetch_url is hidden until the allowlist has an https entry', async () => {
+    await withSession({ images: [] }, OPEN, async ({ base, sessionId }) => {
+      const hidden = await toolNames(base, sessionId);
+      assert.equal(hidden.includes('pikvm_msd_fetch_url'), false);
+      const refused = await callTool(base, sessionId, 'pikvm_msd_fetch_url', {
+        url: FETCH_URL,
+        confirmImage: 'disk.img',
+      });
+      assert.equal(refused.isError, true);
+      assert.match(refused.content[0].text, /PIKVM_MSD_URL_ALLOWLIST/);
+    });
+    await withSession({ images: [] }, fetchFlags(FETCH_ALLOW), async ({ base, sessionId }) => {
+      const shown = await toolNames(base, sessionId);
+      assert.equal(shown.includes('pikvm_msd_fetch_url'), true);
+    });
+  });
+
+  await t.test('url policy refusals make no kvmd call', async () => {
+    const cases = [
+      ['not allowlisted', FETCH_ALLOW, { url: 'https://other.example/iso/disk.img', confirmImage: 'disk.img' }, /not allowlisted/, {}],
+      ['http', FETCH_ALLOW, { url: 'http://images.example/iso/disk.img', confirmImage: 'disk.img' }, /https/, {}],
+      ['userinfo', FETCH_ALLOW, { url: 'https://alice:s3cret@images.example/iso/disk.img', confirmImage: 'disk.img' }, /userinfo/, {}],
+      ['loopback', FETCH_ALLOW, { url: FETCH_URL, confirmImage: 'disk.img' }, /private/, { resolveUrl: async () => ['127.0.0.1'] }],
+      ['rfc1918', FETCH_ALLOW, { url: FETCH_URL, confirmImage: 'disk.img' }, /private/, { resolveUrl: async () => ['10.1.2.3'] }],
+      ['tailscale', FETCH_ALLOW, { url: FETCH_URL, confirmImage: 'disk.img' }, /tailscale/, { resolveUrl: async () => ['100.101.102.103'] }],
+      ['metadata', `${FETCH_ALLOW}`, { url: FETCH_URL, confirmImage: 'disk.img' }, /link-local or metadata/, { allowPrivate: true, resolveUrl: async () => ['169.254.169.254'] }],
+      ['fe80', 'https://[fe80::1]/', { url: 'https://[fe80::1]/disk.img', confirmImage: 'disk.img' }, /link-local or metadata/, { allowPrivate: true, resolveUrl: async () => { throw new Error('dns'); } }],
+      ['mapped metadata', FETCH_ALLOW, { url: FETCH_URL, confirmImage: 'disk.img' }, /link-local or metadata/, { allowPrivate: true, resolveUrl: async () => ['::ffff:169.254.169.254'] }],
+    ];
+    for (const [label, allowRaw, args, pattern, extra] of cases) {
+      await withSession({ images: [] }, fetchFlags(allowRaw, extra), async ({ mock, base, sessionId }) => {
+        const text = await refusedFetch(base, sessionId, mock, args, pattern);
+        if (label === 'userinfo') assert.equal(text.includes('s3cret'), false, text);
+      });
+    }
+  });
+
+  await t.test('an allowlisted tailscale address reaches write_remote', async () => {
+    const rows = [
+      ['v4', 'https://100.101.102.103/,100.101.102.103/32', 'https://100.101.102.103/disk.img', async () => { throw new Error('dns'); }],
+      ['v6', `${FETCH_ALLOW},fd7a:115c:a1e0::/48`, FETCH_URL, async () => ['fd7a:115c:a1e0::50']],
+    ];
+    for (const [label, allowRaw, url, resolveUrl] of rows) {
+      await withSession({ images: [] }, fetchFlags(allowRaw, { resolveUrl }), async ({ mock, base, sessionId }) => {
+        const started = await callTool(base, sessionId, 'pikvm_msd_fetch_url', {
+          url,
+          confirmImage: 'disk.img',
+        });
+        assert.equal(started.isError, undefined, `${label}: ${started.content[0].text}`);
+        const { jobId } = JSON.parse(started.content[0].text);
+        const done = await pollJob(base, sessionId, jobId);
+        assert.equal(done.state, 'done', label);
+        const call = mock.calls.find((item) => item.path === '/api/msd/write_remote');
+        assert.ok(call, label);
+        assert.match(call.query, /verify=1/);
+        assert.match(call.query, /remove_incomplete=1/);
+        assert.match(call.query, /timeout=30/);
+        assert.doesNotMatch(call.query, /insecure/);
+      });
+    }
+  });
+
+  await t.test('ALLOW_PRIVATE lets an rfc1918 address through and not metadata', async () => {
+    await withSession({ images: [] }, fetchFlags(FETCH_ALLOW, {
+      allowPrivate: true,
+      resolveUrl: async () => ['10.1.2.3'],
+    }), async ({ mock, base, sessionId }) => {
+      const started = await callTool(base, sessionId, 'pikvm_msd_fetch_url', {
+        url: FETCH_URL,
+        confirmImage: 'disk.img',
+      });
+      const { jobId } = JSON.parse(started.content[0].text);
+      const done = await pollJob(base, sessionId, jobId);
+      assert.equal(done.state, 'done');
+      assert.ok(mock.calls.some((call) => call.path === '/api/msd/write_remote'));
+    });
+  });
+
+  await t.test('ndjson progress maps into the job', async () => {
+    await withSession({
+      images: [],
+      remote: {
+        gapMs: 200,
+        lines: [
+          JSON.stringify({ ok: true, result: { image: { name: 'disk.img', size: 8, written: 3 } } }),
+          JSON.stringify({ ok: true, result: { image: { name: 'disk.img', size: 8, written: 8 } } }),
+        ],
+      },
+    }, fetchFlags(FETCH_ALLOW), async ({ base, sessionId }) => {
+      const started = await callTool(base, sessionId, 'pikvm_msd_fetch_url', {
+        url: FETCH_URL,
+        confirmImage: 'disk.img',
+      });
+      const { jobId } = JSON.parse(started.content[0].text);
+      assert.equal(await waitFor(async () => {
+        const mid = JSON.parse((await callTool(base, sessionId, 'pikvm_msd_job', { jobId })).content[0].text);
+        return mid.state === 'running' && mid.bytes === 3 && mid.total === 8;
+      }), true);
+      const done = await pollJob(base, sessionId, jobId);
+      assert.equal(done.state, 'done');
+      assert.equal(done.bytes, 8);
+      assert.equal(done.total, 8);
+    });
+  });
+
+  await t.test('an error line fails the job and removes the incomplete image', async () => {
+    await withSession({
+      images: [],
+      remote: {
+        storeIncomplete: true,
+        lines: [
+          JSON.stringify({ ok: true, result: { image: { name: 'disk.img', size: 4, written: 2 } } }),
+          JSON.stringify({ ok: false, result: { error: 'MsdOperationError', error_msg: 'disk failed' } }),
+        ],
+      },
+    }, fetchFlags(FETCH_ALLOW), async ({ mock, base, sessionId }) => {
+      const started = await callTool(base, sessionId, 'pikvm_msd_fetch_url', {
+        url: FETCH_URL,
+        confirmImage: 'disk.img',
+      });
+      const { jobId } = JSON.parse(started.content[0].text);
+      const failed = await pollJob(base, sessionId, jobId);
+      assert.equal(failed.state, 'failed');
+      assert.equal(failed.error.type, 'MsdOperationError');
+      assert.equal(failed.removed, true);
+      assert.equal(mock.state.images['disk.img'], undefined);
+      assert.ok(mock.calls.some((call) => call.path === '/api/msd/remove'));
+    });
+  });
+
+  await t.test('a short stream is STATE_UNKNOWN and skips cleanup', async () => {
+    await withSession({
+      images: [],
+      remote: {
+        lines: [
+          JSON.stringify({ ok: true, result: { image: { name: 'disk.img', size: 4, written: 2 } } }),
+        ],
+      },
+    }, fetchFlags(FETCH_ALLOW), async ({ mock, base, sessionId }) => {
+      const started = await callTool(base, sessionId, 'pikvm_msd_fetch_url', {
+        url: FETCH_URL,
+        confirmImage: 'disk.img',
+      });
+      const { jobId } = JSON.parse(started.content[0].text);
+      const failed = await pollJob(base, sessionId, jobId);
+      assert.equal(failed.state, 'failed');
+      assert.equal(failed.error.type, 'PIKVM_MSD_STATE_UNKNOWN');
+      assert.equal(failed.removed, undefined);
+      assert.equal(mock.calls.some((call) => call.path === '/api/msd/remove'), false);
+    });
+  });
+
+  await t.test('a second transfer fails fast and mount of that image makes no POST', async () => {
+    await withDir(async (dir) => {
+      await writeFile(join(dir, 'disk.img'), Buffer.from('abcd'));
+      let release;
+      const flags = fetchFlags(FETCH_ALLOW, {
+        localDir: dir,
+        beforeFetch: () => new Promise((resolve) => { release = resolve; }),
+      });
+      try {
+        await withSession({ images: [] }, flags, async ({ mock, base, sessionId }) => {
+          const started = await callTool(base, sessionId, 'pikvm_msd_fetch_url', {
+            url: FETCH_URL,
+            confirmImage: 'disk.img',
+          });
+          const { jobId } = JSON.parse(started.content[0].text);
+          assert.equal(await waitFor(() => typeof release === 'function'), true);
+          const other = await openSession(base);
+          const began = Date.now();
+          const second = await callTool(base, other, 'pikvm_msd_fetch_url', {
+            url: FETCH_URL,
+            confirmImage: 'disk.img',
+          });
+          const upload = await callTool(base, other, 'pikvm_msd_upload', {
+            file: 'disk.img',
+            confirmImage: 'disk.img',
+          });
+          assert.ok(Date.now() - began < 700, 'second transfer waited');
+          assert.match(second.content[0].text, /MsdUploadBusyError/);
+          assert.match(second.content[0].text, /upload already running/);
+          assert.match(upload.content[0].text, /upload already running/);
+          const before = mock.calls.length;
+          const mounted = await callTool(base, sessionId, 'pikvm_msd_mount', {
+            image: 'disk.img',
+            mode: 'flash',
+            confirmImage: 'disk.img',
+          });
+          assert.match(mounted.content[0].text, /MsdImageTransferError/);
+          assert.equal(mock.calls.slice(before).some((call) => call.method === 'POST'), false);
+          assert.deepEqual(mock.calls, []);
+          release();
+          release = undefined;
+          const done = await pollJob(base, sessionId, jobId);
+          assert.equal(done.state, 'done');
+        });
+      } finally {
+        if (release) release();
+      }
+    });
+  });
+
+  await t.test('logs omit the query string and an explicit image is sent', async () => {
+    const logged = [];
+    const orig = console.error;
+    console.error = (...args) => {
+      logged.push(args.map(String).join(' '));
+      orig(...args);
+    };
+    try {
+      await withSession({ images: [] }, fetchFlags(FETCH_ALLOW), async ({ mock, base, sessionId }) => {
+        const started = await callTool(base, sessionId, 'pikvm_msd_fetch_url', {
+          url: 'https://images.example/iso/other.img?token=supersecret',
+          image: 'disk.img',
+          confirmImage: 'disk.img',
+        });
+        const { jobId } = JSON.parse(started.content[0].text);
+        const done = await pollJob(base, sessionId, jobId);
+        assert.equal(done.state, 'done');
+        const call = mock.calls.find((item) => item.path === '/api/msd/write_remote');
+        assert.match(call.query, /image=disk\.img/);
+        assert.match(decodeURIComponent(call.query), /token=supersecret/);
+      });
+    } finally {
+      console.error = orig;
+    }
+    const fetchLogs = logged.filter((line) => line.includes('msd_fetch'));
+    assert.ok(fetchLogs.length >= 1);
+    assert.equal(fetchLogs.some((line) => line.includes('supersecret') || line.includes('token=')), false);
+  });
+
+  await t.test('pre-check refusals make no MSD POST', async () => {
+    const cases = [
+      ['connected', { images: ['other.img'], drive: { image: 'other.img', connected: true, cdrom: false, rw: false } }, 'MsdConnectedError'],
+      ['exists', { images: ['disk.img'] }, 'MsdImageExistsError'],
+    ];
+    for (const [label, mockOptions, type] of cases) {
+      await withSession(mockOptions, fetchFlags(FETCH_ALLOW), async ({ mock, base, sessionId }) => {
+        const started = await callTool(base, sessionId, 'pikvm_msd_fetch_url', {
+          url: FETCH_URL,
+          confirmImage: 'disk.img',
+        });
+        const { jobId } = JSON.parse(started.content[0].text);
+        const failed = await pollJob(base, sessionId, jobId);
+        assert.equal(failed.state, 'failed', label);
+        assert.equal(failed.error.type, type, label);
+        assert.deepEqual(msdPosts(mock), [], label);
+      });
+    }
   });
 });

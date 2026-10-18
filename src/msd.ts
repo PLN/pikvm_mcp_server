@@ -2,6 +2,7 @@
 // Modified 2026-10 by PLN: expectImage, preflight, and MSD mutex (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: upload jobs, remove, and job lock (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: hashing jobs, bad-image cleanup, upload try-lock (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: URL fetch jobs and mount block during a transfer (GPL-3.0; see NOTICE).
 
 /**
  * Policy for MSD status, mount, eject, upload, and remove.
@@ -9,8 +10,9 @@
  * and mount rollback live here.
  * Mount and eject share a per-device mutex so one session's rollback
  * cannot run in the middle of another's change. An upload takes a
- * fail-fast try-lock, so a second upload is refused and a transfer
- * does not queue mount or eject.
+ * fail-fast try-lock, so a second upload or URL fetch is refused and a
+ * transfer does not queue mount or eject. Mount refuses an image that
+ * already has an active transfer.
  */
 
 import { createHash, randomBytes } from 'node:crypto';
@@ -23,8 +25,17 @@ import {
   KvmdError,
   type MsdDriveState,
   type MsdState,
+  type MsdWriteResult,
   type PiKVMClient,
 } from './pikvm/client.js';
+import {
+  assertResolvedAddresses,
+  inspectFetchUrl,
+  MsdUrlPolicyError,
+  redactUrlUserinfo,
+  resolveFetchHost,
+  type UrlAllowlist,
+} from './url-policy.js';
 
 export interface ResolvedDevice {
   name: string;
@@ -102,13 +113,25 @@ export class MsdPreflightError extends Error {
   }
 }
 
-/** Another upload already holds this device. The caller is not queued. */
+/** Another upload or URL fetch already holds this device. The caller is not queued. */
 export class MsdUploadBusyError extends Error {
   readonly type = 'MsdUploadBusyError';
 
   constructor() {
     super('upload already running');
     this.name = 'MsdUploadBusyError';
+  }
+}
+
+/** Mount of an image that still has an upload or fetch job. No kvmd call is made. */
+export class MsdImageTransferError extends Error {
+  readonly type = 'MsdImageTransferError';
+  readonly image: string;
+
+  constructor(image: string) {
+    super(`image ${JSON.stringify(image)} has an active transfer`);
+    this.name = 'MsdImageTransferError';
+    this.image = image;
   }
 }
 
@@ -173,7 +196,7 @@ function errorFields(err: unknown): ErrorFields {
     return {
       status: err.status,
       type: err.type,
-      message: err.message,
+      message: redactUrlUserinfo(err.message),
       endpoint: err.endpoint,
     };
   }
@@ -181,18 +204,20 @@ function errorFields(err: unknown): ErrorFields {
     err instanceof MsdExpectImageError
     || err instanceof MsdPreflightError
     || err instanceof MsdUploadBusyError
+    || err instanceof MsdImageTransferError
+    || err instanceof MsdUrlPolicyError
   ) {
     return {
       status: 0,
       type: err.type,
-      message: err.message,
+      message: redactUrlUserinfo(err.message),
       endpoint: '',
     };
   }
   return {
     status: 0,
     type: 'Error',
-    message: err instanceof Error ? err.message : 'MSD operation failed',
+    message: redactUrlUserinfo(err instanceof Error ? err.message : 'MSD operation failed'),
     endpoint: '',
   };
 }
@@ -338,6 +363,7 @@ async function mountMsdLocked(client: PiKVMClient, request: MountRequest): Promi
   if (image.includes('://')) {
     throw new Error('image must not contain ://');
   }
+  assertNoActiveTransfer(device, image);
   const state = await client.getMsdState();
   // Offline hides the drive, so there is no snapshot image to compare.
   if (!state.online) {
@@ -431,6 +457,8 @@ interface JobRecord {
   state: JobState;
   bytes: number;
   total: number;
+  device: string;
+  image: string;
   sha256?: string;
   error?: ErrorFields;
   removed?: boolean;
@@ -439,6 +467,15 @@ interface JobRecord {
 }
 
 const jobs = new Map<string, JobRecord>();
+
+function assertNoActiveTransfer(device: string, image: string): void {
+  for (const job of jobs.values()) {
+    if (job.device !== device || job.image !== image) continue;
+    if (job.state === 'hashing' || job.state === 'running') {
+      throw new MsdImageTransferError(image);
+    }
+  }
+}
 
 function jobLimitOf(value: number | undefined): number {
   return value !== undefined && Number.isSafeInteger(value) && value > 0 ? value : JOB_CAP;
@@ -741,6 +778,8 @@ export async function startMsdUpload(
     state: 'hashing',
     bytes: 0,
     total: opened.size,
+    device,
+    image: file,
   };
   const jobId = randomBytes(16).toString('hex');
   jobs.set(jobId, job);
@@ -782,4 +821,109 @@ export async function removeMsd(
       throw err;
     }
   });
+}
+
+export interface FetchRequest {
+  device: string;
+  url: string;
+  image?: string;
+  confirmImage: string;
+  extensions: readonly string[];
+  allow: UrlAllowlist;
+  allowPrivate: boolean;
+  /** kvmd write_remote timeout in seconds. */
+  remoteTimeoutSec: number;
+  resolveUrl?: (hostname: string) => Promise<string[]>;
+  /** Awaited in the job before DNS. Unset in production. */
+  beforeFetch?: () => Promise<void>;
+  jobLimit?: number;
+  jobTtlMs?: number;
+}
+
+async function assertFetchAllowed(client: PiKVMClient, image: string): Promise<void> {
+  const state = await client.getMsdState();
+  if (!state.online) throw new MsdPreflightError('MsdOfflineError', 'kvmd MSD is offline');
+  if (state.busy) throw new MsdPreflightError('MsdBusyError', 'kvmd MSD is busy');
+  if (state.drive?.connected === true) throw new MsdPreflightError('MsdConnectedError', 'drive is connected');
+  if (state.images[image]) throw new MsdPreflightError('MsdImageExistsError', 'image already exists');
+}
+
+function isStateUnknown(err: unknown): boolean {
+  return err instanceof KvmdError && err.type === 'PIKVM_MSD_STATE_UNKNOWN';
+}
+
+async function runFetch(
+  client: PiKVMClient,
+  request: FetchRequest,
+  inspected: { href: string; hostname: string },
+  image: string,
+  job: JobRecord,
+): Promise<void> {
+  const { device } = request;
+  let started = false;
+  try {
+    if (request.beforeFetch) await request.beforeFetch();
+    const addresses = await resolveFetchHost(inspected.hostname, request.resolveUrl);
+    assertResolvedAddresses(addresses, request.allow, request.allowPrivate);
+    await assertFetchAllowed(client, image);
+    started = true;
+    let last: MsdWriteResult | undefined;
+    for await (const row of client.msdWriteRemote(inspected.href, {
+      image,
+      removeIncomplete: true,
+      timeout: request.remoteTimeoutSec,
+    })) {
+      last = row;
+      job.bytes = row.written;
+      job.total = row.size;
+    }
+    if (!last || last.written !== last.size) throw new Error('written does not match size');
+    job.bytes = last.written;
+    job.total = last.size;
+    job.state = 'done';
+    job.finishedAt = Date.now();
+    logMsd('msd_fetch', device, image, true, undefined, { bytes: last.written });
+  } catch (err) {
+    if (started && !isStateUnknown(err)) {
+      const cleanup = await removeUploadedImage(client, image, device);
+      job.removed = cleanup.removed;
+      if (cleanup.removeError) job.removeError = cleanup.removeError;
+    }
+    failJob(job, err);
+    logMsd('msd_fetch', device, image, false, job.error?.type ?? 'Error', {
+      bytes: job.bytes,
+      ...(job.removed !== undefined ? { removed: job.removed } : {}),
+    });
+  } finally {
+    pruneJobs(jobLimitOf(request.jobLimit), jobTtlOf(request.jobTtlMs));
+  }
+}
+
+/**
+ * Accept the URL and image name, then return a jobId. DNS, the address
+ * policy, the kvmd pre-check, and write_remote run in the job. A second
+ * transfer while one is running throws before any kvmd call.
+ */
+export async function startMsdFetch(
+  client: PiKVMClient,
+  request: FetchRequest,
+): Promise<{ jobId: string }> {
+  const inspected = inspectFetchUrl(request.url, request.allow);
+  const image = request.image ?? inspected.imageFromPath;
+  assertBareName(image, request.extensions);
+  if (request.confirmImage !== image) throw new Error('confirmImage does not match image');
+  acquireUpload(request.device);
+  const job: JobRecord = {
+    state: 'running',
+    bytes: 0,
+    total: 0,
+    device: request.device,
+    image,
+  };
+  const jobId = randomBytes(16).toString('hex');
+  jobs.set(jobId, job);
+  pruneJobs(jobLimitOf(request.jobLimit), jobTtlOf(request.jobTtlMs));
+  void runFetch(client, request, inspected, image, job)
+    .finally(() => releaseUpload(request.device));
+  return { jobId };
 }
