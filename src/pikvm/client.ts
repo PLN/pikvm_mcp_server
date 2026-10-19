@@ -16,6 +16,7 @@
 // Modified 2026-10 by PLN: OCR is not retried after it is sent (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: sharp refuses an oversized image (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: one resolved click frame for the move and the echo (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: a catalog read stops at the caller's deadline (GPL-3.0; see NOTICE).
 // AbortSignal.timeout and PIKVM_UNREACHABLE / PIKVM_AUTH_FAILED no-retry codes
 // adapted from dtrukr/pikvm_mcp_server src/pikvm/client.ts @ d120243 (GPL-3.0).
 // Snapshot HTTP 503 retry-once adapted from dvaerum/pikvm_mcp_server
@@ -558,9 +559,16 @@ function printIsSlow(path: string): boolean {
   return slow === '1' || slow === 'true';
 }
 
-function delay(ms: number): Promise<void> {
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted || ms <= 0) return Promise.resolve();
   return new Promise((resolve) => {
-    setTimeout(resolve, ms);
+    const timer = setTimeout(finish, ms);
+    function finish() {
+      signal?.removeEventListener('abort', finish);
+      clearTimeout(timer);
+      resolve();
+    }
+    signal?.addEventListener('abort', finish, { once: true });
   });
 }
 
@@ -939,6 +947,7 @@ export class PiKVMClient {
     body?: string | object,
     contentType?: string,
     timeoutMs?: number,
+    signal?: AbortSignal,
   ): Promise<T> {
     const idempotentGet = method.toUpperCase() === 'GET';
     const snapshot = idempotentGet && isSnapshotPath(path);
@@ -947,21 +956,25 @@ export class PiKVMClient {
 
     for (;;) {
       try {
-        return await this.requestOnce<T>(method, path, body, contentType, timeoutMs);
+        return await this.requestOnce<T>(method, path, body, contentType, timeoutMs, signal);
       } catch (err) {
+        // The caller's deadline already fired. Another try would run past it.
+        if (signal?.aborted) throw err;
         if (!idempotentGet || !(err instanceof KvmdError) || !isRetryableGetError(err)) {
           throw err;
         }
         if (snapshot && err.status === 503) {
           if (snapshot503Retried) throw err;
           snapshot503Retried = true;
-          await delay(SNAPSHOT_503_GRACE_MS);
+          await delay(SNAPSHOT_503_GRACE_MS, signal);
+          if (signal?.aborted) throw err;
           continue;
         }
         generalFailures += 1;
         if (generalFailures >= MAX_GET_ATTEMPTS) throw err;
         const backoff = GET_RETRY_BACKOFF_MS[generalFailures - 1];
-        await delay(backoff + jitterMs());
+        await delay(backoff + jitterMs(), signal);
+        if (signal?.aborted) throw err;
       }
     }
   }
@@ -975,6 +988,7 @@ export class PiKVMClient {
     body?: string | object,
     contentType?: string,
     timeoutOverride?: number,
+    externalSignal?: AbortSignal,
   ): Promise<T> {
     const url = new URL(`/api${path}`, this.config.host);
     const endpoint = `${method.toUpperCase()} ${url.pathname}`;
@@ -1005,7 +1019,9 @@ export class PiKVMClient {
         headers,
         body: body ? (typeof body === 'object' ? JSON.stringify(body) : body) : undefined,
         dispatcher: testDispatchers.get(this) ?? this.dispatcher,
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: externalSignal
+          ? AbortSignal.any([AbortSignal.timeout(timeoutMs), externalSignal])
+          : AbortSignal.timeout(timeoutMs),
         redirect: 'manual',
       });
     } catch (err) {
@@ -1662,9 +1678,11 @@ export class PiKVMClient {
   /**
    * GET /api/msd. Idempotent, so the ordinary GET retry applies.
    * `free` accepts the parts map and legacy top-level `storage.free`.
+   * `signal` aborts this read and its retries. The catalog wait uses it
+   * so a slow read cannot run past the readiness budget.
    */
-  async getMsdState(): Promise<MsdState> {
-    const body = await this.request<KvmdEnvelope>('GET', '/msd');
+  async getMsdState(signal?: AbortSignal): Promise<MsdState> {
+    const body = await this.request<KvmdEnvelope>('GET', '/msd', undefined, undefined, undefined, signal);
     this.assertKvmdOk(body, 'GET /api/msd');
     return normalizeMsdState(body?.result);
   }

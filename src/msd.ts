@@ -10,6 +10,8 @@
 // Modified 2026-10 by PLN: job reads stay on the device that created them (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: the retained-job cap is per device (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: catalog readiness after a successful write (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: a stable wrong size fails at once, and an unseen image is confirmed briefly (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: the upload slot is free before a job looks finished (GPL-3.0; see NOTICE).
 
 /**
  * Policy for MSD status, mount, eject, upload, and remove.
@@ -40,6 +42,7 @@ import {
 import {
   MSD_READY_TIMEOUT_DEFAULT_MS,
   MSD_READY_TIMEOUT_MAX_MS,
+  MSD_UNSEEN_CONFIRM_MS,
   normalizeMsdTimeoutMs,
 } from './request-timeout.js';
 import {
@@ -627,6 +630,11 @@ export interface UploadRequest {
   beforeHash?: () => Promise<void>;
   /** Awaited in the upload body before the file is read. Unset in production. */
   beforeUploadStream?: () => Promise<void>;
+  /**
+   * Awaited after the file is closed, while the slot is still held, and
+   * before the job becomes done or failed. Unset in production.
+   */
+  beforeSlotRelease?: () => Promise<void>;
   /** Overrides the 1.5s storage.uploading poll. Unset in production. */
   uploadPollMs?: number;
   /** Retained-job cap for one device. Default 64. Unset in production. */
@@ -785,9 +793,10 @@ function catalogDelay(ms: number, image: string, signal: AbortSignal): Promise<v
  * One catalog row. Ready means that exact name is present, complete,
  * and the same size we wrote when the size is known. A missing row, or
  * a row whose size is still 0, is stale and keeps waiting. complete
- * false with a positive size is incomplete. A different positive size,
- * or a complete row of the wrong size, is a mismatch. The deadline
- * turns a stale row into PIKVM_MSD_CATALOG_TIMEOUT.
+ * false keeps waiting until the deadline even when the size is already
+ * different: that size can still change. A complete row of the wrong
+ * size is a stable mismatch and fails at once. The deadline turns a
+ * stale row into PIKVM_MSD_CATALOG_TIMEOUT.
  */
 function catalogVerdict(
   row: MsdImageRecord | undefined,
@@ -812,10 +821,49 @@ function catalogFailure(image: string, row: MsdImageRecord | undefined, expected
   return new MsdCatalogTimeoutError(image);
 }
 
+const CATALOG_SEEN = 'catalogSeen';
+
+function withCatalogSeen(err: unknown, seen: boolean): Error {
+  const error = err instanceof Error ? err : new Error('catalog wait failed');
+  if (Object.prototype.hasOwnProperty.call(error, CATALOG_SEEN)) return error;
+  Object.defineProperty(error, CATALOG_SEEN, { value: seen, enumerable: false });
+  return error;
+}
+
+function catalogSeen(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  return (err as { catalogSeen?: boolean }).catalogSeen === true;
+}
+
+/**
+ * One GET /api/msd that cannot outlive `deadlineAt` or `cancel`.
+ * The request time counts against the deadline: a slow read is aborted
+ * instead of being allowed to finish after the budget.
+ */
+async function readMsdState(
+  client: PiKVMClient,
+  deadlineAt: number,
+  cancel?: AbortSignal,
+): Promise<MsdState | 'deadline' | 'cancelled'> {
+  if (cancel?.aborted) return 'cancelled';
+  const left = deadlineAt - Date.now();
+  if (left <= 0) return 'deadline';
+  const attempt = AbortSignal.timeout(left);
+  const signal = cancel ? AbortSignal.any([attempt, cancel]) : attempt;
+  try {
+    return await client.getMsdState(signal);
+  } catch (err) {
+    if (cancel?.aborted) return 'cancelled';
+    if (attempt.aborted || Date.now() >= deadlineAt) return 'deadline';
+    throw err;
+  }
+}
+
 /**
  * GET /api/msd until the image is ready, or the budget ends.
  * Does not POST the upload or write_remote again. Holds no lock;
- * the caller holds the MSD mutex for the whole wait.
+ * the caller holds the MSD mutex for the whole wait. The budget is
+ * wall time from the start, including each catalog read.
  */
 async function waitForCatalog(
   client: PiKVMClient,
@@ -824,21 +872,37 @@ async function waitForCatalog(
   timeoutMs: number,
   signal: AbortSignal,
 ): Promise<void> {
-  const started = Date.now();
+  const deadlineAt = Date.now() + timeoutMs;
   let delayMs = CATALOG_POLL_MIN_MS;
   let last: MsdImageRecord | undefined;
-  for (;;) {
-    throwIfCancelled(image, signal);
-    const state = await client.getMsdState();
-    throwIfCancelled(image, signal);
-    last = state.images[image];
-    const verdict = catalogVerdict(last, expected);
-    if (verdict === 'ready') return;
-    const elapsed = Date.now() - started;
-    if (elapsed >= timeoutMs) throw catalogFailure(image, last, expected);
-    const wait = Math.min(delayMs, timeoutMs - elapsed);
-    await catalogDelay(wait, image, signal);
-    delayMs = Math.min(CATALOG_POLL_MAX_MS, delayMs * 2);
+  let seen = false;
+  try {
+    for (;;) {
+      if (signal.aborted) throw new MsdCancelledError(image);
+      const read = await readMsdState(client, deadlineAt, signal);
+      if (read === 'cancelled') throw new MsdCancelledError(image);
+      if (read === 'deadline') throw catalogFailure(image, last, expected);
+      if (Date.now() >= deadlineAt) {
+        last = read.images[image];
+        if (last) seen = true;
+        const late = catalogVerdict(last, expected);
+        if (late === 'ready') return;
+        throw catalogFailure(image, last, expected);
+      }
+      last = read.images[image];
+      if (last) seen = true;
+      const verdict = catalogVerdict(last, expected);
+      if (verdict === 'ready') return;
+      if (verdict === 'size' && last !== undefined && last.complete === true && expected !== undefined) {
+        throw new MsdSizeMismatchError(image, last.size, expected);
+      }
+      const remain = deadlineAt - Date.now();
+      if (remain <= 0) throw catalogFailure(image, last, expected);
+      await catalogDelay(Math.min(delayMs, remain), image, signal);
+      delayMs = Math.min(CATALOG_POLL_MAX_MS, delayMs * 2);
+    }
+  } catch (err) {
+    throw withCatalogSeen(err, seen);
   }
 }
 
@@ -863,53 +927,74 @@ export function cancelMsdJob(jobId: string): boolean {
  * appears during the budget, it is removed again. Anything else is
  * PIKVM_MSD_REMOVAL_UNCONFIRMED. The MSD mutex is held for the budget
  * so a mount cannot select the name while it is being confirmed.
+ * `unseenMs` is the budget while the name has not been seen. Once it
+ * appears, the budget becomes `timeoutMs` measured from the start.
+ * Each catalog read stops at that deadline.
  */
 export async function confirmImageAbsent(
   client: PiKVMClient,
   device: string,
   image: string,
   timeoutMs: number,
+  unseenMs?: number,
 ): Promise<{ removed: boolean; removeError?: ErrorFields }> {
-  return withMsdLock(device, () => confirmImageAbsentLocked(client, image, timeoutMs));
+  return withMsdLock(device, () => confirmImageAbsentLocked(client, image, timeoutMs, unseenMs));
 }
 
 async function confirmImageAbsentLocked(
   client: PiKVMClient,
   image: string,
   timeoutMs: number,
+  unseenMs?: number,
 ): Promise<{ removed: boolean; removeError?: ErrorFields }> {
   const started = Date.now();
   let delayMs = CATALOG_POLL_MIN_MS;
   let removedOnce = false;
+  let seen = false;
+  let lastAbsent = false;
   const signal = new AbortController().signal;
+  const budgetMs = (): number => (seen || unseenMs === undefined ? timeoutMs : unseenMs);
 
-  const take = async (): Promise<'absent' | 'removed'> => {
-    const state = await client.getMsdState();
-    const row = state.images[image];
-    if (!row) return 'absent';
+  const applyRow = async (state: MsdState): Promise<'absent' | 'removed'> => {
+    if (!state.images[image]) {
+      lastAbsent = true;
+      return 'absent';
+    }
+    lastAbsent = false;
+    seen = true;
     try {
       await client.msdRemove(image);
       removedOnce = true;
       return 'removed';
     } catch (err) {
-      if (err instanceof KvmdError && err.type === 'MsdUnknownImageError') return 'absent';
+      if (err instanceof KvmdError && err.type === 'MsdUnknownImageError') {
+        lastAbsent = true;
+        return 'absent';
+      }
       throw err;
     }
   };
 
   try {
     for (;;) {
-      const step = await take();
+      const deadlineAt = started + budgetMs();
+      if (deadlineAt - Date.now() <= 0) break;
+      const read = await readMsdState(client, deadlineAt);
+      if (read === 'deadline' || read === 'cancelled') break;
+      const step = await applyRow(read);
       if (step === 'absent' && removedOnce) return { removed: true };
-      const elapsed = Date.now() - started;
-      if (elapsed >= timeoutMs) break;
-      await catalogDelay(Math.min(delayMs, timeoutMs - elapsed), image, signal);
+      const remain = started + budgetMs() - Date.now();
+      if (remain <= 0) break;
+      await catalogDelay(Math.min(delayMs, remain), image, signal);
       delayMs = Math.min(CATALOG_POLL_MAX_MS, delayMs * 2);
     }
-    const step = await take();
-    if (step === 'absent') return { removed: true };
-    const after = await client.getMsdState();
-    if (!after.images[image]) return { removed: true };
+    if (lastAbsent) return { removed: true };
+    if (removedOnce) {
+      const follow = await readMsdState(client, Date.now() + CATALOG_POLL_MIN_MS);
+      if (follow !== 'deadline' && follow !== 'cancelled' && !follow.images[image]) {
+        return { removed: true };
+      }
+    }
     return { removed: false, removeError: errorFields(new MsdRemovalUnconfirmedError(image)) };
   } catch (err) {
     return { removed: false, removeError: errorFields(err) };
@@ -921,8 +1006,15 @@ async function removeUploadedImage(
   image: string,
   device: string,
   timeoutMs: number,
+  unseenMs?: number,
 ): Promise<{ removed: boolean; removeError?: ErrorFields }> {
-  return confirmImageAbsent(client, device, image, timeoutMs);
+  return confirmImageAbsent(client, device, image, timeoutMs, unseenMs);
+}
+
+/** Full readiness budget after the image was seen. A short cap when it was not. */
+function cleanupBudgets(err: unknown, readyMs: number): { timeoutMs: number; unseenMs?: number } {
+  if (catalogSeen(err)) return { timeoutMs: readyMs };
+  return { timeoutMs: readyMs, unseenMs: Math.min(readyMs, MSD_UNSEEN_CONFIRM_MS) };
 }
 
 function failJob(job: JobRecord, err: unknown): void {
@@ -947,9 +1039,13 @@ async function runUpload(
     : UPLOAD_POLL_MS;
   let stream: Readable | undefined;
   let timer: ReturnType<typeof setInterval> | undefined;
+  let failure: unknown;
+  let digest = '';
   const signal = { bad: '' };
   const sent = { n: 0 };
   let wrote = false;
+  let slotFree = false;
+  let published = false;
   try {
     if (request.beforeHash) await request.beforeHash();
     const prehash = await hashFd(fh, size);
@@ -989,7 +1085,7 @@ async function runUpload(
       clearInterval(timer);
       timer = undefined;
     }
-    const digest = hash.digest('hex');
+    digest = hash.digest('hex');
     job.sha256 = digest;
     if (signal.bad) throw new Error(signal.bad);
     if (digest !== prehash) throw new Error('sha256 changed while uploading');
@@ -1004,31 +1100,68 @@ async function runUpload(
         job.abort.signal,
       );
       job.bytes = size;
-      job.state = 'done';
-      job.finishedAt = Date.now();
+      // The slot is free before done is visible, and done is visible
+      // before this lock lets a queued mount run.
+      await releaseSlot();
+      if (failure !== undefined) {
+        publishFailure();
+        return;
+      }
+      publishSuccess();
     });
-    logMsd('msd_upload', device, file, true, undefined, { bytes: size, sha256: digest });
   } catch (err) {
-    if (wrote) {
+    if (failure === undefined) failure = err;
+    if (wrote && !published) {
+      const readyMs = readyBudget(request.readyTimeoutMs);
+      const budgets = cleanupBudgets(err, readyMs);
       const cleanup = await removeUploadedImage(
         client,
         file,
         device,
-        readyBudget(request.readyTimeoutMs),
+        budgets.timeoutMs,
+        budgets.unseenMs,
       );
       job.removed = cleanup.removed;
       if (cleanup.removeError) job.removeError = cleanup.removeError;
     }
-    failJob(job, err);
+  } finally {
+    if (timer) clearInterval(timer);
+    if (!slotFree) await releaseSlot();
+    if (!published) {
+      if (failure !== undefined) publishFailure();
+      else publishSuccess();
+    }
+    pruneJobs(jobLimitOf(request.jobLimit), jobTtlOf(request.jobTtlMs));
+  }
+
+  function publishSuccess(): void {
+    published = true;
+    job.state = 'done';
+    job.finishedAt = Date.now();
+    logMsd('msd_upload', device, file, true, undefined, { bytes: size, sha256: digest });
+  }
+
+  function publishFailure(): void {
+    published = true;
+    failJob(job, failure);
     logMsd('msd_upload', device, file, false, job.error?.type ?? 'Error', {
       bytes: job.bytes,
       ...(job.sha256 ? { sha256: job.sha256 } : {}),
       ...(job.removed !== undefined ? { removed: job.removed } : {}),
     });
-  } finally {
-    if (timer) clearInterval(timer);
-    await closeUpload(stream, fh);
-    pruneJobs(jobLimitOf(request.jobLimit), jobTtlOf(request.jobTtlMs));
+  }
+
+  async function releaseSlot(): Promise<void> {
+    if (slotFree) return;
+    try {
+      await closeUpload(stream, fh);
+      if (request.beforeSlotRelease) await request.beforeSlotRelease();
+    } catch (err) {
+      if (failure === undefined) failure = err;
+    } finally {
+      releaseUpload(device);
+      slotFree = true;
+    }
   }
 }
 
@@ -1065,8 +1198,7 @@ export async function startMsdUpload(
   const jobId = randomBytes(16).toString('hex');
   jobs.set(jobId, job);
   pruneJobs(jobLimitOf(request.jobLimit), jobTtlOf(request.jobTtlMs));
-  void runUpload(client, request, opened.fh, opened.size, expected, job)
-    .finally(() => releaseUpload(device));
+  void runUpload(client, request, opened.fh, opened.size, expected, job);
   return { jobId };
 }
 
@@ -1144,12 +1276,15 @@ async function runFetch(
 ): Promise<void> {
   const { device } = request;
   let sawOurImage = false;
+  let failure: unknown;
+  let last: MsdWriteResult | undefined;
+  let slotFree = false;
+  let published = false;
   try {
     if (request.beforeFetch) await request.beforeFetch();
     const addresses = await resolveFetchHost(inspected.hostname, request.resolveUrl);
     assertResolvedAddresses(addresses, request.allow, request.allowPrivate);
     await assertFetchAllowed(client, image);
-    let last: MsdWriteResult | undefined;
     for await (const row of client.msdWriteRemote(inspected.href, {
       image,
       removeIncomplete: true,
@@ -1178,28 +1313,53 @@ async function runFetch(
         readyBudget(request.readyTimeoutMs),
         job.abort.signal,
       );
-      job.state = 'done';
-      job.finishedAt = Date.now();
+      releaseFetchSlot();
+      publishFetchSuccess();
     });
-    logMsd('msd_fetch', device, image, true, undefined, { bytes: last.written });
   } catch (err) {
-    if (sawOurImage && !isStateUnknown(err)) {
+    if (failure === undefined) failure = err;
+    if (sawOurImage && !published && !isStateUnknown(err)) {
+      const readyMs = readyBudget(request.readyTimeoutMs);
+      const budgets = cleanupBudgets(err, readyMs);
       const cleanup = await removeUploadedImage(
         client,
         image,
         device,
-        readyBudget(request.readyTimeoutMs),
+        budgets.timeoutMs,
+        budgets.unseenMs,
       );
       job.removed = cleanup.removed;
       if (cleanup.removeError) job.removeError = cleanup.removeError;
     }
-    failJob(job, err);
+  } finally {
+    if (!slotFree) releaseFetchSlot();
+    if (!published) {
+      if (failure !== undefined) publishFetchFailure();
+      else publishFetchSuccess();
+    }
+    pruneJobs(jobLimitOf(request.jobLimit), jobTtlOf(request.jobTtlMs));
+  }
+
+  function releaseFetchSlot(): void {
+    if (slotFree) return;
+    releaseUpload(device);
+    slotFree = true;
+  }
+
+  function publishFetchSuccess(): void {
+    published = true;
+    job.state = 'done';
+    job.finishedAt = Date.now();
+    logMsd('msd_fetch', device, image, true, undefined, { bytes: last?.written ?? job.bytes });
+  }
+
+  function publishFetchFailure(): void {
+    published = true;
+    failJob(job, failure);
     logMsd('msd_fetch', device, image, false, job.error?.type ?? 'Error', {
       bytes: job.bytes,
       ...(job.removed !== undefined ? { removed: job.removed } : {}),
     });
-  } finally {
-    pruneJobs(jobLimitOf(request.jobLimit), jobTtlOf(request.jobTtlMs));
   }
 }
 
@@ -1228,7 +1388,6 @@ export async function startMsdFetch(
   const jobId = randomBytes(16).toString('hex');
   jobs.set(jobId, job);
   pruneJobs(jobLimitOf(request.jobLimit), jobTtlOf(request.jobTtlMs));
-  void runFetch(client, request, inspected, image, job)
-    .finally(() => releaseUpload(request.device));
+  void runFetch(client, request, inspected, image, job);
   return { jobId };
 }

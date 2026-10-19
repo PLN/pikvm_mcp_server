@@ -9,6 +9,9 @@
 // Modified 2026-10 by PLN: upload abort must not crash the process (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: abort tests reject a raw-fd upload read (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: catalog readiness and confirmed removal (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: stable size mismatch, unseen confirm, and the readiness deadline (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: symlink and FIFO path checks follow the platform (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: a finished job has already released the upload slot (GPL-3.0; see NOTICE).
 
 /**
  * MSD tools against the mock. The HTTP harness matches test/http.test.mjs.
@@ -27,12 +30,14 @@ import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { cancelMsdJob } from '../dist/msd.js';
+import { MSD_UNSEEN_CONFIRM_MS } from '../dist/request-timeout.js';
 import { PiKVMClient } from '../dist/pikvm/client.js';
 import { BusyLock } from '../dist/pikvm/lock.js';
 import { createMcpServer, ARM_GATED_TOOLS, MSD_READ_ONLY_TOOLS, msdToolRequiresArm } from '../dist/server.js';
 import { parseUrlAllowlist } from '../dist/url-policy.js';
 import { startHttpServer } from '../dist/http.js';
 import { startKvmdMock } from './kvmd-mock.mjs';
+import { fifoAvailable, symlinkAvailable } from './posix-caps.mjs';
 
 const execFileAsync = promisify(execFile);
 const TOKEN = 'test-bearer-token-0123456789abcdef';
@@ -988,19 +993,23 @@ test('upload, remove, and job polling', { timeout: 120000 }, async (t) => {
   await t.test('path rejections make no kvmd call', async () => {
     await withDir(async (dir) => {
       await writeFile(join(dir, 'real.img'), body);
-      await symlink(join(dir, 'real.img'), join(dir, 'link.img'));
       await mkdir(join(dir, 'dir.img'));
       await writeFile(join(dir, 'big.img'), body);
-      await execFileAsync('mkfifo', [join(dir, 'pipe.img')]);
       const cases = [
         ['traversal', { file: '../real.img', confirmImage: '../real.img' }, /bare image name/],
         ['absolute', { file: '/tmp/real.img', confirmImage: '/tmp/real.img' }, /bare image name/],
-        ['symlink', { file: 'link.img', confirmImage: 'link.img' }, /symlink/],
         ['directory', { file: 'dir.img', confirmImage: 'dir.img' }, /directory/],
-        ['fifo', { file: 'pipe.img', confirmImage: 'pipe.img' }, /not a regular file/],
         ['oversize', { file: 'big.img', confirmImage: 'big.img' }, /PIKVM_MSD_MAX_BYTES/],
         ['sha256 format', { file: 'real.img', confirmImage: 'real.img', sha256: 'nope' }, /64 hex/],
       ];
+      if (symlinkAvailable()) {
+        await symlink(join(dir, 'real.img'), join(dir, 'link.img'));
+        cases.push(['symlink', { file: 'link.img', confirmImage: 'link.img' }, /symlink/]);
+      }
+      if (fifoAvailable()) {
+        await execFileAsync('mkfifo', [join(dir, 'pipe.img')]);
+        cases.push(['fifo', { file: 'pipe.img', confirmImage: 'pipe.img' }, /not a regular file/]);
+      }
       for (const [label, args, pattern] of cases) {
         const flags = label === 'oversize'
           ? uploadMsd(dir, { maxBytes: 3 })
@@ -1260,6 +1269,59 @@ test('upload, remove, and job polling', { timeout: 120000 }, async (t) => {
         const kept = JSON.parse((await callTool(base, sessionId, 'pikvm_msd_job', { jobId: ids[2] })).content[0].text);
         assert.equal(kept.state, 'failed');
       });
+    });
+  });
+
+  await t.test('a failed job stays unfinished until the upload slot is free', async (inner) => {
+    watchCrashes(inner);
+    await withDir(async (dir) => {
+      await writeFile(join(dir, 'disk.img'), body);
+      let release;
+      const flags = uploadMsd(dir, {
+        beforeSlotRelease: () => new Promise((resolve) => { release = resolve; }),
+      });
+      try {
+        await withSession({ images: [] }, flags, async ({ mock, base, sessionId }) => {
+          const started = await callTool(base, sessionId, 'pikvm_msd_upload', {
+            file: 'disk.img',
+            confirmImage: 'disk.img',
+            sha256: 'a'.repeat(64),
+          });
+          assert.equal(started.isError, undefined, started.content[0].text);
+          const { jobId } = JSON.parse(started.content[0].text);
+          assert.equal(await waitFor(() => typeof release === 'function'), true);
+          const mid = JSON.parse((await callTool(base, sessionId, 'pikvm_msd_job', { jobId })).content[0].text);
+          assert.equal(mid.state, 'hashing');
+          const other = await openSession(base);
+          const refused = await callTool(base, other, 'pikvm_msd_upload', {
+            file: 'disk.img',
+            confirmImage: 'disk.img',
+            sha256: 'a'.repeat(64),
+          });
+          assert.equal(refused.isError, true);
+          assert.match(refused.content[0].text, /upload already running/);
+          assert.deepEqual(mock.calls, []);
+          release();
+          release = undefined;
+          const failed = await pollJob(base, sessionId, jobId);
+          assert.equal(failed.state, 'failed');
+          assert.match(failed.error.message, /sha256 mismatch/);
+          const next = await callTool(base, sessionId, 'pikvm_msd_upload', {
+            file: 'disk.img',
+            confirmImage: 'disk.img',
+            sha256: 'b'.repeat(64),
+          });
+          assert.equal(next.isError, undefined, next.content[0].text);
+          const nextId = JSON.parse(next.content[0].text).jobId;
+          assert.equal(await waitFor(() => typeof release === 'function'), true);
+          release();
+          release = undefined;
+          const nextFailed = await pollJob(base, sessionId, nextId);
+          assert.equal(nextFailed.state, 'failed');
+        });
+      } finally {
+        if (release) release();
+      }
     });
   });
 
@@ -2054,8 +2116,11 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
       await run({ images: [], catalogIncompletePolls: 2 }, 2000, async ({ mock, base, sessionId }) => {
         const started = await startTransfer(kind, base, sessionId);
         const { jobId } = JSON.parse(started.content[0].text);
+        const began = Date.now();
         const done = await pollJob(base, sessionId, jobId, 8000);
+        const elapsed = Date.now() - began;
         assert.equal(done.state, 'done', kind);
+        assert.ok(elapsed >= 700, `${kind} did not keep polling an incomplete row (${elapsed} ms)`);
         assert.equal(transferPosts(mock, kind).length, 1, kind);
         assert.equal(mock.state.images['disk.img'].complete, true);
       });
@@ -2123,6 +2188,101 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
         assert.equal(failed.state, 'failed', kind);
         assert.equal(failed.error.type, 'PIKVM_MSD_CANCELLED', kind);
         assert.equal(transferPosts(mock, kind).length, 1, kind);
+      });
+    });
+
+    await t.test(`${kind}: a complete wrong size fails before the budget ends`, async (inner) => {
+      watchCrashes(inner);
+      const budget = 3000;
+      const run = kind === 'upload' ? withUpload : withFetch;
+      await run({ images: [], catalogSize: 9 }, budget, async ({ mock, base, sessionId }) => {
+        const started = await startTransfer(kind, base, sessionId);
+        const { jobId } = JSON.parse(started.content[0].text);
+        const began = Date.now();
+        const failed = await pollJob(base, sessionId, jobId, 8000);
+        const elapsed = Date.now() - began;
+        assert.equal(failed.state, 'failed', kind);
+        assert.equal(failed.error.type, 'PIKVM_MSD_SIZE_MISMATCH', kind);
+        assert.match(failed.error.message, /size is 9, expected 4/, kind);
+        assert.ok(elapsed < 1000, `${kind} burned the budget (${elapsed} ms)`);
+        assert.equal(transferPosts(mock, kind).length, 1, kind);
+        assert.equal(mock.state.images['disk.img'], undefined, kind);
+        assert.equal(failed.removed, true, kind);
+      });
+    });
+
+    await t.test(`${kind}: an image that never appears is confirmed without another full budget`, async (inner) => {
+      watchCrashes(inner);
+      const budget = 2000;
+      const run = kind === 'upload' ? withUpload : withFetch;
+      await run({ images: [], catalogHidePolls: 1000 }, budget, async ({ mock, base, sessionId }) => {
+        const started = await startTransfer(kind, base, sessionId);
+        const { jobId } = JSON.parse(started.content[0].text);
+        const began = Date.now();
+        const failed = await pollJob(base, sessionId, jobId, 8000);
+        const elapsed = Date.now() - began;
+        assert.equal(failed.state, 'failed', kind);
+        assert.equal(failed.error.type, 'PIKVM_MSD_CATALOG_TIMEOUT', kind);
+        assert.equal(failed.removed, true, kind);
+        assert.equal(transferPosts(mock, kind).length, 1, kind);
+        assert.ok(elapsed >= budget, `${kind} ended before the readiness budget (${elapsed} ms)`);
+        assert.ok(
+          elapsed < budget + MSD_UNSEEN_CONFIRM_MS + 500,
+          `${kind} spent another full budget confirming absence (${elapsed} ms)`,
+        );
+      });
+    });
+
+    await t.test(`${kind}: an image that comes back after remove uses the full confirm budget`, async (inner) => {
+      watchCrashes(inner);
+      const budget = 2000;
+      const run = kind === 'upload' ? withUpload : withFetch;
+      await run({
+        images: [],
+        catalogIncompletePolls: 1000,
+        catalogReappearPolls: 3,
+      }, budget, async ({ mock, base, sessionId }) => {
+        const started = await startTransfer(kind, base, sessionId);
+        const { jobId } = JSON.parse(started.content[0].text);
+        const began = Date.now();
+        const failed = await pollJob(base, sessionId, jobId, 8000);
+        const elapsed = Date.now() - began;
+        assert.equal(failed.state, 'failed', kind);
+        assert.equal(failed.error.type, 'PIKVM_MSD_IMAGE_INCOMPLETE', kind);
+        assert.equal(failed.removed, true, failed.removeError?.message);
+        assert.equal(mock.state.images['disk.img'], undefined, kind);
+        assert.equal(transferPosts(mock, kind).length, 1, kind);
+        assert.ok(
+          elapsed > budget + MSD_UNSEEN_CONFIRM_MS,
+          `${kind} confirmed on the short budget (${elapsed} ms)`,
+        );
+        assert.ok(elapsed < budget * 2 + 1500, `${kind} ran past the confirm budget (${elapsed} ms)`);
+      });
+    });
+
+    await t.test(`${kind}: a slow catalog read stops near the readiness deadline`, async (inner) => {
+      watchCrashes(inner);
+      const budget = 500;
+      const run = kind === 'upload' ? withUpload : withFetch;
+      await run({
+        images: [],
+        catalogHidePolls: 50,
+        msdGetDelayMs: 4000,
+        msdGetDelayCount: 1,
+      }, budget, async ({ mock, base, sessionId }) => {
+        const started = await startTransfer(kind, base, sessionId);
+        const { jobId } = JSON.parse(started.content[0].text);
+        const began = Date.now();
+        const failed = await pollJob(base, sessionId, jobId, 8000);
+        const elapsed = Date.now() - began;
+        assert.equal(failed.state, 'failed', kind);
+        assert.equal(failed.error.type, 'PIKVM_MSD_CATALOG_TIMEOUT', kind);
+        assert.equal(transferPosts(mock, kind).length, 1, kind);
+        assert.ok(elapsed >= budget + 350, `${kind} stopped early (${elapsed} ms)`);
+        assert.ok(
+          elapsed < budget + MSD_UNSEEN_CONFIRM_MS + 600,
+          `${kind} waited out the slow read (${elapsed} ms)`,
+        );
       });
     });
   }

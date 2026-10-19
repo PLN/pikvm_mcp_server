@@ -10,6 +10,7 @@
 // Modified 2026-10 by PLN: hold a snapshot so two captures can overlap (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: hold one streamer read so a capture can finish first (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: delay a fresh image in the MSD catalog (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: a slow catalog read and a name that returns after remove (GPL-3.0; see NOTICE).
 
 /**
  * Minimal KVMD REST mock implementing exactly the routes src/pikvm/client.ts
@@ -45,6 +46,10 @@
  * GET /api/msd responses. `catalogIncompletePolls` shows it with
  * complete false for that many responses. `catalogSize` reports that
  * size instead of the stored one. Seeded images are not affected.
+ * `catalogReappearPolls` puts a removed fresh image back for that many
+ * later GET /api/msd responses. `msdGetDelayMs` and `msdGetDelayCount`
+ * pause that many GET /api/msd responses after a fresh image exists.
+ * The pause ends early when the client aborts.
  * `drive` sets the initial
  * selection (`image` is a seeded name or null, plus connected/cdrom/rw).
  * A write that is aborted or shorter than Content-Length keeps a
@@ -275,6 +280,12 @@ export async function startKvmdMock(options = {}) {
     ? options.catalogIncompletePolls
     : 0;
   const catalogSize = Number.isInteger(options.catalogSize) ? options.catalogSize : null;
+  let catalogReappearLeft = Number.isInteger(options.catalogReappearPolls)
+    ? options.catalogReappearPolls
+    : 0;
+  let reappear = null;
+  let msdGetDelayLeft = Number.isInteger(options.msdGetDelayCount) ? options.msdGetDelayCount : 0;
+  const msdGetDelayMs = Number.isInteger(options.msdGetDelayMs) ? options.msdGetDelayMs : 0;
   let holdsLeft = Number.isInteger(options.holdMutations) ? options.holdMutations : 0;
   async function maybeHoldMutation() {
     if (holdsLeft <= 0) return;
@@ -381,6 +392,17 @@ export async function startKvmdMock(options = {}) {
 
   async function handleMsd(req, res, u) {
     if (req.method === 'GET' && u.pathname === '/api/msd') {
+      if (reappear && catalogReappearLeft > 0) {
+        catalogReappearLeft -= 1;
+        state.images[reappear.name] = reappear.meta;
+        bytes.set(reappear.name, reappear.body);
+        reappear = null;
+      }
+      if (catalogFresh.size > 0 && msdGetDelayLeft > 0 && msdGetDelayMs > 0) {
+        msdGetDelayLeft -= 1;
+        await waitOrClose(req, msdGetDelayMs);
+        if (req.destroyed || res.writableEnded || res.destroyed) return true;
+      }
       kvmdOk(res, msdResult());
       return true;
     }
@@ -470,8 +492,13 @@ export async function startKvmdMock(options = {}) {
         kvmdFail(res, 400, 'MsdUnknownImageError', MSD_UNKNOWN);
         return true;
       }
+      const meta = state.images[name];
+      const body = bytes.get(name);
       delete state.images[name];
       bytes.delete(name);
+      if (catalogFresh.has(name) && catalogReappearLeft > 0 && meta && body) {
+        reappear = { name, meta, body };
+      }
       if (state.drive.image && state.drive.image.name === name) state.drive.image = null;
       kvmdOk(res);
       return true;

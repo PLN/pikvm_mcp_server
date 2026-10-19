@@ -5,6 +5,7 @@
 <!-- Modified 2026-10 by PLN: empty secret vars are unset (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: TLS mode check (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: registry hwTest gate (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: Node >=22.9.0, ten skipped tests, Tailscale as an example (GPL-3.0; see NOTICE) -->
 
 # Hardware suite
 
@@ -14,9 +15,8 @@ With no registry, the only accepted name is `default`, the legacy `PIKVM_HOST` /
 
 ## Prerequisites
 
-- Node.js 22 or newer (`node --version`).
-- Tailscale is up on this machine (`tailscale status`).
-- The PiKVM is on the same tailnet and answers HTTPS on its MagicDNS name.
+- Node.js >=22.9.0 (`node --version`).
+- A PiKVM that answers HTTPS. Tailscale is an example topology: MagicDNS on the same tailnet is one way to reach the device, and it is not a hard requirement.
 
 Build once if you have not already:
 
@@ -72,7 +72,7 @@ The read-only level does not need the HTTP arm flags. The MSD and HID levels do,
 
 | Level | Variables | What it touches |
 | --- | --- | --- |
-| Read-only (default) | `PIKVM_HW_TEST_DEVICE=default` plus the host and password | Auth check, `GET /api/info?fields=system,hw` (kvmd version and model are logged), one raw `GET /api/msd` (logged with the password redacted) and `pikvm_msd_status`, the TLS mode (`hw: tls mode=verify|pin|insecure`; in pin mode a successful call logs `hw: tls pin=match`), one bad-password `GET` (a single 401, `PIKVM_AUTH_FAILED`, not retried), and a closed-port probe of the same host. The probe uses port 65000 unless `PIKVM_HW_TEST_UNREACHABLE_PORT` names another port. Set that variable to `0` or `skip` to skip the probe. Ports on the Fetch bad-port list (1, 7, 9, and the rest of that list) are rejected before a connection, with an error that names the variable. A connection refused is `PIKVM_UNREACHABLE`. A filtered port (the request times out) is skipped rather than failed. |
+| Read-only (default) | `PIKVM_HW_TEST_DEVICE=default` plus the host and password | Auth check, `GET /api/info?fields=system,hw` (kvmd version and model are logged), one raw `GET /api/msd` (logged with the password redacted) and `pikvm_msd_status`, the TLS mode (`hw: tls mode=verify|pin|insecure`; in pin mode a successful call logs `hw: tls pin=match`), one bad-password `GET` (a single 401 or 403, `PIKVM_AUTH_FAILED`, not retried), and a closed-port probe of the same host. The probe uses port 65000 unless `PIKVM_HW_TEST_UNREACHABLE_PORT` names another port. Set that variable to `0` or `skip` to skip the probe. Ports on the Fetch bad-port list (1, 7, 9, and the rest of that list) are rejected before a connection, with an error that names the variable. A connection refused is `PIKVM_UNREACHABLE`. A filtered port (the request times out) is skipped rather than failed. |
 | MSD | also `PIKVM_HW_TEST_ALLOW_MSD=1` and `PIKVM_MCP_ARM_MSD=1` | Uploads a 1 MiB `mcp-hwtest-<timestamp>-<rand>.iso`, mounts it as cdrom, ejects twice (the second result is `alreadyDisconnected`), mounts it as flash read-only, ejects, and removes it. If `PIKVM_HW_TEST_FETCH_URL` is an allowlisted `https` URL, `pikvm_msd_fetch_url` downloads it under another `mcp-hwtest-*` name and then removes that name. |
 | MSD force | `PIKVM_HW_TEST_ALLOW_MSD=force` instead of `1` | Dangerous. Confirm the target host is not using the virtual drive before running force. If the virtual drive is already connected, the cycle disconnects it, runs the writes above, and remounts the previous image afterwards. A busy drive is not skipped either; the cycle may fail. |
 | HID | also `PIKVM_HW_TEST_ALLOW_HID=1` and `PIKVM_MCP_ARM_HID=1` | `pikvm_type` sends the two characters `hw` with delay 0 and again with delay 50. Delay is milliseconds. kvmd reads seconds, so 50 is sent as `0.05`. This types into whatever has focus. Leave the target on a safe screen, such as an empty text editor, and do not leave a shell prompt focused. |
@@ -155,7 +155,7 @@ The `hw: snapshot ...` line is the image to put back, with its `connected`, `cdr
 
 `npm test` expands `test/*.test.mjs` only. These files live in `test/hw/` and are named `*.hw.test.mjs`, so that glob does not see them. The workflow runs `npm ci`, `npm run typecheck`, and `npm test`. It does not run `npm run test:hw`.
 
-On Node 22.14, `node --test test/hw` from the repo root is a directory import (`"type": "module"`) and does not discover the files. Use `npm run test:hw`, which passes `test/hw/*.hw.test.mjs` and `--test-concurrency=1`. A normal test runs `node --import` of the network guard and `node --test --test-concurrency=1` with its working directory set to `test/hw` and the device variable unset. The TAP reporter does not print file names, so that test uses `test/hw-discovered-reporter.mjs`, which lists each discovered file. The test asserts that `readonly.hw.test.mjs`, `msd.hw.test.mjs`, and `hid.hw.test.mjs` were all discovered, that all 8 tests skipped, and that stdout and stderr together contain no socket or DNS marker. `node --test` copies a child file's stderr onto the runner's stdout, so the marker is not visible on stderr alone.
+On Node >=22.9.0, `node --test test/hw` from the repo root is a directory import (`"type": "module"`) and does not discover the files. Use `npm run test:hw`, which passes `test/hw/*.hw.test.mjs` and `--test-concurrency=1`. A normal test runs `node --import` of the network guard and `node --test --test-concurrency=1` with its working directory set to `test/hw` and the device variable unset. The import and the reporter are file URLs, so the same specifier loads on Windows. The TAP reporter does not print file names, so that test uses `test/hw-discovered-reporter.mjs`, which lists each discovered file. The test asserts that `readonly.hw.test.mjs`, `msd.hw.test.mjs`, and `hid.hw.test.mjs` were all discovered, that all 10 tests skipped, and that stdout and stderr together contain no socket or DNS marker. `node --test` copies a child file's stderr onto the runner's stdout, so the marker is not visible on stderr alone.
 
 ## Manual checklist
 
