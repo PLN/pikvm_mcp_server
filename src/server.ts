@@ -13,6 +13,7 @@
 // Modified 2026-10 by PLN: click frames and frameId (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: OCR stays listed until a device says disabled (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: mouse tools pass the resolved click frame (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: MSD jobs wait for the catalog (GPL-3.0; see NOTICE).
 
 /**
  * MCP server factory for PiKVM tools
@@ -802,7 +803,7 @@ const tools: Tool[] = [
   },
   {
     name: 'pikvm_msd_upload',
-    description: 'Upload a local image into PiKVM storage and return a jobId immediately after the file is confined. Hashing and the kvmd pre-check run in the job, which is hashing and then running. A sha256 mismatch fails the job and uploads nothing. A second upload while one is running is refused. file is a bare name under PIKVM_MSD_LOCAL_DIR. confirmImage must equal file. The drive is not changed. Poll pikvm_msd_job. Hidden while PIKVM_MSD_LOCAL_DIR is unset.',
+    description: 'Upload a local image into PiKVM storage and return a jobId immediately after the file is confined. Hashing and the kvmd pre-check run in the job, which is hashing, then running, then awaiting_catalog. A sha256 mismatch fails the job and uploads nothing. After kvmd accepts the bytes the job waits for that image to be complete in the catalog. The upload POST is not repeated. A second upload while one is running is refused. file is a bare name under PIKVM_MSD_LOCAL_DIR. confirmImage must equal file. The drive is not changed. Poll pikvm_msd_job. Hidden while PIKVM_MSD_LOCAL_DIR is unset.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -828,7 +829,7 @@ const tools: Tool[] = [
   },
   {
     name: 'pikvm_msd_fetch_url',
-    description: 'Download an image from an allowlisted https URL into PiKVM storage and return a jobId immediately. The URL must be https, have no userinfo, and match PIKVM_MSD_URL_ALLOWLIST. image defaults to the last path segment. confirmImage must equal the final name. DNS, the address check, the kvmd pre-check, and the download run in the job. A second transfer while one is running is refused. The drive is not changed. Poll pikvm_msd_job. Hidden while the allowlist has no https entry.',
+    description: 'Download an image from an allowlisted https URL into PiKVM storage and return a jobId immediately. The URL must be https, have no userinfo, and match PIKVM_MSD_URL_ALLOWLIST. image defaults to the last path segment. confirmImage must equal the final name. DNS, the address check, the kvmd pre-check, and the download run in the job. After write_remote accepts the bytes the job waits for that image to be complete in the catalog. The remote write is not repeated. A second transfer while one is running is refused. The drive is not changed. Poll pikvm_msd_job. Hidden while the allowlist has no https entry.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -854,7 +855,7 @@ const tools: Tool[] = [
   },
   {
     name: 'pikvm_msd_job',
-    description: 'Read an in-memory MSD upload or URL fetch job. Returns state hashing, running, done, or failed, plus bytes, total, and sha256 when known. A failed transfer that stored the wrong or incomplete bytes includes removed, except PIKVM_MSD_STATE_UNKNOWN, which skips cleanup. Finished jobs are dropped after 24 hours. Does not change the drive.',
+    description: 'Read an in-memory MSD upload or URL fetch job. Returns state hashing, running, awaiting_catalog, done, or failed, plus bytes, total, and sha256 when known. awaiting_catalog means the write was accepted and the job is waiting for that image in the catalog. A failed transfer that stored the wrong or incomplete bytes includes removed, except PIKVM_MSD_STATE_UNKNOWN, which skips cleanup. Finished jobs are dropped after 24 hours. Does not change the drive.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1417,6 +1418,7 @@ export function createMcpServer(deps: McpServerDeps): Server {
             uploadPollMs: deps.msd?.uploadPollMs,
             jobLimit: deps.msd?.jobLimit,
             jobTtlMs: deps.msd?.jobTtlMs,
+            readyTimeoutMs: deps.msd?.readyTimeoutMs,
           });
           return jsonText(outcome);
         }
@@ -1442,6 +1444,7 @@ export function createMcpServer(deps: McpServerDeps): Server {
             beforeFetch: deps.msd?.beforeFetch,
             jobLimit: deps.msd?.jobLimit,
             jobTtlMs: deps.msd?.jobTtlMs,
+            readyTimeoutMs: deps.msd?.readyTimeoutMs,
           });
           return jsonText(outcome);
         }

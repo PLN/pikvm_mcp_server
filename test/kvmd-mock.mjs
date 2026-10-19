@@ -9,6 +9,7 @@
 // Modified 2026-10 by PLN: preview sizing and OCR routes (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: hold a snapshot so two captures can overlap (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: hold one streamer read so a capture can finish first (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: delay a fresh image in the MSD catalog (GPL-3.0; see NOTICE).
 
 /**
  * Minimal KVMD REST mock implementing exactly the routes src/pikvm/client.ts
@@ -40,6 +41,10 @@
  * (`'name.img'` or `{name,size,complete}`). `holdSnapshots` is how many
  * image snapshots wait until `releaseSnapshots()`. `holdNextStreamer()`
  * makes the next GET /api/streamer wait until `releaseStreamer()`.
+ * `catalogHidePolls` omits a freshly written image from that many
+ * GET /api/msd responses. `catalogIncompletePolls` shows it with
+ * complete false for that many responses. `catalogSize` reports that
+ * size instead of the stored one. Seeded images are not affected.
  * `drive` sets the initial
  * selection (`image` is a seeded name or null, plus connected/cdrom/rw).
  * A write that is aborted or shorter than Content-Length keeps a
@@ -262,8 +267,14 @@ export async function startKvmdMock(options = {}) {
   const heldMutations = [];
   const heldSnapshots = [];
   const heldStreamer = [];
+  const catalogFresh = new Set();
   let streamerHolds = 0;
   let imageSnapshots = 0;
+  let catalogHideLeft = Number.isInteger(options.catalogHidePolls) ? options.catalogHidePolls : 0;
+  let catalogIncompleteLeft = Number.isInteger(options.catalogIncompletePolls)
+    ? options.catalogIncompletePolls
+    : 0;
+  const catalogSize = Number.isInteger(options.catalogSize) ? options.catalogSize : null;
   let holdsLeft = Number.isInteger(options.holdMutations) ? options.holdMutations : 0;
   async function maybeHoldMutation() {
     if (holdsLeft <= 0) return;
@@ -295,13 +306,24 @@ export async function startKvmdMock(options = {}) {
   function storageImages() {
     const images = {};
     for (const [name, meta] of Object.entries(state.images)) {
+      if (catalogFresh.has(name) && catalogHideLeft > 0) {
+        catalogHideLeft -= 1;
+        continue;
+      }
+      let complete = meta.complete;
+      let size = meta.size;
+      if (catalogFresh.has(name) && catalogIncompleteLeft > 0) {
+        catalogIncompleteLeft -= 1;
+        complete = false;
+      }
+      if (catalogFresh.has(name) && catalogSize !== null) size = catalogSize;
       images[name] = {
-        size: meta.size,
+        size,
         mod_ts: meta.mod_ts,
         writable: meta.writable,
         cdromable: meta.cdromable,
         removable: meta.removable,
-        complete: meta.complete,
+        complete,
         in_storage: true,
       };
     }
@@ -541,6 +563,7 @@ export async function startKvmdMock(options = {}) {
         const keepComplete = () => {
           state.images[image] = imageMeta(image, buf.length, true);
           bytes.set(image, buf);
+          catalogFresh.add(image);
           state.parts[''].free = Math.max(0, state.parts[''].free - buf.length);
         };
         if (options.failMidWrite) {
@@ -609,15 +632,29 @@ export async function startKvmdMock(options = {}) {
       if (remote.storeIncomplete) {
         state.images[name] = imageMeta(name, 4, false);
         bytes.set(name, Buffer.from('part'));
+        catalogFresh.add(name);
       }
+      let remoteFailed = false;
+      let remoteSize = 4;
       for (const line of lines) {
         if (remote.gapMs) await waitOrClose(req, remote.gapMs);
         if (req.destroyed || res.writableEnded) return true;
-        res.write(String(line).endsWith('\n') ? String(line) : `${line}\r\n`);
+        const text = String(line);
+        try {
+          const parsed = JSON.parse(text);
+          if (parsed && parsed.ok === false) remoteFailed = true;
+          const info = parsed?.result?.image;
+          if (info && Number.isFinite(info.size) && info.size > 0) remoteSize = info.size;
+          if (info && Number.isFinite(info.written) && info.written > 0) remoteSize = info.written;
+        } catch {
+          // A non-JSON progress line is still forwarded.
+        }
+        res.write(text.endsWith('\n') ? text : `${text}\r\n`);
       }
-      if (!remote.lines) {
-        state.images[name] = imageMeta(name, 4, true);
-        bytes.set(name, Buffer.from('remote'));
+      if (!remoteFailed) {
+        state.images[name] = imageMeta(name, remoteSize, true);
+        bytes.set(name, Buffer.alloc(remoteSize, 0x72));
+        catalogFresh.add(name);
       }
       res.end();
       return true;

@@ -1,6 +1,7 @@
 // Modified 2026-10 by PLN: clamp PIKVM_REQUEST_TIMEOUT_MS (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: MSD upload job and idle deadlines (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: cap MSD job at 7 days and idle at 1 hour (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: MSD catalog readiness budget (GPL-3.0; see NOTICE).
 
 /** Default abort deadline for one ordinary kvmd call. */
 export const REQUEST_TIMEOUT_DEFAULT_MS = 5000;
@@ -49,6 +50,15 @@ export const MSD_JOB_TIMEOUT_MAX_MS = 7 * 24 * 60 * 60 * 1000;
 
 /** One hour. Same timer limit as the job ceiling, on a shorter cap. */
 export const MSD_IDLE_TIMEOUT_MAX_MS = 60 * 60 * 1000;
+
+/**
+ * How long a successful upload or write_remote waits for that image
+ * to show up complete in the catalog. Thirty seconds.
+ */
+export const MSD_READY_TIMEOUT_DEFAULT_MS = 30 * 1000;
+
+/** Ten minutes. A longer catalog wait is clamped to this. */
+export const MSD_READY_TIMEOUT_MAX_MS = 10 * 60 * 1000;
 
 /**
  * Parse an MSD deadline. Only a string of digits is accepted.

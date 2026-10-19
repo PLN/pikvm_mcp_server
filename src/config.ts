@@ -4,6 +4,7 @@
 // Modified 2026-10 by PLN: PIKVM_MCP_ARM_MSD (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: PIKVM_MSD_LOCAL_DIR and PIKVM_MSD_MAX_BYTES (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: PIKVM_MSD_URL_ALLOWLIST and URL private opt-in (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: PIKVM_MSD_READY_TIMEOUT_MS (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: write_remote connect timeout (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: warn on a junk connect timeout (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: password and bearer secret files (GPL-3.0; see NOTICE).
@@ -31,6 +32,8 @@ import {
   MSD_IDLE_TIMEOUT_MAX_MS,
   MSD_JOB_TIMEOUT_DEFAULT_MS,
   MSD_JOB_TIMEOUT_MAX_MS,
+  MSD_READY_TIMEOUT_DEFAULT_MS,
+  MSD_READY_TIMEOUT_MAX_MS,
   parseMsdTimeoutMs,
   parseRequestTimeoutMs,
 } from './request-timeout.js';
@@ -125,6 +128,12 @@ export interface MsdConfig {
   allowPrivate: boolean;
   /** kvmd write_remote connect timeout in seconds. Not the job wall clock. */
   connectTimeoutSec: number;
+  /**
+   * How long a successful write waits for that exact image to be
+   * complete in the catalog. From PIKVM_MSD_READY_TIMEOUT_MS.
+   * Default 30 seconds. The upload POST is not repeated.
+   */
+  readyTimeoutMs: number;
 }
 
 /** aiohttp sock_connect budget sent as write_remote timeout=. Default 30s. */
@@ -304,6 +313,11 @@ function readRuntimeConfig(): RuntimeConfig {
       urlAllow: parseUrlAllowlist(process.env.PIKVM_MSD_URL_ALLOWLIST),
       allowPrivate: process.env.PIKVM_MSD_URL_ALLOW_PRIVATE === '1',
       connectTimeoutSec: parseUrlConnectTimeoutSec(process.env.PIKVM_MSD_URL_CONNECT_TIMEOUT_SEC),
+      readyTimeoutMs: parseMsdTimeoutMs(
+        process.env.PIKVM_MSD_READY_TIMEOUT_MS,
+        MSD_READY_TIMEOUT_DEFAULT_MS,
+        MSD_READY_TIMEOUT_MAX_MS,
+      ),
     },
     http,
   };
