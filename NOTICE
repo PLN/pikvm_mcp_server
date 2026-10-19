@@ -34,6 +34,8 @@ Modified 2026-10 by PLN: click frames stay on the full preview (GPL-3.0; see bel
 Modified 2026-10 by PLN: OCR is not retried after it is sent (GPL-3.0; see below).
 Modified 2026-10 by PLN: redaction stays bounded, and sharp refuses an oversized image (GPL-3.0; see below).
 Modified 2026-10 by PLN: a mouse echo is the frame that move applied (GPL-3.0; see below).
+Modified 2026-10 by PLN: an MSD write waits until the catalog shows that image (GPL-3.0; see below).
+Modified 2026-10 by PLN: the HID-send capture test names the mapping it keeps (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -713,4 +715,29 @@ No code from another pikvm_mcp_server fork was added for these methods.
   the move and the result echo. A full capture that finishes while the
   move is waiting on the streamer does not change either one. The HID
   values are the ones mapped from the resolved frame.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  PIKVM_MSD_READY_TIMEOUT_MS defaults to 30 seconds and clamps at 10
+  minutes. After kvmd accepts an upload or write_remote, the job state
+  is awaiting_catalog until that exact image is present, complete, and
+  the expected size. Polls wait 250 ms, then up to 2 seconds. The write
+  is not sent again. Absence or a row that is not yet sized is
+  PIKVM_MSD_CATALOG_TIMEOUT: the upload was accepted and the image may
+  still appear. A complete:false row is PIKVM_MSD_IMAGE_INCOMPLETE. A
+  different size is PIKVM_MSD_SIZE_MISMATCH. Cancelling the wait is
+  PIKVM_MSD_CANCELLED. The per-device MSD lock is held until that wait
+  ends. Cleanup of an image this run wrote does not treat an unknown
+  name as gone. It checks the catalog for the same budget, removes the
+  name if it appears, and reports removed only after absence. Otherwise
+  the result is PIKVM_MSD_REMOVAL_UNCONFIRMED. The hardware cycle
+  requires every name that run created to be absent at the end, and
+  still leaves unrelated mcp-hwtest images in place.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  The capture test that holds GET /api/streamer during a click states
+  what it checks: a full capture during the HID send leaves the mapping
+  and the echo alone. That hold is the resolution refresh inside the
+  move, after the coordinates were mapped.
   No code from another pikvm_mcp_server fork was copied.

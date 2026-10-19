@@ -1,5 +1,6 @@
 // Modified 2026-10 by PLN: opt-in MSD hardware cycle (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: MSD also needs the device armMsd (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: cleanup confirms created names on this device (GPL-3.0; see NOTICE).
 
 /**
  * MSD write cycle. Skipped unless PIKVM_HW_TEST_DEVICE is set, and
@@ -50,6 +51,8 @@ describe('MSD hardware cycle', { concurrency: false }, () => {
         fetchImageName,
         allowlist: session.config.msd.urlAllow,
         client: session.pikvm,
+        device: session.device,
+        catalogTimeoutMs: session.config.msd.readyTimeoutMs,
       });
       if (outcome.skipped) {
         t.skip(outcome.reason);

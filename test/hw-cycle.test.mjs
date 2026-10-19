@@ -1,6 +1,7 @@
 // Modified 2026-10 by PLN: MSD cycle cleanup against the mock (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: 1 MiB ISO and leftover names (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: restore a leftover image this run did not create (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: catalog confirmation uses a short budget (GPL-3.0; see NOTICE).
 
 /**
  * Forced-failure dry run. The kvmd mock stands in for the device.
@@ -141,6 +142,7 @@ describe('MSD cycle dry run', { concurrency: false }, () => {
         imageName: hwTestImageName(),
         allowlist: ALLOW,
         timeoutMs: 5000,
+        catalogTimeoutMs: 250,
       });
       assert.equal(outcome.skipped, true);
       assert.match(outcome.reason, /connected/);
@@ -162,6 +164,7 @@ describe('MSD cycle dry run', { concurrency: false }, () => {
         imageName: hwTestImageName(),
         allowlist: ALLOW,
         timeoutMs: 5000,
+        catalogTimeoutMs: 250,
       });
       assert.equal(outcome.skipped, true);
       assert.match(outcome.reason, /busy/);
@@ -184,6 +187,7 @@ describe('MSD cycle dry run', { concurrency: false }, () => {
           allowlist: ALLOW,
           failAfter: 'mount-cdrom',
           timeoutMs: 5000,
+        catalogTimeoutMs: 250,
           client: pikvm,
           log: (line) => logs.push(line),
         }),
@@ -218,6 +222,7 @@ describe('MSD cycle dry run', { concurrency: false }, () => {
           allowlist: ALLOW,
           failAfter: 'mount-cdrom',
           timeoutMs: 5000,
+        catalogTimeoutMs: 250,
           client: pikvm,
           log: (line) => logs.push(line),
         }),
@@ -249,6 +254,7 @@ describe('MSD cycle dry run', { concurrency: false }, () => {
         fetchImageName,
         allowlist: ALLOW,
         timeoutMs: 5000,
+        catalogTimeoutMs: 250,
         client: pikvm,
       });
       assert.equal(outcome.skipped, false);
@@ -281,6 +287,7 @@ describe('MSD cycle dry run', { concurrency: false }, () => {
           allowlist: ALLOW,
           failAfter: 'mount-cdrom',
           timeoutMs: 5000,
+        catalogTimeoutMs: 250,
           client: pikvm,
         }),
         /forced failure/,
@@ -303,6 +310,7 @@ describe('MSD cycle dry run', { concurrency: false }, () => {
           fetchImageName: hwTestImageName('url'),
           allowlist: ALLOW,
           timeoutMs: 5000,
+        catalogTimeoutMs: 250,
         }),
         /https/,
       );

@@ -2,16 +2,21 @@
 // Modified 2026-10 by PLN: cleanup deletes only this run's image names (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: restore a leftover image this run did not create (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: cleanup logs go through redactUrl (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: cleanup confirms each created name is absent (GPL-3.0; see NOTICE).
 
 /**
  * Upload, mount, eject, and remove one mcp-hwtest image through the tools.
  * The finally block disconnects a drive this cycle connected, removes
  * only the image names this run created, and restores the snapshot.
+ * Each created name must be absent at the end. An unknown-image
+ * answer is not enough: the catalog is checked for the readiness
+ * budget, and a name that appears in that window is removed again.
  * A selected image this run did not create is restored, including a
  * leftover mcp-hwtest-* name. Any other mcp-hwtest-* name is logged
  * and left in place. A forced failure still runs the finally block.
  */
 
+import { confirmImageAbsent } from '../../dist/msd.js';
 import { inspectFetchUrl, redactUrl } from '../../dist/url-policy.js';
 import { isHwTestImageName } from './media.mjs';
 
@@ -59,7 +64,7 @@ async function pollJob(call, jobId, timeoutMs) {
   }
 }
 
-async function cleanup(call, snap, created, client, log) {
+async function cleanup(call, snap, created, client, device, catalogTimeoutMs, log) {
   const errors = [];
   const note = (err) => {
     errors.push(err instanceof Error ? err : new Error(String(err)));
@@ -84,12 +89,19 @@ async function cleanup(call, snap, created, client, log) {
   } catch (err) {
     note(err);
   }
-  const names = Object.keys(status?.images ?? {});
-  for (const name of names) {
-    if (!created.has(name)) continue;
+  for (const name of created) {
+    if (!client) {
+      note(new Error(`cleanup has no client to confirm ${name} is absent`));
+      continue;
+    }
     try {
-      await callJson(call, 'pikvm_msd_remove', { image: name, confirmImage: name });
-      log(`hw: cleanup removed ${name}`);
+      const outcome = await confirmImageAbsent(client, device, name, catalogTimeoutMs);
+      if (!outcome.removed) {
+        const why = outcome.removeError?.message ?? `removal of ${name} was not confirmed`;
+        note(new Error(why));
+      } else {
+        log(`hw: cleanup confirmed ${name} is absent`);
+      }
     } catch (err) {
       note(err);
     }
@@ -129,6 +141,11 @@ async function cleanup(call, snap, created, client, log) {
     finalStatus = await callJson(call, 'pikvm_msd_status', {});
   } catch (err) {
     note(err);
+  }
+  for (const name of created) {
+    if (Object.hasOwn(finalStatus?.images ?? {}, name)) {
+      note(new Error(`image ${JSON.stringify(name)} is still in the catalog`));
+    }
   }
   const leftovers = Object.keys(finalStatus?.images ?? {}).filter(
     (name) => isHwTestImageName(name) && !created.has(name),
@@ -233,7 +250,15 @@ export async function runMsdWriteCycle(call, options) {
   } catch (err) {
     failure = err instanceof Error ? err : new Error(String(err));
   } finally {
-    cleaned = await cleanup(call, snap, created, options.client, log);
+    cleaned = await cleanup(
+      call,
+      snap,
+      created,
+      options.client,
+      options.device ?? 'default',
+      options.catalogTimeoutMs ?? 30000,
+      log,
+    );
   }
   if (cleaned.errors.length > 0) {
     const summary = cleaned.errors.map((err) => redactUrl(err.message)).join('; ');
