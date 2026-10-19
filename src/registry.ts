@@ -2,6 +2,7 @@
 // Modified 2026-10 by PLN: reject a duplicate device key and a shared origin (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: http and https on one host are the same device (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: per-device screenshot preview defaults (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: per-device OCR narrowing (GPL-3.0; see NOTICE).
 // Host normalisation follows the idea of dtrukr/pikvm_mcp_server
 // normalizeHost at 097b529 (GPL-3.0, a fork of
 // KultivatorConsulting/pikvm_mcp_server). This file is written fresh.
@@ -22,6 +23,7 @@ import {
   parseScreenshotOverride,
   type ScreenshotSettings,
 } from './screenshot.js';
+import { parseDeviceOcr, type DeviceOcrOverride } from './ocr.js';
 
 export const REGISTRY_MAX_BYTES = SECRET_MAX_BYTES;
 
@@ -40,6 +42,7 @@ const DEVICE_KEYS = [
   'msdLocalDir',
   'hwTest',
   'screenshot',
+  'ocr',
 ] as const;
 
 export interface RegistryDevice {
@@ -54,6 +57,8 @@ export interface RegistryDevice {
   hwTest: boolean;
   /** Environment defaults with this device's screenshot fields applied. */
   screenshot: ScreenshotSettings;
+  /** Narrows process OCR. Absent means the process engine, languages, and confidence. */
+  ocr?: DeviceOcrOverride;
 }
 
 export interface DeviceRegistry {
@@ -250,6 +255,7 @@ function parseDevice(name: string, raw: unknown, env: NodeJS.ProcessEnv, require
   }
   const hwTest = optionalBoolean(name, 'hwTest', raw.hwTest) === true;
   const screenshot = mergeScreenshot(parseScreenshotEnv(env), parseScreenshotOverride(name, raw.screenshot));
+  const ocr = parseDeviceOcr(name, raw.ocr);
   return {
     host,
     username: raw.username,
@@ -260,6 +266,7 @@ function parseDevice(name: string, raw: unknown, env: NodeJS.ProcessEnv, require
     msdLocalDir,
     hwTest,
     screenshot,
+    ocr,
   };
 }
 

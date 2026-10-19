@@ -3,6 +3,7 @@
 // Modified 2026-10 by PLN: TLS mode check is skipped with the suite (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: screenshot and OCR checks are skipped with the suite (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: ESM specifiers are file URLs (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: host OCR hardware checks are skipped with the suite (GPL-3.0; see NOTICE).
 
 /**
  * The hardware files must not run during npm test, and with
@@ -107,9 +108,9 @@ describe('hardware suite process', () => {
     assert.equal(summaryCount(stdout, 'fail'), 0);
     assert.equal(summaryCount(stdout, 'cancelled'), 0);
     assert.equal(summaryCount(stdout, 'pass'), 0);
-    assert.equal(summaryCount(stdout, 'tests'), 10);
-    assert.equal(summaryCount(stdout, 'skipped'), 10);
-    for (const name of ['readonly.hw.test.mjs', 'msd.hw.test.mjs', 'hid.hw.test.mjs']) {
+    assert.equal(summaryCount(stdout, 'tests'), 12);
+    assert.equal(summaryCount(stdout, 'skipped'), 12);
+    for (const name of ['readonly.hw.test.mjs', 'msd.hw.test.mjs', 'hid.hw.test.mjs', 'ocr.hw.test.mjs']) {
       assert.match(stdout, new RegExp(name));
     }
     assert.match(stdout, /PIKVM_HW_TEST_DEVICE is unset/);

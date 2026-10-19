@@ -9,6 +9,7 @@
 // Modified 2026-10 by PLN: fatal errors go through redactUrl (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: probe OCR at startup (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: OCR probes start after listen (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: probe host tesseract before listen (GPL-3.0; see NOTICE).
 /**
  * PiKVM MCP Server
  *
@@ -25,6 +26,7 @@ import { PiKVMClient } from './pikvm/client.js';
 import { loadConfig, type Config } from './config.js';
 import { BusyLock } from './pikvm/lock.js';
 import { buildFleet, startOcrProbes } from './devices.js';
+import { ocrUsesKvmdProbe, resolveOcr } from './ocr.js';
 import { createMcpServer, type McpServerDeps } from './server.js';
 import { startHttpServer } from './http.js';
 import { pinCommand } from './pin.js';
@@ -65,6 +67,9 @@ async function listen(config: Config, deps: McpServerDeps): Promise<void> {
 async function main() {
   // Load configuration (deferred to here for proper error handling)
   const config = loadConfig();
+  // ENGINE=host fails here when the binary is missing. Unset with no
+  // binary is off. kvmd is not selected as a fallback.
+  const ocr = await resolveOcr(config.ocr);
   if (config.registry) {
     const ceilingHid = config.http ? config.http.armHid : true;
     const ceilingMsd = config.http ? config.http.armMsd : true;
@@ -88,8 +93,9 @@ async function main() {
       msdArmGateEnforced: config.http ? !config.http.armMsd : false,
       msd: config.msd,
       screenshot: config.screenshot,
+      ocr,
     });
-    startOcrProbes(fleet.devices.values());
+    if (ocrUsesKvmdProbe(ocr, fleet.devices.values())) startOcrProbes(fleet.devices.values());
     return;
   }
 
@@ -113,8 +119,9 @@ async function main() {
     msdArmGateEnforced,
     msd: config.msd,
     screenshot: config.screenshot,
+    ocr,
   });
-  startOcrProbes([{ name: 'default', client: pikvm }]);
+  if (ocrUsesKvmdProbe(ocr, [])) startOcrProbes([{ name: 'default', client: pikvm }]);
 }
 
 const started = process.argv[2] === 'pin'
