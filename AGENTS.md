@@ -3,6 +3,7 @@
 <!-- Modified 2026-10 by PLN: pikvm_type delay is milliseconds (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: opt-in hardware suite (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: tool count follows OCR, arm flags, and the registry (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: host OCR is listed when tesseract was found (GPL-3.0; see NOTICE) -->
 
 # AGENTS.md - PiKVM MCP Server
 
@@ -80,7 +81,7 @@ The server is configured via environment variables or a config file:
 1. **`pikvm_screenshot`** - Capture current screen as a JPEG preview (default 960×600, quality 70). Optional `region` is cropped locally. The default click frame is the last full preview, in request order. A crop does not change it.
 2. **`pikvm_get_resolution`** - Get current screen resolution (useful for mouse coordinates)
 
-`pikvm_read_text` stays listed while any device is OCR-enabled or not yet probed. A disabled device returns `PIKVM_OCR_UNAVAILABLE`. It is slow on small boards.
+`pikvm_read_text` returns one JSON text block, not plain text. With `PIKVM_OCR_ENGINE` unset, it is listed when the startup probe finds the system `tesseract` binary, and it is hidden when that probe does not. `kvmd` is listed while any device is OCR-enabled or not yet probed, and only when kvmd is the selected engine. A disabled kvmd device returns `PIKVM_OCR_UNAVAILABLE`. Host recognition is local. kvmd recognition is slow on small boards.
 
 ### Keyboard
 3. **`pikvm_type`** - Type text (handles special chars correctly via keymap)
@@ -102,7 +103,7 @@ The server is configured via environment variables or a config file:
 
 The server exposes 13 skills as both MCP prompts (`prompts/list` / `prompts/get`) and read-only `skill_*` tools (`tools/list` / `tools/call`). The skill tools are auto-generated from prompt definitions for marketplace visibility (e.g. LobeHub indexes tools, not prompts).
 
-The tool count is configuration-dependent. OCR visibility keeps `pikvm_read_text` listed while any device is enabled or not yet probed, and omits it once every device has reported disabled. Arm flags (`PIKVM_MCP_ARM_HID`, `PIKVM_MCP_ARM_MSD`, and the per-device `armHid` / `armMsd` flags) decide which listed HID and MSD calls run. A registry decides which device a call uses. A local image directory lists `pikvm_msd_upload`, and a URL allowlist lists `pikvm_msd_fetch_url`.
+The tool count is configuration-dependent. Host OCR lists `pikvm_read_text` when the tesseract probe succeeded. kvmd OCR lists it while any device is enabled or not yet probed, and omits it once every device has reported disabled. `PIKVM_OCR_ENGINE=off`, or an unset engine with no tesseract binary, omits it. Arm flags (`PIKVM_MCP_ARM_HID`, `PIKVM_MCP_ARM_MSD`, and the per-device `armHid` / `armMsd` flags) decide which listed HID and MSD calls run. A registry decides which device a call uses. A local image directory lists `pikvm_msd_upload`, and a URL allowlist lists `pikvm_msd_fetch_url`.
 
 ### Tool Guides
 | Prompt | Skill Tool | Covers |

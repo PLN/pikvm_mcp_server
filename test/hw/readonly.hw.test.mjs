@@ -4,6 +4,7 @@
 // Modified 2026-10 by PLN: log the TLS mode (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: screenshot region and optional OCR (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a bad password is 401 or 403 (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: kvmd OCR text is a JSON block (GPL-3.0; see NOTICE).
 
 /**
  * Read-only checks. Nothing here changes the drive.
@@ -217,6 +218,10 @@ describe('read-only hardware', { concurrency: false }, () => {
   test('OCR reads text when the device enables it', { skip }, async (t) => {
     const session = await openHardwareSession();
     try {
+      if (session.ocr.engine !== 'kvmd') {
+        t.skip('kvmd is not the effective OCR engine');
+        return;
+      }
       const state = session.pikvm.ocrState();
       if (state.status !== 'enabled') {
         t.skip('OCR is disabled on this device');
@@ -225,7 +230,10 @@ describe('read-only hardware', { concurrency: false }, () => {
       const args = state.langs.length > 0 ? { langs: state.langs[0] } : {};
       const result = await session.call('pikvm_read_text', args);
       assert.notEqual(result.isError, true, result.content?.[0]?.text);
-      assert.equal(typeof result.content?.[0]?.text, 'string');
+      const body = JSON.parse(result.content[0].text);
+      assert.equal(body.engine, 'kvmd');
+      assert.deepEqual(body.words, []);
+      assert.equal(typeof body.text, 'string');
     } finally {
       await session.close();
     }

@@ -6,6 +6,7 @@
 <!-- Modified 2026-10 by PLN: TLS mode check (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: registry hwTest gate (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: Node >=22.9.0, ten skipped tests, Tailscale as an example (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: twelve skipped tests, including host OCR timings (GPL-3.0; see NOTICE) -->
 
 # Hardware suite
 
@@ -155,7 +156,9 @@ The `hw: snapshot ...` line is the image to put back, with its `connected`, `cdr
 
 `npm test` expands `test/*.test.mjs` only. These files live in `test/hw/` and are named `*.hw.test.mjs`, so that glob does not see them. The workflow runs `npm ci`, `npm run typecheck`, and `npm test`. It does not run `npm run test:hw`.
 
-On Node >=22.9.0, `node --test test/hw` from the repo root is a directory import (`"type": "module"`) and does not discover the files. Use `npm run test:hw`, which passes `test/hw/*.hw.test.mjs` and `--test-concurrency=1`. A normal test runs `node --import` of the network guard and `node --test --test-concurrency=1` with its working directory set to `test/hw` and the device variable unset. The import and the reporter are file URLs, so the same specifier loads on Windows. The TAP reporter does not print file names, so that test uses `test/hw-discovered-reporter.mjs`, which lists each discovered file. The test asserts that `readonly.hw.test.mjs`, `msd.hw.test.mjs`, and `hid.hw.test.mjs` were all discovered, that all 10 tests skipped, and that stdout and stderr together contain no socket or DNS marker. `node --test` copies a child file's stderr onto the runner's stdout, so the marker is not visible on stderr alone.
+On Node >=22.9.0, `node --test test/hw` from the repo root is a directory import (`"type": "module"`) and does not discover the files. Use `npm run test:hw`, which passes `test/hw/*.hw.test.mjs` and `--test-concurrency=1`. A normal test runs `node --import` of the network guard and `node --test --test-concurrency=1` with its working directory set to `test/hw` and the device variable unset. The import and the reporter are file URLs, so the same specifier loads on Windows. The TAP reporter does not print file names, so that test uses `test/hw-discovered-reporter.mjs`, which lists each discovered file. The test asserts that `readonly.hw.test.mjs`, `msd.hw.test.mjs`, `hid.hw.test.mjs`, and `ocr.hw.test.mjs` were all discovered, that all 12 tests skipped, and that stdout and stderr together contain no socket or DNS marker. `node --test` copies a child file's stderr onto the runner's stdout, so the marker is not visible on stderr alone.
+
+`ocr.hw.test.mjs` is read-only. It times a bounded crop (640×100, the same kind of region as left 0, top 440, right 640, bottom 540) for the effective engine, and it times kvmd for that crop only when the device reports OCR enabled. It logs the host CPU model and core count, plus the kvmd version and the board model. Full-frame kvmd OCR is not called. On a CM4 that full frame can exceed 30 seconds, and the timeout is not retried. Host `fullFrame` runs only when `PIKVM_OCR_ALLOW_FULL_FRAME=1`. The log lines are durations and counts. They do not include the recognized text.
 
 ## Manual checklist
 

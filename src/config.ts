@@ -15,6 +15,7 @@
 // Modified 2026-10 by PLN: a logged host is an origin (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: screenshot preview defaults (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: PIKVM_OCR_TIMEOUT_MS (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: host OCR settings (GPL-3.0; see NOTICE).
 // Env read adapted from dtrukr/pikvm_mcp_server src/config.ts @ d120243 (GPL-3.0).
 
 /**
@@ -40,6 +41,7 @@ import {
 import { resolveSecret } from './secrets.js';
 import { loadDeviceRegistry, type DeviceRegistry } from './registry.js';
 import { parseOcrTimeoutMs, parseScreenshotEnv, type ScreenshotSettings } from './screenshot.js';
+import { parseOcrSettings, type OcrSettings } from './ocr.js';
 import {
   readPinnedCert,
   type DeviceTls,
@@ -187,6 +189,8 @@ export interface Config {
   msd: MsdConfig;
   /** Preview defaults from PIKVM_SCREENSHOT_MAX_WIDTH, _MAX_HEIGHT, and _QUALITY. */
   screenshot: ScreenshotSettings;
+  /** Process OCR settings. The binary is probed later, not while this is parsed. */
+  ocr: OcrSettings;
   /** Present only when PIKVM_MCP_PORT is set (HTTP mode). */
   http?: HttpConfig;
   /**
@@ -358,6 +362,7 @@ function loadLegacyConfig(): Config {
     calibration: runtime.calibration,
     msd: runtime.msd,
     screenshot: parseScreenshotEnv(),
+    ocr: parseOcrSettings(),
     http: runtime.http,
   };
 }
@@ -373,6 +378,7 @@ function loadConfigFromRegistry(registry: DeviceRegistry): Config {
     calibration: runtime.calibration,
     msd: runtime.msd,
     screenshot: parseScreenshotEnv(),
+    ocr: parseOcrSettings(),
     http: runtime.http,
     registry,
   };

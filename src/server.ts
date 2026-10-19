@@ -16,6 +16,7 @@
 // Modified 2026-10 by PLN: MSD jobs wait for the catalog (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: catalog error codes on the upload and fetch tools (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: test hook before the upload slot is released (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: host OCR returns one JSON text block (GPL-3.0; see NOTICE).
 
 /**
  * MCP server factory for PiKVM tools
@@ -43,7 +44,6 @@ import {
   OcrUnavailableError,
   UnknownFrameError,
   parseOcrBox,
-  parseOcrLangs,
   parseRegion,
   requireScreenshotInteger,
   SCREENSHOT_DIMENSION_MAX,
@@ -72,6 +72,15 @@ import {
   startMsdUpload,
 } from './msd.js';
 import { MsdUrlPolicyError, redactUrl } from './url-policy.js';
+import {
+  executeOcr,
+  OcrError,
+  ocrToolVisible,
+  offOcr,
+  parseFullFrame,
+  parseOcrEngineArg,
+  type ResolvedOcr,
+} from './ocr.js';
 
 export interface McpServerDeps {
   pikvm: PiKVMClient;
@@ -99,6 +108,11 @@ export interface McpServerDeps {
   fleet?: Fleet;
   /** Legacy preview defaults. Registry devices carry their own. */
   screenshot?: ScreenshotSettings;
+  /**
+   * Process OCR runtime. Omitted is off, so a test that does not care
+   * does not spawn tesseract. index.ts probes and passes the result.
+   */
+  ocr?: ResolvedOcr;
 }
 
 /**
@@ -294,6 +308,11 @@ export function formatToolError(error: unknown, password = ''): string {
     const details = JSON.stringify({ type: error.type, message });
     return `Error [${error.type}]: ${message}\n${details}`;
   }
+  if (error instanceof OcrError) {
+    const message = redact(error.message);
+    const details = JSON.stringify({ type: error.type, message, engine: error.engine });
+    return `Error [${error.type}]: ${message}\n${details}`;
+  }
   if (error instanceof KvmdError) {
     const message = redact(error.message);
     const endpoint = redact(error.endpoint);
@@ -484,18 +503,26 @@ const tools: Tool[] = [
   },
   {
     name: 'pikvm_read_text',
-    description: 'Read text from the PiKVM screen with kvmd OCR (GET /streamer/snapshot?ocr=1). Listed while any device is enabled or not yet probed. A disabled device returns PIKVM_OCR_UNAVAILABLE and does not fetch an image. Slow on small boards. langs must be a language that device reported. left, top, right, and bottom are an optional box in preview-frame pixels (the default click frame, or frameId). They are converted to full resolution for kvmd. Text is capped at 64 KiB.',
+    description: 'Read on-screen text. BREAKING: the result is one JSON text block, the same shape as screenshot metadata, not plain text. engine is host (the system tesseract binary) or kvmd. Unset PIKVM_OCR_ENGINE uses host when tesseract was found at startup, and is off otherwise. kvmd is never the unset default and is never a fallback after a host failure. Host is listed when the binary was found. kvmd is listed while any device is enabled or not yet probed. off is hidden. A host call needs a box unless fullFrame is true and PIKVM_OCR_ALLOW_FULL_FRAME=1. The region is refused before a snapshot when it is above the pixel cap. words[].click is the word centre in this frameId. Text is capped at 64 KiB.',
     inputSchema: {
       type: 'object',
       properties: {
+        engine: {
+          type: 'string',
+          description: 'host or kvmd. Omitted uses the process engine after a device narrowing. kvmd still requires the device probe.',
+        },
         langs: {
           type: 'string',
-          description: 'Comma-separated OCR languages, each one reported by the device. Omitted uses the kvmd default.',
+          description: 'Comma-separated languages. Host uses the process list (default eng) when omitted. kvmd uses the device default when omitted.',
         },
         left: { type: 'number', description: 'Left edge of the OCR box in preview-frame pixels.' },
         top: { type: 'number', description: 'Top edge of the OCR box in preview-frame pixels.' },
         right: { type: 'number', description: 'Right edge of the OCR box in preview-frame pixels.' },
         bottom: { type: 'number', description: 'Bottom edge of the OCR box in preview-frame pixels.' },
+        fullFrame: {
+          type: 'boolean',
+          description: 'Host only: recognize the whole source. Requires PIKVM_OCR_ALLOW_FULL_FRAME=1 and stays within about 8.3 megapixels.',
+        },
         frameId: {
           type: 'string',
           description: 'Capture whose pixels the box is in. Omitted uses the default click frame. Unknown sends no OCR request.',
@@ -921,6 +948,7 @@ for (const tool of tools) {
  * model, which requires one transport (and therefore one Server) per session.
  */
 export function createMcpServer(deps: McpServerDeps): Server {
+  const ocrRuntime = deps.ocr ?? offOcr();
   const fleet = deps.fleet ?? implicitFleet(deps);
   const server = new Server(
     {
@@ -972,13 +1000,10 @@ export function createMcpServer(deps: McpServerDeps): Server {
       if (tool.name === 'pikvm_msd_upload' && !uploadReady) return false;
       if (tool.name === 'pikvm_msd_fetch_url' && !fetchReady) return false;
       if (tool.name === 'pikvm_read_text') {
-        // Probes run after listen, so startup sees unknown. Hide the tool
-        // only once every device has reported disabled. A call still
-        // returns PIKVM_OCR_UNAVAILABLE when that device is disabled.
-        return [...fleet.devices.values()].some((device) => {
-          const status = device.client.ocrState().status;
-          return status === 'enabled' || status === 'unknown';
-        });
+        return ocrToolVisible(ocrRuntime, [...fleet.devices.values()].map((device) => ({
+          ocr: device.ocr,
+          ocrStatus: device.client.ocrState().status,
+        })));
       }
       return true;
     });
@@ -1084,14 +1109,6 @@ export function createMcpServer(deps: McpServerDeps): Server {
         }
 
         case 'pikvm_read_text': {
-          let ocr = deviceClient.ocrState();
-          if (ocr.status === 'unknown') {
-            ocr = await deviceClient.probeOcr(active.name);
-          }
-          if (ocr.status !== 'enabled') {
-            throw new OcrUnavailableError(active.name);
-          }
-          const langs = parseOcrLangs(args.langs, ocr.langs, active.name);
           const box = parseOcrBox({
             left: args.left,
             top: args.top,
@@ -1099,10 +1116,32 @@ export function createMcpServer(deps: McpServerDeps): Server {
             bottom: args.bottom,
           });
           const frameId = parseFrameId(args.frameId);
-          const text = await deviceClient.readText({ langs, box, frameId });
-          return {
-            content: [{ type: 'text', text }],
-          };
+          const described = deviceClient.describeFrame(frameId);
+          const calibration = deviceClient.getCalibration();
+          const result = await executeOcr({
+            deviceName: active.name,
+            runtime: ocrRuntime,
+            override: active.ocr,
+            engineArg: parseOcrEngineArg(args.engine),
+            langsArg: args.langs,
+            box,
+            frame: described.frame,
+            frameId: described.echo.frameId,
+            fullFrame: parseFullFrame(args.fullFrame),
+            getSource: () => deviceClient.getResolution(true),
+            calibration: calibration
+              ? { factorX: calibration.factorX, factorY: calibration.factorY }
+              : null,
+            fetchSnapshot: (timeoutMs) => deviceClient.fetchFullSnapshot(timeoutMs),
+            readKvmd: (langs) => deviceClient.readText({ langs, box, frameId }),
+            ensureKvmd: async () => {
+              let state = deviceClient.ocrState();
+              if (state.status === 'unknown') state = await deviceClient.probeOcr(active.name);
+              if (state.status !== 'enabled') throw new OcrUnavailableError(active.name);
+              return state;
+            },
+          });
+          return jsonText(result);
         }
 
         case 'pikvm_get_resolution': {

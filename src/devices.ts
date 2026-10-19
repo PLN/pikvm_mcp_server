@@ -1,6 +1,7 @@
 // Modified 2026-10 by PLN: per-device client, lock, and arm (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: per-device screenshot defaults (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: OCR probes run together (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: per-device OCR narrowing (GPL-3.0; see NOTICE).
 
 /**
  * One PiKVMClient, BusyLock, and arm state per registry device.
@@ -13,6 +14,7 @@ import { BusyLock } from './pikvm/lock.js';
 import { PiKVMClient } from './pikvm/client.js';
 import type { DeviceRegistry } from './registry.js';
 import type { ScreenshotSettings } from './screenshot.js';
+import type { DeviceOcrOverride } from './ocr.js';
 import type { TlsMode } from './tls.js';
 
 export interface FleetDevice {
@@ -27,6 +29,8 @@ export interface FleetDevice {
   hwTest: boolean;
   tlsMode: TlsMode;
   screenshot: ScreenshotSettings;
+  /** Narrows process OCR. Binary path and concurrency stay process-wide. */
+  ocr?: DeviceOcrOverride;
 }
 
 export interface Fleet {
@@ -72,6 +76,7 @@ export function buildFleet(config: Config, ceiling: FleetCeiling): Fleet {
       hwTest: device.hwTest,
       tlsMode: device.tls.mode,
       screenshot: device.screenshot,
+      ocr: device.ocr,
     });
   }
   return {

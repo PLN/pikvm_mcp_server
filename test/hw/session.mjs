@@ -5,6 +5,7 @@
 // Modified 2026-10 by PLN: hardware session uses the registry device (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: hardware logs go through redactUrl (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: probe OCR before the hardware session (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: hardware session uses the resolved OCR engine (GPL-3.0; see NOTICE).
 
 /**
  * In-process MCP HTTP session aimed at one PiKVMClient.
@@ -24,6 +25,7 @@ import { PiKVMClient, unexpectedRedirectMessage } from '../../dist/pikvm/client.
 import { redactSecrets } from '../../dist/redact.js';
 import { redactError, redactUrl } from '../../dist/url-policy.js';
 import { createMcpServer } from '../../dist/server.js';
+import { ocrUsesKvmdProbe, resolveOcr } from '../../dist/ocr.js';
 import { resolveDevice } from '../../dist/msd.js';
 import { hwDeviceRequest } from './gate.mjs';
 
@@ -70,7 +72,7 @@ async function openSession(base, token) {
   return sessionId;
 }
 
-export async function openToolSession({ pikvm, msd, armHid, armMsd, calibration, fleet, screenshot }) {
+export async function openToolSession({ pikvm, msd, armHid, armMsd, calibration, fleet, screenshot, ocr }) {
   const token = randomBytes(24).toString('hex');
   const lock = fleet ? fleet.devices.get(fleet.defaultName).lock : new BusyLock();
   const httpServer = await startHttpServer({
@@ -86,6 +88,7 @@ export async function openToolSession({ pikvm, msd, armHid, armMsd, calibration,
       msdArmGateEnforced: armMsd !== true,
       msd,
       screenshot,
+      ocr,
     }),
   });
   const address = httpServer.address();
@@ -120,6 +123,7 @@ export async function openHardwareSession(overrides = {}) {
   // Password and, when HTTP is configured, the bearer come from loadConfig's
   // resolveSecret, so PIKVM_PASSWORD_FILE and CREDENTIALS_DIRECTORY work here.
   const config = loadConfig();
+  const ocr = await resolveOcr(config.ocr);
   const ceilingHid = process.env.PIKVM_MCP_ARM_HID === '1';
   const ceilingMsd = process.env.PIKVM_MCP_ARM_MSD === '1';
   if (config.registry) {
@@ -130,8 +134,12 @@ export async function openHardwareSession(overrides = {}) {
         `PIKVM_HW_TEST_DEVICE=${JSON.stringify(requested.name)} is not in the registry`,
       );
     }
-    for (const device of fleet.devices.values()) {
-      await device.client.probeOcr(device.name);
+    if (ocrUsesKvmdProbe(ocr, fleet.devices.values())) {
+      for (const device of fleet.devices.values()) {
+        if (ocr.engine === 'kvmd' || device.ocr?.engine === 'kvmd') {
+          await device.client.probeOcr(device.name);
+        }
+      }
     }
     const spec = config.registry.devices.get(requested.name);
     const session = await openToolSession({
@@ -142,6 +150,7 @@ export async function openHardwareSession(overrides = {}) {
       armMsd: ceilingMsd,
       calibration: config.calibration,
       screenshot: config.screenshot,
+      ocr,
     });
     const deviceConfig = {
       ...config,
@@ -170,6 +179,7 @@ export async function openHardwareSession(overrides = {}) {
       device: ctx.name,
       armHid: ctx.armHid,
       armMsd: ctx.armMsd,
+      ocr,
     };
   }
   const pikvm = new PiKVMClient(config.pikvm);
@@ -179,7 +189,7 @@ export async function openHardwareSession(overrides = {}) {
       `resolveDevice returned ${JSON.stringify(resolved.name)}; only the legacy default device is supported`,
     );
   }
-  await pikvm.probeOcr(resolved.name);
+  if (ocrUsesKvmdProbe(ocr, [])) await pikvm.probeOcr(resolved.name);
   const session = await openToolSession({
     pikvm: resolved.client,
     msd: { ...config.msd, ...overrides.msd },
@@ -187,6 +197,7 @@ export async function openHardwareSession(overrides = {}) {
     armMsd: ceilingMsd,
     calibration: config.calibration,
     screenshot: config.screenshot,
+    ocr,
   });
   return {
     ...session,
@@ -195,6 +206,7 @@ export async function openHardwareSession(overrides = {}) {
     device: resolved.name,
     armHid: ceilingHid,
     armMsd: ceilingMsd,
+    ocr,
   };
 }
 

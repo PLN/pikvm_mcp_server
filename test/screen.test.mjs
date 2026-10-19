@@ -1,6 +1,7 @@
 // Modified 2026-10 by PLN: screenshot defaults, crop, metadata, and OCR (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: frame tests watch crashes, and a capture cannot change a resolved move (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: the HID-send capture test names the mapping it keeps (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: kvmd OCR results are JSON (GPL-3.0; see NOTICE).
 
 /**
  * Preview defaults, local crop, coordinate metadata, and optional OCR.
@@ -19,6 +20,7 @@ import { BusyLock } from '../dist/pikvm/lock.js';
 import { PiKVMClient, pixelToNormalized } from '../dist/pikvm/client.js';
 import { limitedSharp } from '../dist/screenshot.js';
 import { createMcpServer } from '../dist/server.js';
+import { kvmdOcr } from '../dist/ocr.js';
 import { startHttpServer } from '../dist/http.js';
 import { startKvmdMock } from './kvmd-mock.mjs';
 
@@ -41,6 +43,14 @@ const ENV_KEYS = [
   'PIKVM_SCREENSHOT_MAX_HEIGHT',
   'PIKVM_SCREENSHOT_QUALITY',
   'PIKVM_OCR_TIMEOUT_MS',
+  'PIKVM_OCR_ENGINE',
+  'PIKVM_OCR_TESSERACT_BIN',
+  'PIKVM_OCR_TESSDATA_DIR',
+  'PIKVM_OCR_LANGS',
+  'PIKVM_OCR_MAX_CONCURRENCY',
+  'PIKVM_OCR_MAX_PIXELS',
+  'PIKVM_OCR_ALLOW_FULL_FRAME',
+  'PIKVM_OCR_MIN_CONF',
   'CREDENTIALS_DIRECTORY',
 ];
 
@@ -175,7 +185,7 @@ async function waitUntil(fn, ms = 2000) {
   }
 }
 
-async function startLegacy(mock, extraEnv = {}) {
+async function startLegacy(mock, extraEnv = {}, ocr) {
   const config = withEnv({
     PIKVM_HOST: mock.url,
     PIKVM_PASSWORD: 'testpw',
@@ -194,6 +204,7 @@ async function startLegacy(mock, extraEnv = {}) {
     calibrationConfig,
     armGateEnforced: false,
     screenshot: config.screenshot,
+    ...(ocr ? { ocr } : {}),
   }));
   const sessionId = await openSession(srv.base);
   return {
@@ -487,6 +498,7 @@ test('OCR is hidden when every device is disabled, and a disabled device does no
       fleet: quiet,
       calibrationConfig,
       armGateEnforced: false,
+      ocr: kvmdOcr(),
     }));
     try {
       const sessionId = await openSession(hiddenSrv.base);
@@ -534,6 +546,7 @@ test('OCR is hidden when every device is disabled, and a disabled device does no
       fleet,
       calibrationConfig,
       armGateEnforced: false,
+      ocr: kvmdOcr(),
     }));
     try {
       const sessionId = await openSession(srv.base);
@@ -555,7 +568,10 @@ test('OCR is hidden when every device is disabled, and a disabled device does no
         arguments: { device: 'lab2', langs: 'eng', left: 1, top: 2, right: 3, bottom: 4 },
       });
       assert.notEqual(read.result.isError, true, read.result.content[0].text);
-      assert.match(read.result.content[0].text, /screen text/);
+      const readBody = JSON.parse(read.result.content[0].text);
+      assert.equal(readBody.engine, 'kvmd');
+      assert.deepEqual(readBody.words, []);
+      assert.match(readBody.text, /screen text/);
       const shot = on.calls.filter((call) => call.path === '/api/streamer/snapshot').at(-1);
       assert.equal(shot.query, '?ocr=1&ocr_langs=eng&ocr_left=1&ocr_top=2&ocr_right=3&ocr_bottom=4');
 
@@ -624,6 +640,7 @@ test('OCR errors are redacted', async (t) => {
       lock: new BusyLock(),
       calibrationConfig,
       armGateEnforced: false,
+      ocr: kvmdOcr(),
     }));
     try {
       const sessionId = await openSession(srv.base);
@@ -1117,6 +1134,7 @@ test('OCR probes run together, and a disabled answer is cached', async () => {
       fleet,
       calibrationConfig,
       armGateEnforced: false,
+      ocr: kvmdOcr(),
     }));
     try {
       const sessionId = await openSession(srv.base);
@@ -1173,15 +1191,18 @@ test('an OCR box is preview pixels, and text is capped', async (t) => {
       PIKVM_TLS_MODE: 'insecure',
     }, () => loadConfig()).pikvm.ocrTimeoutMs, 30000);
 
-    const session = await startLegacy(mock);
+    const session = await startLegacy(mock, {}, kvmdOcr());
     try {
       await session.pikvm.probeOcr('default');
       const plain = await rpc(session.srv.base, session.sessionId, 'tools/call', {
         name: 'pikvm_read_text',
         arguments: { langs: 'eng', left: 1, top: 2, right: 3, bottom: 4 },
       });
-      assert.match(plain.result.content[0].text, /\[truncated\]/);
-      assert.ok(Buffer.byteLength(plain.result.content[0].text) <= 64 * 1024);
+      const plainBody = JSON.parse(plain.result.content[0].text);
+      assert.equal(plainBody.engine, 'kvmd');
+      assert.deepEqual(plainBody.words, []);
+      assert.match(plainBody.text, /\[truncated\]/);
+      assert.ok(Buffer.byteLength(plainBody.text) <= 64 * 1024);
       assert.equal(
         ocrSnapshots(mock).at(-1).query,
         '?ocr=1&ocr_langs=eng&ocr_left=1&ocr_top=2&ocr_right=3&ocr_bottom=4',

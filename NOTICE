@@ -779,3 +779,15 @@ No code from another pikvm_mcp_server fork was added for these methods.
   can start another transfer without hitting "upload already running"
   from the slot that job still held.
   No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  Host OCR shells out to the system tesseract binary. tesseract.js is
+  not a dependency. The eng traineddata is the Apache-2.0 file shipped
+  by the operating system, and Leptonica is the BSD-style library that
+  tesseract links. Neither is vendored in this repository. An unset
+  PIKVM_OCR_ENGINE uses that binary when the startup probe finds it,
+  and leaves OCR off otherwise. kvmd is not the unset default and is
+  not called when host fails. pikvm_read_text returns one JSON text
+  block. The hardware self-skip count is twelve, including the
+  read-only OCR timings.
+  No code from another pikvm_mcp_server fork was copied.

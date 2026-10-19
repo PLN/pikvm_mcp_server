@@ -17,6 +17,7 @@
 // Modified 2026-10 by PLN: sharp refuses an oversized image (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: one resolved click frame for the move and the echo (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a catalog read stops at the caller's deadline (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: full-resolution snapshot for host OCR (GPL-3.0; see NOTICE).
 // AbortSignal.timeout and PIKVM_UNREACHABLE / PIKVM_AUTH_FAILED no-retry codes
 // adapted from dtrukr/pikvm_mcp_server src/pikvm/client.ts @ d120243 (GPL-3.0).
 // Snapshot HTTP 503 retry-once adapted from dvaerum/pikvm_mcp_server
@@ -1376,6 +1377,22 @@ export class PiKVMClient {
       throw new Error('OCR response was not text');
     }
     return capOcrText(text);
+  }
+
+  /**
+   * One full-resolution snapshot. No preview parameters and no ocr=1.
+   * The deadline is the caller's remaining OCR budget. A timeout is not retried.
+   */
+  async fetchFullSnapshot(timeoutMs: number): Promise<Buffer> {
+    const body = await this.requestOnce<ArrayBuffer>(
+      'GET',
+      '/streamer/snapshot',
+      undefined,
+      undefined,
+      timeoutMs,
+    );
+    if (body instanceof ArrayBuffer) return Buffer.from(body);
+    throw new Error('snapshot response was not an image');
   }
 
   /**
