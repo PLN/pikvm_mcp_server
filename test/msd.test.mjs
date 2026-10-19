@@ -10,6 +10,7 @@
 // Modified 2026-10 by PLN: abort tests reject a raw-fd upload read (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: catalog readiness and confirmed removal (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: stable size mismatch, unseen confirm, and the readiness deadline (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: symlink and FIFO path checks follow the platform (GPL-3.0; see NOTICE).
 
 /**
  * MSD tools against the mock. The HTTP harness matches test/http.test.mjs.
@@ -35,6 +36,7 @@ import { createMcpServer, ARM_GATED_TOOLS, MSD_READ_ONLY_TOOLS, msdToolRequiresA
 import { parseUrlAllowlist } from '../dist/url-policy.js';
 import { startHttpServer } from '../dist/http.js';
 import { startKvmdMock } from './kvmd-mock.mjs';
+import { fifoAvailable, symlinkAvailable } from './posix-caps.mjs';
 
 const execFileAsync = promisify(execFile);
 const TOKEN = 'test-bearer-token-0123456789abcdef';
@@ -990,19 +992,23 @@ test('upload, remove, and job polling', { timeout: 120000 }, async (t) => {
   await t.test('path rejections make no kvmd call', async () => {
     await withDir(async (dir) => {
       await writeFile(join(dir, 'real.img'), body);
-      await symlink(join(dir, 'real.img'), join(dir, 'link.img'));
       await mkdir(join(dir, 'dir.img'));
       await writeFile(join(dir, 'big.img'), body);
-      await execFileAsync('mkfifo', [join(dir, 'pipe.img')]);
       const cases = [
         ['traversal', { file: '../real.img', confirmImage: '../real.img' }, /bare image name/],
         ['absolute', { file: '/tmp/real.img', confirmImage: '/tmp/real.img' }, /bare image name/],
-        ['symlink', { file: 'link.img', confirmImage: 'link.img' }, /symlink/],
         ['directory', { file: 'dir.img', confirmImage: 'dir.img' }, /directory/],
-        ['fifo', { file: 'pipe.img', confirmImage: 'pipe.img' }, /not a regular file/],
         ['oversize', { file: 'big.img', confirmImage: 'big.img' }, /PIKVM_MSD_MAX_BYTES/],
         ['sha256 format', { file: 'real.img', confirmImage: 'real.img', sha256: 'nope' }, /64 hex/],
       ];
+      if (symlinkAvailable()) {
+        await symlink(join(dir, 'real.img'), join(dir, 'link.img'));
+        cases.push(['symlink', { file: 'link.img', confirmImage: 'link.img' }, /symlink/]);
+      }
+      if (fifoAvailable()) {
+        await execFileAsync('mkfifo', [join(dir, 'pipe.img')]);
+        cases.push(['fifo', { file: 'pipe.img', confirmImage: 'pipe.img' }, /not a regular file/]);
+      }
       for (const [label, args, pattern] of cases) {
         const flags = label === 'oversize'
           ? uploadMsd(dir, { maxBytes: 3 })

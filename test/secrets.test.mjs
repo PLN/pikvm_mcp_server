@@ -1,6 +1,7 @@
 // Modified 2026-10 by PLN: password and bearer secret files (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: empty secret vars are unset (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: bearer whitespace is HTTP-only (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: file-URL import, and POSIX fixture skips (GPL-3.0; see NOTICE).
 
 /**
  * resolveSecret order and file rules. Temp directories are removed.
@@ -14,7 +15,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, test } from 'node:test';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { redactConfig, loadConfig } from '../dist/config.js';
 import { SECRET_MAX_BYTES, resolveSecret } from '../dist/secrets.js';
 import { PiKVMClient } from '../dist/pikvm/client.js';
@@ -22,6 +23,7 @@ import { BusyLock } from '../dist/pikvm/lock.js';
 import { createMcpServer } from '../dist/server.js';
 import { startHttpServer } from '../dist/http.js';
 import { startKvmdMock } from './kvmd-mock.mjs';
+import { exactModeAvailable, fifoAvailable, symlinkAvailable } from './posix-caps.mjs';
 
 const REPO = join(fileURLToPath(import.meta.url), '..', '..');
 const SENTINEL = 'sentinel-9f3a2c7b-secret';
@@ -281,41 +283,48 @@ describe('resolveSecret', () => {
           /not a regular file/,
         );
       }
-      const fifo = join(dir, 'fifo');
-      execFileSync('mkfifo', [fifo]);
-      assert.throws(
-        () => resolveSecret({
+      if (fifoAvailable()) {
+        const fifo = join(dir, 'fifo');
+        execFileSync('mkfifo', [fifo]);
+        assert.throws(
+          () => resolveSecret({
+            name: 'PIKVM_PASSWORD',
+            credName: 'pikvm-password',
+            required: true,
+            env: { PIKVM_PASSWORD_FILE: fifo },
+          }),
+          /not a regular file/,
+        );
+      }
+      if (symlinkAvailable()) {
+        const real = join(dir, 'real');
+        writeFileSync(real, 'by-symlink\n', { mode: 0o600 });
+        const link = join(dir, 'link');
+        symlinkSync(real, link);
+        assert.equal(resolveSecret({
           name: 'PIKVM_PASSWORD',
           credName: 'pikvm-password',
           required: true,
-          env: { PIKVM_PASSWORD_FILE: fifo },
-        }),
-        /not a regular file/,
-      );
-      const real = join(dir, 'real');
-      writeFileSync(real, 'by-symlink\n', { mode: 0o600 });
-      const link = join(dir, 'link');
-      symlinkSync(real, link);
-      assert.equal(resolveSecret({
-        name: 'PIKVM_PASSWORD',
-        credName: 'pikvm-password',
-        required: true,
-        env: { PIKVM_PASSWORD_FILE: link },
-      }), 'by-symlink');
+          env: { PIKVM_PASSWORD_FILE: link },
+        }), 'by-symlink');
+      }
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
   });
 
-  test('opening a FIFO does not block', async () => {
-    if (process.platform === 'win32') return;
+  test('opening a FIFO does not block', async (t) => {
+    if (!fifoAvailable()) {
+      t.skip('FIFO is not available on this platform');
+      return;
+    }
     const dir = await tempDir();
     const fifo = join(dir, 'fifo');
     const script = join(dir, 'open-fifo.mjs');
     try {
       execFileSync('mkfifo', [fifo]);
       await writeFile(script, `
-        import { resolveSecret } from ${JSON.stringify(join(REPO, 'dist/secrets.js'))};
+        import { resolveSecret } from ${JSON.stringify(pathToFileURL(join(REPO, 'dist/secrets.js')).href)};
         try {
           resolveSecret({
             name: 'PIKVM_PASSWORD',
@@ -345,8 +354,11 @@ describe('resolveSecret', () => {
     }
   });
 
-  test('mode 0644 warns and 0600 does not', async () => {
-    if (process.platform === 'win32') return;
+  test('mode 0644 warns and 0600 does not', async (t) => {
+    if (!exactModeAvailable()) {
+      t.skip('exact file modes are not available on this platform');
+      return;
+    }
     const dir = await tempDir();
     try {
       const loose = join(dir, 'loose');

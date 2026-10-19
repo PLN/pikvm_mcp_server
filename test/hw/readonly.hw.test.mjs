@@ -3,6 +3,7 @@
 // Modified 2026-10 by PLN: reject fetch bad ports (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: log the TLS mode (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: screenshot region and optional OCR (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: a bad password is 401 or 403 (GPL-3.0; see NOTICE).
 
 /**
  * Read-only checks. Nothing here changes the drive.
@@ -117,7 +118,7 @@ describe('read-only hardware', { concurrency: false }, () => {
     }
   });
 
-  test('a bad password is one 401 and PIKVM_AUTH_FAILED', { skip }, async () => {
+  test('a bad password is one 401 or 403 and PIKVM_AUTH_FAILED', { skip }, async () => {
     const session = await openHardwareSession();
     try {
       const wrong = new PiKVMClient({
@@ -125,11 +126,12 @@ describe('read-only hardware', { concurrency: false }, () => {
         password: `hw-test-bad-${randomBytes(8).toString('hex')}`,
       });
       try {
+        // One getMsdState. 401 and 403 are both PIKVM_AUTH_FAILED and are not retried.
         await assert.rejects(
           () => wrong.getMsdState(),
           (err) => {
             assert.ok(err instanceof KvmdError);
-            assert.equal(err.status, 401);
+            assert.ok(err.status === 401 || err.status === 403);
             assert.equal(err.type, 'PIKVM_AUTH_FAILED');
             assert.equal(err.message.includes(session.config.pikvm.password), false);
             return true;

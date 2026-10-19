@@ -2,6 +2,7 @@
 // Modified 2026-10 by PLN: the net marker is on TAP stdout (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: TLS mode check is skipped with the suite (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: screenshot and OCR checks are skipped with the suite (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: ESM specifiers are file URLs (GPL-3.0; see NOTICE).
 
 /**
  * The hardware files must not run during npm test, and with
@@ -13,7 +14,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { describe, test } from 'node:test';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { join } from 'node:path';
 import { PiKVMClient } from '../dist/pikvm/client.js';
 import { resolveDevice } from '../dist/msd.js';
@@ -73,17 +74,18 @@ describe('hardware suite process', () => {
       TMPDIR: process.env.TMPDIR ?? '/tmp',
       PIKVM_MCP_NO_DOTENV: '1',
     };
-    // Node 22.14 treats `node --test test/hw` as a directory import when
+    // Node >=22.9.0 treats `node --test test/hw` as a directory import when
     // package.json says "type": "module", so the files are not discovered.
     // `node --test` with this directory as cwd finds *.hw.test.mjs.
-    // --import is an argv so a path with spaces is one argument.
+    // --import and --test-reporter take an ESM specifier. A file URL loads
+    // the same module on Linux and on Windows, including a path with spaces.
     // The stock TAP reporter does not name discovered files. This reporter
     // lists them and still emits the "# tests N" summary, including a
     // child file's stderr (where the net marker is written).
     const child = spawn(process.execPath, [
-      '--import', guard,
+      '--import', pathToFileURL(guard).href,
       '--test',
-      '--test-reporter', discovered,
+      '--test-reporter', pathToFileURL(discovered).href,
       '--test-concurrency=1',
     ], {
       cwd: join(repo, 'test', 'hw'),

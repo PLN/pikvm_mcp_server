@@ -3,6 +3,7 @@
 // Modified 2026-10 by PLN: TLS 1.2 reset stays unreachable (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: pin without a registry names only default (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a leading-zero serial stays a minimal INTEGER (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: file-URL import, and POSIX fixture skips (GPL-3.0; see NOTICE).
 
 /**
  * Self-signed server minted in this process. No committed key.
@@ -31,7 +32,7 @@ import { join } from 'node:path';
 import { Readable } from 'node:stream';
 import tls from 'node:tls';
 import { after, before, describe, test } from 'node:test';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { loadConfig } from '../dist/config.js';
 import { KvmdError, PiKVMClient } from '../dist/pikvm/client.js';
 import {
@@ -48,6 +49,7 @@ import {
 } from '../dist/tls.js';
 import { kvmdGet } from './hw/session.mjs';
 import { certificateSerial, mintCert, mintExpired, mintNode } from './tls-cert.mjs';
+import { exactModeAvailable, fifoAvailable, symlinkAvailable } from './posix-caps.mjs';
 
 const REPO = join(fileURLToPath(import.meta.url), '..', '..');
 const right = mintCert();
@@ -427,7 +429,7 @@ describe('TLS config', () => {
         oversize.restore();
       }
 
-      if (process.platform !== 'win32') {
+      if (fifoAvailable()) {
         const fifo = join(dir, 'fifo');
         execFileSync('mkfifo', [fifo]);
         const started = Date.now();
@@ -437,25 +439,31 @@ describe('TLS config', () => {
 
       const file = join(dir, 'leaf.pem');
       writeFileSync(file, right.cert, { mode: 0o644 });
-      const link = join(dir, 'leaf-link.pem');
-      symlinkSync(file, link);
-      const pinned = withEnv({
-        PIKVM_HOST: 'https://pikvm.example.ts.net',
-        PIKVM_PASSWORD: 'testpw',
-        PIKVM_TLS_MODE: 'pin',
-        PIKVM_TLS_CERT_FILE: link,
-        PIKVM_VERIFY_SSL: 'false',
-      });
-      try {
-        const config = loadConfig();
-        assert.equal(config.pikvm.tls.default.mode, 'pin');
-        assert.equal(config.pikvm.tls.default.spkiSha256, right.spkiSha256);
-        assert.equal(config.pikvm.tls.default.device, 'default');
-        assert.equal(pinned.logged.some((line) => line.includes('mode ')), false);
-        assert.equal(pinned.logged.length, 1);
-        assert.match(pinned.logged[0], /overrides/);
-      } finally {
-        pinned.restore();
+      const sources = [file];
+      if (symlinkAvailable()) {
+        const link = join(dir, 'leaf-link.pem');
+        symlinkSync(file, link);
+        sources.push(link);
+      }
+      for (const certFile of sources) {
+        const pinned = withEnv({
+          PIKVM_HOST: 'https://pikvm.example.ts.net',
+          PIKVM_PASSWORD: 'testpw',
+          PIKVM_TLS_MODE: 'pin',
+          PIKVM_TLS_CERT_FILE: certFile,
+          PIKVM_VERIFY_SSL: 'false',
+        });
+        try {
+          const config = loadConfig();
+          assert.equal(config.pikvm.tls.default.mode, 'pin');
+          assert.equal(config.pikvm.tls.default.spkiSha256, right.spkiSha256);
+          assert.equal(config.pikvm.tls.default.device, 'default');
+          assert.equal(pinned.logged.some((line) => line.includes('mode ')), false);
+          assert.equal(pinned.logged.length, 1);
+          assert.match(pinned.logged[0], /overrides/);
+        } finally {
+          pinned.restore();
+        }
       }
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -568,7 +576,9 @@ describe('pin CLI', { concurrency: false }, () => {
       const written = readPinnedCert(dest);
       assert.equal(written.spkiSha256, right.spkiSha256);
       assert.equal(new crypto.X509Certificate(written.pem).raw.equals(right.raw), true);
-      assert.equal(statSync(dest).mode & 0o777, 0o644);
+      if (exactModeAvailable()) {
+        assert.equal(statSync(dest).mode & 0o777, 0o644);
+      }
       assert.equal(readdirSync(dir).some((name) => name.includes('.tmp')), false);
       assert.equal(connections - before, 1);
       assert.equal(received.length, 0);
@@ -678,7 +688,7 @@ function chainServer(cert, key) {
 
 async function verifyOnce(port, extraCa) {
   const script = `
-    import { PiKVMClient } from ${JSON.stringify(join(REPO, 'dist', 'pikvm', 'client.js'))};
+    import { PiKVMClient } from ${JSON.stringify(pathToFileURL(join(REPO, 'dist', 'pikvm', 'client.js')).href)};
     const client = new PiKVMClient({
       host: process.env.PROBE_HOST,
       username: 'admin',
@@ -945,7 +955,11 @@ describe('TLS chain classification', { concurrency: false }, () => {
     }
   });
 
-  test('rename replaces a symlink and leaves the target untouched', () => {
+  test('rename replaces a symlink and leaves the target untouched', (t) => {
+    if (!symlinkAvailable()) {
+      t.skip('symlink is not available on this platform');
+      return;
+    }
     const dir = mkdtempSync(join(tmpdir(), 'pikvm-link-'));
     try {
       const target = join(dir, 'target.pem');

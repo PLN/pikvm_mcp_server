@@ -2,6 +2,7 @@
 <!-- Modified 2026-10 by PLN: connect timeout and DNS map to unreachable (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: pikvm_type delay is milliseconds (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: opt-in hardware suite (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: tool count follows OCR, arm flags, and the registry (GPL-3.0; see NOTICE) -->
 
 # AGENTS.md - PiKVM MCP Server
 
@@ -101,7 +102,7 @@ The server is configured via environment variables or a config file:
 
 The server exposes 13 skills as both MCP prompts (`prompts/list` / `prompts/get`) and read-only `skill_*` tools (`tools/list` / `tools/call`). The skill tools are auto-generated from prompt definitions for marketplace visibility (e.g. LobeHub indexes tools, not prompts).
 
-**Total tools: 25** (12 `pikvm_*` hardware tools + 13 `skill_*` guidance tools)
+The tool count is configuration-dependent. OCR visibility keeps `pikvm_read_text` listed while any device is enabled or not yet probed, and omits it once every device has reported disabled. Arm flags (`PIKVM_MCP_ARM_HID`, `PIKVM_MCP_ARM_MSD`, and the per-device `armHid` / `armMsd` flags) decide which listed HID and MSD calls run. A registry decides which device a call uses. A local image directory lists `pikvm_msd_upload`, and a URL allowlist lists `pikvm_msd_fetch_url`.
 
 ### Tool Guides
 | Prompt | Skill Tool | Covers |
