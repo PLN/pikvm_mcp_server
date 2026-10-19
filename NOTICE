@@ -39,6 +39,7 @@ Modified 2026-10 by PLN: the HID-send capture test names the mapping it keeps (G
 Modified 2026-10 by PLN: a stable wrong size fails at once, and an unseen image is confirmed briefly (GPL-3.0; see below).
 Modified 2026-10 by PLN: Windows ESM specifiers, POSIX fixture skips, and hardware docs (GPL-3.0; see below).
 Modified 2026-10 by PLN: the upload slot is free before a job looks finished (GPL-3.0; see below).
+Modified 2026-10 by PLN: typed eject, rollbackError wording, and catalog cleanup under the MSD lock (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -790,4 +791,16 @@ No code from another pikvm_mcp_server fork was added for these methods.
   not called when host fails. pikvm_read_text returns one JSON text
   block. The hardware self-skip count is twelve, including the
   read-only OCR timings.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  Eject uses MsdExpectImageError for a mismatched expectImage, the same
+  typed error as mount. rollbackError lists each failed restore step,
+  including the final state re-read and a synthetic entry when the
+  snapshot image is an NBD or URL that set_params will not accept.
+  After a catalog wait fails, removal of the image stays inside the
+  MSD lock that held the wait. A file-close failure after that image
+  is already in the catalog removes it before the job is failed.
+  An incomplete catalog row keeps being polled when its size already
+  differs. OCR environment names stay PIKVM_OCR_*.
   No code from another pikvm_mcp_server fork was copied.

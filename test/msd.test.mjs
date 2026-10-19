@@ -12,6 +12,7 @@
 // Modified 2026-10 by PLN: stable size mismatch, unseen confirm, and the readiness deadline (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: symlink and FIFO path checks follow the platform (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a finished job has already released the upload slot (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: incomplete size polling, slot-before-mount, and catalog cleanup (GPL-3.0; see NOTICE).
 
 /**
  * MSD tools against the mock. The HTTP harness matches test/http.test.mjs.
@@ -262,7 +263,11 @@ test('expectImage mismatch makes no mutating kvmd call', async () => {
     async ({ mock, base, sessionId }) => {
       const result = await callTool(base, sessionId, 'pikvm_msd_eject', { expectImage: 'other.img' });
       assert.equal(result.isError, true);
-      assert.match(result.content[0].text, /expectImage mismatch/);
+      assert.match(result.content[0].text, /MsdExpectImageError/);
+      assert.match(result.content[0].text, /drive image is "disk\.img"/);
+      const details = JSON.parse(result.content[0].text.split('\n')[1]);
+      assert.equal(details.type, 'MsdExpectImageError');
+      assert.equal(details.image, 'disk.img');
       assert.deepEqual(msdPosts(mock), []);
       assert.equal(mock.calls.filter((call) => call.method === 'GET' && call.path === '/api/msd').length, 1);
       assert.equal(mock.state.drive.connected, true);
@@ -2285,6 +2290,82 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
         );
       });
     });
+
+    await t.test(`${kind}: an incomplete wrong size keeps polling`, async (inner) => {
+      watchCrashes(inner);
+      const run = kind === 'upload' ? withUpload : withFetch;
+      await run({ images: [], catalogIncompletePolls: 2, catalogSize: 9 }, 4000, async ({ mock, base, sessionId }) => {
+        const started = await startTransfer(kind, base, sessionId);
+        const { jobId } = JSON.parse(started.content[0].text);
+        const began = Date.now();
+        const failed = await pollJob(base, sessionId, jobId, 8000);
+        const elapsed = Date.now() - began;
+        assert.equal(failed.state, 'failed', kind);
+        assert.equal(failed.error.type, 'PIKVM_MSD_SIZE_MISMATCH', kind);
+        assert.match(failed.error.message, /size is 9, expected 4/, kind);
+        assert.ok(elapsed >= 700, `${kind} stopped on an incomplete wrong size (${elapsed} ms)`);
+        assert.ok(elapsed < 2500, `${kind} waited out a long budget (${elapsed} ms)`);
+        assert.equal(transferPosts(mock, kind).length, 1, kind);
+        assert.equal(failed.removed, true, kind);
+        assert.equal(mock.state.images['disk.img'], undefined, kind);
+      });
+    });
+
+    await t.test(`${kind}: an incomplete wrong size stays incomplete until the deadline`, async (inner) => {
+      watchCrashes(inner);
+      const budget = 500;
+      const run = kind === 'upload' ? withUpload : withFetch;
+      await run({ images: [], catalogIncompletePolls: 1000, catalogSize: 9 }, budget, async ({ mock, base, sessionId }) => {
+        const started = await startTransfer(kind, base, sessionId);
+        const { jobId } = JSON.parse(started.content[0].text);
+        const began = Date.now();
+        const failed = await pollJob(base, sessionId, jobId, 8000);
+        const elapsed = Date.now() - began;
+        assert.equal(failed.state, 'failed', kind);
+        assert.equal(failed.error.type, 'PIKVM_MSD_IMAGE_INCOMPLETE', kind);
+        assert.ok(elapsed >= 400, `${kind} failed fast on an incomplete wrong size (${elapsed} ms)`);
+        assert.equal(transferPosts(mock, kind).length, 1, kind);
+        assert.equal(failed.removed, true, kind);
+        assert.equal(mock.state.images['disk.img'], undefined, kind);
+      });
+    });
+
+    await t.test(`${kind}: catalog failure cleanup holds the MSD lock`, async (inner) => {
+      watchCrashes(inner);
+      const run = kind === 'upload' ? withUpload : withFetch;
+      await run({
+        images: ['other.img'],
+        catalogIncompletePolls: 1000,
+      }, 800, async ({ mock, base, sessionId }) => {
+        const started = await startTransfer(kind, base, sessionId);
+        const { jobId } = JSON.parse(started.content[0].text);
+        assert.equal(await waitFor(async () => {
+          const mid = JSON.parse((await callTool(base, sessionId, 'pikvm_msd_job', { jobId })).content[0].text);
+          return mid.state === 'awaiting_catalog';
+        }, 4000), true, kind);
+        const other = await openSession(base);
+        const mountPromise = callTool(base, other, 'pikvm_msd_mount', {
+          image: 'other.img',
+          confirmImage: 'other.img',
+          mode: 'flash',
+          connect: false,
+        });
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        assert.equal(mock.calls.some((call) => call.path === '/api/msd/set_params'), false, kind);
+        const failed = await pollJob(base, sessionId, jobId, 8000);
+        assert.equal(failed.state, 'failed', kind);
+        assert.equal(failed.error.type, 'PIKVM_MSD_IMAGE_INCOMPLETE', kind);
+        assert.equal(failed.removed, true, kind);
+        const mounted = await mountPromise;
+        assert.equal(mounted.isError, undefined, `${kind}: ${mounted.content[0].text}`);
+        const paths = mock.calls.map((call) => call.path);
+        const removeAt = paths.indexOf('/api/msd/remove');
+        const paramsAt = paths.indexOf('/api/msd/set_params');
+        assert.ok(removeAt !== -1 && paramsAt !== -1, kind);
+        assert.ok(removeAt < paramsAt, `${kind} mounted before cleanup (${removeAt} vs ${paramsAt})`);
+        assert.equal(mock.state.images['disk.img'], undefined, kind);
+      });
+    });
   }
 
   await t.test('an image absent at remove time, then visible, is confirmed gone', async (inner) => {
@@ -2299,6 +2380,126 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
       assert.equal(mock.state.images['disk.img'], undefined);
       assert.equal(transferPosts(mock, 'upload').length, 1);
       assert.ok(mock.calls.some((call) => call.path === '/api/msd/remove'));
+    });
+  });
+
+  await t.test('a successful upload is done, with the slot free, before mount', async (inner) => {
+    watchCrashes(inner);
+    await withDir(async (dir) => {
+      await writeFile(join(dir, 'disk.img'), Buffer.from('abcd'));
+      await writeFile(join(dir, 'next.img'), Buffer.from('wxyz'));
+      let release;
+      const flags = uploadMsd(dir, {
+        beforeSlotRelease: () => new Promise((resolve) => { release = resolve; }),
+      });
+      try {
+        await withSession({
+          images: ['other.img'],
+          holdMutations: 1,
+        }, flags, async ({ mock, base, sessionId }) => {
+          const started = await callTool(base, sessionId, 'pikvm_msd_upload', {
+            file: 'disk.img',
+            confirmImage: 'disk.img',
+          });
+          assert.equal(started.isError, undefined, started.content[0].text);
+          const { jobId } = JSON.parse(started.content[0].text);
+          assert.equal(await waitFor(() => typeof release === 'function'), true);
+          const mid = JSON.parse((await callTool(base, sessionId, 'pikvm_msd_job', { jobId })).content[0].text);
+          assert.equal(mid.state, 'awaiting_catalog');
+          const blocked = await callTool(base, sessionId, 'pikvm_msd_upload', {
+            file: 'next.img',
+            confirmImage: 'next.img',
+          });
+          assert.equal(blocked.isError, true);
+          assert.match(blocked.content[0].text, /upload already running/);
+          const other = await openSession(base);
+          const mountPromise = callTool(base, other, 'pikvm_msd_mount', {
+            image: 'other.img',
+            confirmImage: 'other.img',
+            mode: 'flash',
+            connect: false,
+          });
+          await new Promise((resolve) => setTimeout(resolve, 40));
+          assert.equal(mock.calls.some((call) => call.path === '/api/msd/set_params'), false);
+          release();
+          release = undefined;
+          assert.equal(await waitFor(() => mock.calls.some((call) => call.path === '/api/msd/set_params'), 4000), true);
+          const done = JSON.parse((await callTool(base, sessionId, 'pikvm_msd_job', { jobId })).content[0].text);
+          assert.equal(done.state, 'done');
+          const next = await callTool(base, sessionId, 'pikvm_msd_upload', {
+            file: 'next.img',
+            confirmImage: 'next.img',
+            sha256: 'b'.repeat(64),
+          });
+          assert.equal(next.isError, undefined, next.content[0].text);
+          assert.equal(typeof JSON.parse(next.content[0].text).jobId, 'string');
+          mock.releaseHold();
+          const mounted = await mountPromise;
+          assert.equal(mounted.isError, undefined, mounted.content[0].text);
+          assert.equal(JSON.parse(mounted.content[0].text).drive.image.name, 'other.img');
+          assert.equal(mock.calls.filter((call) => (
+            call.path === '/api/msd/write' && call.query.includes('next.img')
+          )).length, 0);
+        });
+      } finally {
+        if (release) release();
+      }
+    });
+  });
+
+  await t.test('a close failure after the catalog removes the image under the lock', async (inner) => {
+    watchCrashes(inner);
+    await withDir(async (dir) => {
+      await writeFile(join(dir, 'disk.img'), Buffer.from('abcd'));
+      let opened = false;
+      let release;
+      const flags = uploadMsd(dir, {
+        closeFile: async (fh) => {
+          await fh.close();
+          opened = true;
+          await new Promise((resolve) => { release = resolve; });
+          throw new Error('close failed');
+        },
+      });
+      try {
+        await withSession({
+          images: ['other.img'],
+          holdMutations: 1,
+        }, flags, async ({ mock, base, sessionId }) => {
+          const started = await callTool(base, sessionId, 'pikvm_msd_upload', {
+            file: 'disk.img',
+            confirmImage: 'disk.img',
+          });
+          assert.equal(started.isError, undefined, started.content[0].text);
+          const { jobId } = JSON.parse(started.content[0].text);
+          assert.equal(await waitFor(() => opened && typeof release === 'function'), true);
+          assert.equal(mock.state.images['disk.img'].complete, true);
+          const other = await openSession(base);
+          const mountPromise = callTool(base, other, 'pikvm_msd_mount', {
+            image: 'other.img',
+            confirmImage: 'other.img',
+            mode: 'flash',
+            connect: false,
+          });
+          await new Promise((resolve) => setTimeout(resolve, 40));
+          assert.equal(mock.calls.some((call) => call.path === '/api/msd/set_params'), false);
+          release();
+          release = undefined;
+          assert.equal(await waitFor(() => mock.calls.some((call) => call.path === '/api/msd/set_params'), 8000), true);
+          assert.equal(mock.state.images['disk.img'], undefined);
+          const failed = JSON.parse((await callTool(base, sessionId, 'pikvm_msd_job', { jobId })).content[0].text);
+          assert.equal(failed.state, 'failed');
+          assert.match(failed.error.message, /close failed/);
+          assert.equal(failed.removed, true);
+          const paths = mock.calls.map((call) => call.path);
+          assert.ok(paths.indexOf('/api/msd/remove') < paths.indexOf('/api/msd/set_params'));
+          mock.releaseHold();
+          const mounted = await mountPromise;
+          assert.equal(mounted.isError, undefined, mounted.content[0].text);
+        });
+      } finally {
+        if (release) release();
+      }
     });
   });
 });

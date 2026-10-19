@@ -17,14 +17,15 @@
 // Modified 2026-10 by PLN: catalog error codes on the upload and fetch tools (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: test hook before the upload slot is released (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: host OCR returns one JSON text block (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: fleet comments, typed eject, and rollbackError wording (GPL-3.0; see NOTICE).
 
 /**
  * MCP server factory for PiKVM tools
  *
  * Builds a fresh MCP Server instance with all tool/prompt handlers registered.
  * stdio mode uses one instance; each HTTP session gets its own (per the
- * Streamable HTTP session model), sharing the single PiKVMClient and BusyLock
- * below them.
+ * Streamable HTTP session model). Sessions share the fleet: one PiKVMClient
+ * and one BusyLock per device.
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -123,6 +124,11 @@ export interface MsdServerConfig extends MsdConfig {
   beforeHash?: () => Promise<void>;
   beforeUploadStream?: () => Promise<void>;
   beforeSlotRelease?: () => Promise<void>;
+  /**
+   * Replaces the upload file close. Unset in production. The hook must
+   * close the handle. A rejection is a close failure.
+   */
+  closeFile?: (fh: { close(): Promise<void> }) => Promise<void>;
   beforeFetch?: () => Promise<void>;
   /** Hostname to addresses. Unset uses DNS, and does not resolve IP literals. */
   resolveUrl?: (hostname: string) => Promise<string[]>;
@@ -284,7 +290,7 @@ export function msdToolRequiresArm(name: string): boolean {
 
 /**
  * Tool failure text. KvmdError keeps status, type, message, and endpoint.
- * MsdExpectImageError names the connected image. MsdImageTransferError
+ * MsdExpectImageError names the snapshot image. MsdImageTransferError
  * names the image with an active transfer. MsdPreflightError,
  * MsdUploadBusyError, and MsdUrlPolicyError keep their type. URL userinfo
  * is removed from every message. Other errors stay `Error: <message>`.
@@ -769,20 +775,20 @@ const tools: Tool[] = [
       properties: {
         device: {
           type: 'string',
-          description: 'Device name. Ignored until more than one device exists; the server uses the single configured device.',
+          description: 'Registry device name. Omitted means the default device.',
         },
       },
     },
   },
   {
     name: 'pikvm_msd_mount',
-    description: 'Select a mass-storage image and, by default, connect the virtual drive. confirmImage must equal image. Refuses while that image has an active upload or fetch, and makes no POST. When a drive is already connected, expectImage must equal that image name or the mount is refused and nothing is ejected. mode is cdrom or flash. rw is for flash and defaults to false; kvmd may force rw false, and the returned drive is a re-read after the change. On failure the previous drive selection is restored. An NBD or URL image in that snapshot cannot be restored, because set_params refuses names containing ://.',
+    description: 'Select a mass-storage image and, by default, connect the virtual drive. confirmImage must equal image. Refuses while that image has an active upload or fetch, and makes no POST. When a drive is already connected, expectImage must equal that image name or the mount is refused and nothing is ejected. mode is cdrom or flash. rw is for flash and defaults to false; kvmd may force rw false, and the returned drive is a re-read after the change. On failure the previous drive selection is restored. rollbackError is one entry per failed step, including the re-read. An NBD or URL image in that snapshot cannot be restored, because set_params refuses names containing ://, and that refusal is one of those entries.',
     inputSchema: {
       type: 'object',
       properties: {
         device: {
           type: 'string',
-          description: 'Device name. Ignored until more than one device exists.',
+          description: 'Registry device name. Omitted means the default device.',
         },
         image: {
           type: 'string',
@@ -815,13 +821,13 @@ const tools: Tool[] = [
   },
   {
     name: 'pikvm_msd_eject',
-    description: 'Disconnect the virtual drive. expectImage must equal the current drive image name, or an empty string when none is selected. Safe to repeat: a second eject returns alreadyDisconnected.',
+    description: 'Disconnect the virtual drive. expectImage must equal the current drive image name, or an empty string when none is selected. A mismatch is MsdExpectImageError and does not change the drive. Safe to repeat: a second eject returns alreadyDisconnected.',
     inputSchema: {
       type: 'object',
       properties: {
         device: {
           type: 'string',
-          description: 'Device name. Ignored until more than one device exists.',
+          description: 'Registry device name. Omitted means the default device.',
         },
         expectImage: {
           type: 'string',
@@ -833,13 +839,13 @@ const tools: Tool[] = [
   },
   {
     name: 'pikvm_msd_upload',
-    description: 'Upload a local image into PiKVM storage and return a jobId immediately after the file is confined. Hashing and the kvmd pre-check run in the job, which is hashing, then running, then awaiting_catalog. A sha256 mismatch fails the job and uploads nothing. After kvmd accepts the bytes the job waits for that image to be present, complete, and the expected size. PIKVM_MSD_CATALOG_TIMEOUT means the write was accepted and the image may still appear. PIKVM_MSD_IMAGE_INCOMPLETE means the row stayed incomplete until the deadline. PIKVM_MSD_SIZE_MISMATCH means a complete row has the wrong size and fails at once. PIKVM_MSD_CANCELLED means the wait was cancelled. PIKVM_MSD_REMOVAL_UNCONFIRMED means cleanup could not prove the image is gone. The upload POST is not repeated. A second upload while one is running is refused. file is a bare name under PIKVM_MSD_LOCAL_DIR. confirmImage must equal file. The drive is not changed. Poll pikvm_msd_job. Hidden while PIKVM_MSD_LOCAL_DIR is unset.',
+    description: 'Upload a local image into PiKVM storage and return a jobId immediately after the file is confined. Hashing and the kvmd pre-check run in the job, which is hashing, then running, then awaiting_catalog. A sha256 mismatch fails the job and uploads nothing. After kvmd accepts the bytes the job waits for that image to be present, complete, and the expected size. PIKVM_MSD_CATALOG_TIMEOUT means the write was accepted and the image may still appear. PIKVM_MSD_IMAGE_INCOMPLETE means the row stayed incomplete until the deadline. PIKVM_MSD_SIZE_MISMATCH means a complete row has the wrong size and fails at once. An incomplete row whose size already differs keeps waiting. PIKVM_MSD_CANCELLED means the wait was cancelled. PIKVM_MSD_REMOVAL_UNCONFIRMED means cleanup could not prove the image is gone. The upload POST is not repeated. Catalog-failure cleanup holds the MSD lock until that check finishes. A file-close failure after the image is in the catalog removes it before the job is failed. A second upload while one is running is refused. file is a bare name under PIKVM_MSD_LOCAL_DIR. confirmImage must equal file. The drive is not changed. Poll pikvm_msd_job. Hidden while PIKVM_MSD_LOCAL_DIR is unset.',
     inputSchema: {
       type: 'object',
       properties: {
         device: {
           type: 'string',
-          description: 'Device name. Ignored until more than one device exists.',
+          description: 'Registry device name. Omitted means the default device.',
         },
         file: {
           type: 'string',
@@ -859,13 +865,13 @@ const tools: Tool[] = [
   },
   {
     name: 'pikvm_msd_fetch_url',
-    description: 'Download an image from an allowlisted https URL into PiKVM storage and return a jobId immediately. The URL must be https, have no userinfo, and match PIKVM_MSD_URL_ALLOWLIST. image defaults to the last path segment. confirmImage must equal the final name. DNS, the address check, the kvmd pre-check, and the download run in the job. After write_remote accepts the bytes the job waits for that image to be complete in the catalog, with the same PIKVM_MSD_CATALOG_TIMEOUT, PIKVM_MSD_IMAGE_INCOMPLETE, PIKVM_MSD_SIZE_MISMATCH, PIKVM_MSD_CANCELLED, and PIKVM_MSD_REMOVAL_UNCONFIRMED results as an upload. The remote write is not repeated. A second transfer while one is running is refused. The drive is not changed. Poll pikvm_msd_job. Hidden while the allowlist has no https entry.',
+    description: 'Download an image from an allowlisted https URL into PiKVM storage and return a jobId immediately. The URL must be https, have no userinfo, and match PIKVM_MSD_URL_ALLOWLIST. image defaults to the last path segment. confirmImage must equal the final name. DNS, the address check, the kvmd pre-check, and the download run in the job. After write_remote accepts the bytes the job waits for that image to be complete in the catalog. Cleanup after that wait fails holds the MSD lock until it finishes, with the same PIKVM_MSD_CATALOG_TIMEOUT, PIKVM_MSD_IMAGE_INCOMPLETE, PIKVM_MSD_SIZE_MISMATCH, PIKVM_MSD_CANCELLED, and PIKVM_MSD_REMOVAL_UNCONFIRMED results as an upload. The remote write is not repeated. A second transfer while one is running is refused. The drive is not changed. Poll pikvm_msd_job. Hidden while the allowlist has no https entry.',
     inputSchema: {
       type: 'object',
       properties: {
         device: {
           type: 'string',
-          description: 'Device name. Ignored until more than one device exists.',
+          description: 'Registry device name. Omitted means the default device.',
         },
         url: {
           type: 'string',
@@ -905,7 +911,7 @@ const tools: Tool[] = [
       properties: {
         device: {
           type: 'string',
-          description: 'Device name. Ignored until more than one device exists.',
+          description: 'Registry device name. Omitted means the default device.',
         },
         image: {
           type: 'string',
@@ -943,9 +949,10 @@ for (const tool of tools) {
 /**
  * Build a fresh MCP Server with all handlers registered.
  *
- * `deps` are shared across all instances (one PiKVM device, one busy-lock);
- * per-HTTP-session instances exist to satisfy the Streamable HTTP session
- * model, which requires one transport (and therefore one Server) per session.
+ * `deps` are shared across all instances. The fleet has one PiKVMClient
+ * and one BusyLock per device. Per-HTTP-session instances exist to satisfy
+ * the Streamable HTTP session model, which requires one transport (and
+ * therefore one Server) per session.
  */
 export function createMcpServer(deps: McpServerDeps): Server {
   const ocrRuntime = deps.ocr ?? offOcr();
@@ -1458,6 +1465,7 @@ export function createMcpServer(deps: McpServerDeps): Server {
             beforeHash: deps.msd?.beforeHash,
             beforeUploadStream: deps.msd?.beforeUploadStream,
             beforeSlotRelease: deps.msd?.beforeSlotRelease,
+            closeFile: deps.msd?.closeFile,
             uploadPollMs: deps.msd?.uploadPollMs,
             jobLimit: deps.msd?.jobLimit,
             jobTtlMs: deps.msd?.jobTtlMs,

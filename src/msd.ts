@@ -12,6 +12,7 @@
 // Modified 2026-10 by PLN: catalog readiness after a successful write (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a stable wrong size fails at once, and an unseen image is confirmed briefly (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: the upload slot is free before a job looks finished (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: eject expectImage is typed, and catalog cleanup keeps the MSD lock (GPL-3.0; see NOTICE).
 
 /**
  * Policy for MSD status, mount, eject, upload, and remove.
@@ -22,7 +23,8 @@
  * fail-fast try-lock, so a second upload or URL fetch is refused and a
  * transfer does not queue mount or eject. Mount refuses an image that
  * already has an active transfer. After a successful write, the catalog
- * wait holds that mutex until the image is ready or the budget ends.
+ * wait holds that mutex until the image is ready, or until cleanup after
+ * that wait fails has finished.
  */
 
 import { createHash, randomBytes } from 'node:crypto';
@@ -233,7 +235,11 @@ export interface MountSuccess {
 export interface MountFailure {
   error: ErrorFields;
   restored: MsdDriveState | null;
-  /** Every rollback step that failed, in order. Omitted when rollback succeeded. */
+  /**
+   * One entry per failed step, including the re-read. An NBD or URL
+   * snapshot adds a synthetic entry because that image cannot be restored.
+   * Omitted when every step succeeded.
+   */
   rollbackError?: ErrorFields[];
 }
 
@@ -352,8 +358,9 @@ async function disconnect(client: PiKVMClient): Promise<void> {
 /**
  * Restores the snapshot. An NBD or other URL selected as the drive image
  * cannot be restored: msdSetParams refuses any name containing '://' and
- * does not send it. That refusal is recorded with any later rollback
- * errors; the previous URL image stays unrestored.
+ * does not send it. That refusal is a rollbackError entry, as is a
+ * failure of the final state re-read. The previous URL image stays
+ * unrestored.
  */
 async function rollback(
   client: PiKVMClient,
@@ -407,7 +414,7 @@ async function ejectMsdLocked(
   const state = await client.getMsdState();
   const current = imageName(state.drive);
   if (current !== expectImage) {
-    throw new Error(`expectImage mismatch: drive image is ${JSON.stringify(current)}`);
+    throw new MsdExpectImageError(current);
   }
   try {
     await client.msdSetConnected(false);
@@ -504,7 +511,8 @@ export function mountMsd(client: PiKVMClient, request: MountRequest): Promise<Mo
  * Devices with an upload in progress. A second upload fails immediately
  * instead of waiting behind a transfer. Mount and eject do not take this
  * set, and the byte transfer does not take withMsdLock or BusyLock.
- * The catalog wait after a successful write does take withMsdLock.
+ * The catalog wait after a successful write takes withMsdLock, and
+ * cleanup after that wait fails stays inside the same hold.
  */
 const uploadHeld = new Set<string>();
 
@@ -635,6 +643,11 @@ export interface UploadRequest {
    * before the job becomes done or failed. Unset in production.
    */
   beforeSlotRelease?: () => Promise<void>;
+  /**
+   * Replaces fh.close for this job. Unset in production. The hook must
+   * close the handle. A rejection is a close failure.
+   */
+  closeFile?: (fh: FileHandle) => Promise<void>;
   /** Overrides the 1.5s storage.uploading poll. Unset in production. */
   uploadPollMs?: number;
   /** Retained-job cap for one device. Default 64. Unset in production. */
@@ -758,9 +771,14 @@ async function assertUploadAllowed(client: PiKVMClient, image: string, size: num
  * closed once, after the read. When the stream was never created,
  * only fh.close() runs.
  */
-function closeUpload(stream: Readable | undefined, fh: FileHandle): Promise<void> {
+function closeUpload(
+  stream: Readable | undefined,
+  fh: FileHandle,
+  closeFile?: (fh: FileHandle) => Promise<void>,
+): Promise<void> {
   stream?.destroy();
-  return fh.close().catch(() => undefined);
+  if (closeFile) return closeFile(fh);
+  return fh.close();
 }
 
 function readyBudget(value: number | undefined): number {
@@ -806,9 +824,14 @@ function catalogVerdict(
   const sizeKnown = expected !== undefined;
   const sizeOk = !sizeKnown || row.size === expected;
   if (row.complete === true && sizeOk) return 'ready';
+  // complete false keeps waiting until the deadline even when the size
+  // already differs. That size can still change, so it is not a mismatch.
+  if (row.complete !== true) {
+    if (row.size > 0) return 'incomplete';
+    return 'wait';
+  }
   if (sizeKnown && row.size > 0 && row.size !== expected) return 'size';
-  if (row.complete === true && !sizeOk) return 'size';
-  if (row.complete !== true && row.size > 0) return 'incomplete';
+  if (!sizeOk) return 'size';
   return 'wait';
 }
 
@@ -1023,6 +1046,29 @@ function failJob(job: JobRecord, err: unknown): void {
   job.error = errorFields(err);
 }
 
+/**
+ * Remove an image we already wrote. The caller holds the MSD mutex for
+ * this device. confirmImageAbsent would take that mutex again and wait
+ * on this same hold.
+ */
+async function cleanupStoredImageLocked(
+  client: PiKVMClient,
+  image: string,
+  err: unknown,
+  readyMs: number,
+  job: JobRecord,
+): Promise<void> {
+  const budgets = cleanupBudgets(err, readyMs);
+  const cleanup = await confirmImageAbsentLocked(
+    client,
+    image,
+    budgets.timeoutMs,
+    budgets.unseenMs,
+  );
+  job.removed = cleanup.removed;
+  if (cleanup.removeError) job.removeError = cleanup.removeError;
+}
+
 async function runUpload(
   client: PiKVMClient,
   request: UploadRequest,
@@ -1046,6 +1092,7 @@ async function runUpload(
   let wrote = false;
   let slotFree = false;
   let published = false;
+  let cleaned = false;
   try {
     if (request.beforeHash) await request.beforeHash();
     const prehash = await hashFd(fh, size);
@@ -1091,27 +1138,29 @@ async function runUpload(
     if (digest !== prehash) throw new Error('sha256 changed while uploading');
     if (result.written !== size) throw new Error('written does not match size');
     job.state = 'awaiting_catalog';
+    const readyMs = readyBudget(request.readyTimeoutMs);
     await withMsdLock(device, async () => {
-      await waitForCatalog(
-        client,
-        file,
-        size,
-        readyBudget(request.readyTimeoutMs),
-        job.abort.signal,
-      );
+      try {
+        await waitForCatalog(client, file, size, readyMs, job.abort.signal);
+      } catch (err) {
+        if (failure === undefined) failure = err;
+        await cleanupHeld(err);
+        return;
+      }
       job.bytes = size;
       // The slot is free before done is visible, and done is visible
-      // before this lock lets a queued mount run.
+      // before this lock lets a queued mount run. A close failure after
+      // the image is in the catalog removes it before that lock drops.
       await releaseSlot();
       if (failure !== undefined) {
-        publishFailure();
+        await cleanupHeld(failure);
         return;
       }
       publishSuccess();
     });
   } catch (err) {
     if (failure === undefined) failure = err;
-    if (wrote && !published) {
+    if (wrote && !published && !cleaned) {
       const readyMs = readyBudget(request.readyTimeoutMs);
       const budgets = cleanupBudgets(err, readyMs);
       const cleanup = await removeUploadedImage(
@@ -1121,6 +1170,7 @@ async function runUpload(
         budgets.timeoutMs,
         budgets.unseenMs,
       );
+      cleaned = true;
       job.removed = cleanup.removed;
       if (cleanup.removeError) job.removeError = cleanup.removeError;
     }
@@ -1154,7 +1204,7 @@ async function runUpload(
   async function releaseSlot(): Promise<void> {
     if (slotFree) return;
     try {
-      await closeUpload(stream, fh);
+      await closeUpload(stream, fh, request.closeFile);
       if (request.beforeSlotRelease) await request.beforeSlotRelease();
     } catch (err) {
       if (failure === undefined) failure = err;
@@ -1162,6 +1212,18 @@ async function runUpload(
       releaseUpload(device);
       slotFree = true;
     }
+  }
+
+  async function cleanupHeld(err: unknown): Promise<void> {
+    if (cleaned) return;
+    cleaned = true;
+    await cleanupStoredImageLocked(
+      client,
+      file,
+      err,
+      readyBudget(request.readyTimeoutMs),
+      job,
+    );
   }
 }
 
@@ -1280,6 +1342,7 @@ async function runFetch(
   let last: MsdWriteResult | undefined;
   let slotFree = false;
   let published = false;
+  let cleaned = false;
   try {
     if (request.beforeFetch) await request.beforeFetch();
     const addresses = await resolveFetchHost(inspected.hostname, request.resolveUrl);
@@ -1305,20 +1368,21 @@ async function runFetch(
     job.bytes = last.written;
     job.total = last.size;
     job.state = 'awaiting_catalog';
+    const readyMs = readyBudget(request.readyTimeoutMs);
     await withMsdLock(device, async () => {
-      await waitForCatalog(
-        client,
-        image,
-        expected,
-        readyBudget(request.readyTimeoutMs),
-        job.abort.signal,
-      );
+      try {
+        await waitForCatalog(client, image, expected, readyMs, job.abort.signal);
+      } catch (err) {
+        if (failure === undefined) failure = err;
+        if (!isStateUnknown(err)) await cleanupFetchHeld(err);
+        return;
+      }
       releaseFetchSlot();
       publishFetchSuccess();
     });
   } catch (err) {
     if (failure === undefined) failure = err;
-    if (sawOurImage && !published && !isStateUnknown(err)) {
+    if (sawOurImage && !published && !cleaned && !isStateUnknown(err)) {
       const readyMs = readyBudget(request.readyTimeoutMs);
       const budgets = cleanupBudgets(err, readyMs);
       const cleanup = await removeUploadedImage(
@@ -1328,6 +1392,7 @@ async function runFetch(
         budgets.timeoutMs,
         budgets.unseenMs,
       );
+      cleaned = true;
       job.removed = cleanup.removed;
       if (cleanup.removeError) job.removeError = cleanup.removeError;
     }
@@ -1344,6 +1409,18 @@ async function runFetch(
     if (slotFree) return;
     releaseUpload(device);
     slotFree = true;
+  }
+
+  async function cleanupFetchHeld(err: unknown): Promise<void> {
+    if (cleaned) return;
+    cleaned = true;
+    await cleanupStoredImageLocked(
+      client,
+      image,
+      err,
+      readyBudget(request.readyTimeoutMs),
+      job,
+    );
   }
 
   function publishFetchSuccess(): void {
