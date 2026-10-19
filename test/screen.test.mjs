@@ -1,5 +1,6 @@
 // Modified 2026-10 by PLN: screenshot defaults, crop, metadata, and OCR (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: frame tests watch crashes, and a capture cannot change a resolved move (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: the HID-send capture test names the mapping it keeps (GPL-3.0; see NOTICE).
 
 /**
  * Preview defaults, local crop, coordinate metadata, and optional OCR.
@@ -864,7 +865,12 @@ test('an evicted or cross-device frameId sends no HID', async (t) => {
   }
 });
 
-test('a full capture between resolve and send keeps the resolved frame', async (t) => {
+// The held GET /api/streamer is the resolution refresh inside the move,
+// after the click coordinates were already mapped. A full capture that
+// finishes during that read leaves the HID mapping and the echo on the
+// frame that was current when the click started. The next click uses
+// the capture that replaced the preview.
+test('a capture during the HID send leaves the mapping alone', async (t) => {
   watchCrashes(t);
   const mock = await startKvmdMock();
   try {

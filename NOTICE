@@ -35,6 +35,7 @@ Modified 2026-10 by PLN: OCR is not retried after it is sent (GPL-3.0; see below
 Modified 2026-10 by PLN: redaction stays bounded, and sharp refuses an oversized image (GPL-3.0; see below).
 Modified 2026-10 by PLN: a mouse echo is the frame that move applied (GPL-3.0; see below).
 Modified 2026-10 by PLN: an MSD write waits until the catalog shows that image (GPL-3.0; see below).
+Modified 2026-10 by PLN: the HID-send capture test names the mapping it keeps (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -732,4 +733,11 @@ No code from another pikvm_mcp_server fork was added for these methods.
   the result is PIKVM_MSD_REMOVAL_UNCONFIRMED. The hardware cycle
   requires every name that run created to be absent at the end, and
   still leaves unrelated mcp-hwtest images in place.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  The capture test that holds GET /api/streamer during a click states
+  what it checks: a full capture during the HID send leaves the mapping
+  and the echo alone. That hold is the resolution refresh inside the
+  move, after the coordinates were mapped.
   No code from another pikvm_mcp_server fork was copied.
