@@ -11,6 +11,7 @@
 // Modified 2026-10 by PLN: the retained-job cap is per device (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: catalog readiness after a successful write (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a stable wrong size fails at once, and an unseen image is confirmed briefly (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: the upload slot is free before a job looks finished (GPL-3.0; see NOTICE).
 
 /**
  * Policy for MSD status, mount, eject, upload, and remove.
@@ -629,6 +630,11 @@ export interface UploadRequest {
   beforeHash?: () => Promise<void>;
   /** Awaited in the upload body before the file is read. Unset in production. */
   beforeUploadStream?: () => Promise<void>;
+  /**
+   * Awaited after the file is closed, while the slot is still held, and
+   * before the job becomes done or failed. Unset in production.
+   */
+  beforeSlotRelease?: () => Promise<void>;
   /** Overrides the 1.5s storage.uploading poll. Unset in production. */
   uploadPollMs?: number;
   /** Retained-job cap for one device. Default 64. Unset in production. */
@@ -1033,9 +1039,13 @@ async function runUpload(
     : UPLOAD_POLL_MS;
   let stream: Readable | undefined;
   let timer: ReturnType<typeof setInterval> | undefined;
+  let failure: unknown;
+  let digest = '';
   const signal = { bad: '' };
   const sent = { n: 0 };
   let wrote = false;
+  let slotFree = false;
+  let published = false;
   try {
     if (request.beforeHash) await request.beforeHash();
     const prehash = await hashFd(fh, size);
@@ -1075,7 +1085,7 @@ async function runUpload(
       clearInterval(timer);
       timer = undefined;
     }
-    const digest = hash.digest('hex');
+    digest = hash.digest('hex');
     job.sha256 = digest;
     if (signal.bad) throw new Error(signal.bad);
     if (digest !== prehash) throw new Error('sha256 changed while uploading');
@@ -1090,12 +1100,18 @@ async function runUpload(
         job.abort.signal,
       );
       job.bytes = size;
-      job.state = 'done';
-      job.finishedAt = Date.now();
+      // The slot is free before done is visible, and done is visible
+      // before this lock lets a queued mount run.
+      await releaseSlot();
+      if (failure !== undefined) {
+        publishFailure();
+        return;
+      }
+      publishSuccess();
     });
-    logMsd('msd_upload', device, file, true, undefined, { bytes: size, sha256: digest });
   } catch (err) {
-    if (wrote) {
+    if (failure === undefined) failure = err;
+    if (wrote && !published) {
       const readyMs = readyBudget(request.readyTimeoutMs);
       const budgets = cleanupBudgets(err, readyMs);
       const cleanup = await removeUploadedImage(
@@ -1108,16 +1124,44 @@ async function runUpload(
       job.removed = cleanup.removed;
       if (cleanup.removeError) job.removeError = cleanup.removeError;
     }
-    failJob(job, err);
+  } finally {
+    if (timer) clearInterval(timer);
+    if (!slotFree) await releaseSlot();
+    if (!published) {
+      if (failure !== undefined) publishFailure();
+      else publishSuccess();
+    }
+    pruneJobs(jobLimitOf(request.jobLimit), jobTtlOf(request.jobTtlMs));
+  }
+
+  function publishSuccess(): void {
+    published = true;
+    job.state = 'done';
+    job.finishedAt = Date.now();
+    logMsd('msd_upload', device, file, true, undefined, { bytes: size, sha256: digest });
+  }
+
+  function publishFailure(): void {
+    published = true;
+    failJob(job, failure);
     logMsd('msd_upload', device, file, false, job.error?.type ?? 'Error', {
       bytes: job.bytes,
       ...(job.sha256 ? { sha256: job.sha256 } : {}),
       ...(job.removed !== undefined ? { removed: job.removed } : {}),
     });
-  } finally {
-    if (timer) clearInterval(timer);
-    await closeUpload(stream, fh);
-    pruneJobs(jobLimitOf(request.jobLimit), jobTtlOf(request.jobTtlMs));
+  }
+
+  async function releaseSlot(): Promise<void> {
+    if (slotFree) return;
+    try {
+      await closeUpload(stream, fh);
+      if (request.beforeSlotRelease) await request.beforeSlotRelease();
+    } catch (err) {
+      if (failure === undefined) failure = err;
+    } finally {
+      releaseUpload(device);
+      slotFree = true;
+    }
   }
 }
 
@@ -1154,8 +1198,7 @@ export async function startMsdUpload(
   const jobId = randomBytes(16).toString('hex');
   jobs.set(jobId, job);
   pruneJobs(jobLimitOf(request.jobLimit), jobTtlOf(request.jobTtlMs));
-  void runUpload(client, request, opened.fh, opened.size, expected, job)
-    .finally(() => releaseUpload(device));
+  void runUpload(client, request, opened.fh, opened.size, expected, job);
   return { jobId };
 }
 
@@ -1233,12 +1276,15 @@ async function runFetch(
 ): Promise<void> {
   const { device } = request;
   let sawOurImage = false;
+  let failure: unknown;
+  let last: MsdWriteResult | undefined;
+  let slotFree = false;
+  let published = false;
   try {
     if (request.beforeFetch) await request.beforeFetch();
     const addresses = await resolveFetchHost(inspected.hostname, request.resolveUrl);
     assertResolvedAddresses(addresses, request.allow, request.allowPrivate);
     await assertFetchAllowed(client, image);
-    let last: MsdWriteResult | undefined;
     for await (const row of client.msdWriteRemote(inspected.href, {
       image,
       removeIncomplete: true,
@@ -1267,12 +1313,12 @@ async function runFetch(
         readyBudget(request.readyTimeoutMs),
         job.abort.signal,
       );
-      job.state = 'done';
-      job.finishedAt = Date.now();
+      releaseFetchSlot();
+      publishFetchSuccess();
     });
-    logMsd('msd_fetch', device, image, true, undefined, { bytes: last.written });
   } catch (err) {
-    if (sawOurImage && !isStateUnknown(err)) {
+    if (failure === undefined) failure = err;
+    if (sawOurImage && !published && !isStateUnknown(err)) {
       const readyMs = readyBudget(request.readyTimeoutMs);
       const budgets = cleanupBudgets(err, readyMs);
       const cleanup = await removeUploadedImage(
@@ -1285,13 +1331,35 @@ async function runFetch(
       job.removed = cleanup.removed;
       if (cleanup.removeError) job.removeError = cleanup.removeError;
     }
-    failJob(job, err);
+  } finally {
+    if (!slotFree) releaseFetchSlot();
+    if (!published) {
+      if (failure !== undefined) publishFetchFailure();
+      else publishFetchSuccess();
+    }
+    pruneJobs(jobLimitOf(request.jobLimit), jobTtlOf(request.jobTtlMs));
+  }
+
+  function releaseFetchSlot(): void {
+    if (slotFree) return;
+    releaseUpload(device);
+    slotFree = true;
+  }
+
+  function publishFetchSuccess(): void {
+    published = true;
+    job.state = 'done';
+    job.finishedAt = Date.now();
+    logMsd('msd_fetch', device, image, true, undefined, { bytes: last?.written ?? job.bytes });
+  }
+
+  function publishFetchFailure(): void {
+    published = true;
+    failJob(job, failure);
     logMsd('msd_fetch', device, image, false, job.error?.type ?? 'Error', {
       bytes: job.bytes,
       ...(job.removed !== undefined ? { removed: job.removed } : {}),
     });
-  } finally {
-    pruneJobs(jobLimitOf(request.jobLimit), jobTtlOf(request.jobTtlMs));
   }
 }
 
@@ -1320,7 +1388,6 @@ export async function startMsdFetch(
   const jobId = randomBytes(16).toString('hex');
   jobs.set(jobId, job);
   pruneJobs(jobLimitOf(request.jobLimit), jobTtlOf(request.jobTtlMs));
-  void runFetch(client, request, inspected, image, job)
-    .finally(() => releaseUpload(request.device));
+  void runFetch(client, request, inspected, image, job);
   return { jobId };
 }

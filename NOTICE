@@ -38,6 +38,7 @@ Modified 2026-10 by PLN: an MSD write waits until the catalog shows that image (
 Modified 2026-10 by PLN: the HID-send capture test names the mapping it keeps (GPL-3.0; see below).
 Modified 2026-10 by PLN: a stable wrong size fails at once, and an unseen image is confirmed briefly (GPL-3.0; see below).
 Modified 2026-10 by PLN: Windows ESM specifiers, POSIX fixture skips, and hardware docs (GPL-3.0; see below).
+Modified 2026-10 by PLN: the upload slot is free before a job looks finished (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -769,4 +770,12 @@ No code from another pikvm_mcp_server fork was added for these methods.
   the ten self-skipped tests, and describes Tailscale as an example
   topology. The tool count follows OCR visibility, arm flags, and
   whether a registry is configured.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  An upload or fetch job stays hashing, running, or awaiting_catalog
+  until its file is closed and the upload slot is released. Only then
+  does the job become done or failed. A poll that sees a finished job
+  can start another transfer without hitting "upload already running"
+  from the slot that job still held.
   No code from another pikvm_mcp_server fork was copied.

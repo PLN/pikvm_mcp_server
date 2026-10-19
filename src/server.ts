@@ -15,6 +15,7 @@
 // Modified 2026-10 by PLN: mouse tools pass the resolved click frame (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: MSD jobs wait for the catalog (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: catalog error codes on the upload and fetch tools (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: test hook before the upload slot is released (GPL-3.0; see NOTICE).
 
 /**
  * MCP server factory for PiKVM tools
@@ -107,6 +108,7 @@ export interface McpServerDeps {
 export interface MsdServerConfig extends MsdConfig {
   beforeHash?: () => Promise<void>;
   beforeUploadStream?: () => Promise<void>;
+  beforeSlotRelease?: () => Promise<void>;
   beforeFetch?: () => Promise<void>;
   /** Hostname to addresses. Unset uses DNS, and does not resolve IP literals. */
   resolveUrl?: (hostname: string) => Promise<string[]>;
@@ -1416,6 +1418,7 @@ export function createMcpServer(deps: McpServerDeps): Server {
             sha256,
             beforeHash: deps.msd?.beforeHash,
             beforeUploadStream: deps.msd?.beforeUploadStream,
+            beforeSlotRelease: deps.msd?.beforeSlotRelease,
             uploadPollMs: deps.msd?.uploadPollMs,
             jobLimit: deps.msd?.jobLimit,
             jobTtlMs: deps.msd?.jobTtlMs,

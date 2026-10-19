@@ -11,6 +11,7 @@
 // Modified 2026-10 by PLN: catalog readiness and confirmed removal (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: stable size mismatch, unseen confirm, and the readiness deadline (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: symlink and FIFO path checks follow the platform (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: a finished job has already released the upload slot (GPL-3.0; see NOTICE).
 
 /**
  * MSD tools against the mock. The HTTP harness matches test/http.test.mjs.
@@ -1268,6 +1269,59 @@ test('upload, remove, and job polling', { timeout: 120000 }, async (t) => {
         const kept = JSON.parse((await callTool(base, sessionId, 'pikvm_msd_job', { jobId: ids[2] })).content[0].text);
         assert.equal(kept.state, 'failed');
       });
+    });
+  });
+
+  await t.test('a failed job stays unfinished until the upload slot is free', async (inner) => {
+    watchCrashes(inner);
+    await withDir(async (dir) => {
+      await writeFile(join(dir, 'disk.img'), body);
+      let release;
+      const flags = uploadMsd(dir, {
+        beforeSlotRelease: () => new Promise((resolve) => { release = resolve; }),
+      });
+      try {
+        await withSession({ images: [] }, flags, async ({ mock, base, sessionId }) => {
+          const started = await callTool(base, sessionId, 'pikvm_msd_upload', {
+            file: 'disk.img',
+            confirmImage: 'disk.img',
+            sha256: 'a'.repeat(64),
+          });
+          assert.equal(started.isError, undefined, started.content[0].text);
+          const { jobId } = JSON.parse(started.content[0].text);
+          assert.equal(await waitFor(() => typeof release === 'function'), true);
+          const mid = JSON.parse((await callTool(base, sessionId, 'pikvm_msd_job', { jobId })).content[0].text);
+          assert.equal(mid.state, 'hashing');
+          const other = await openSession(base);
+          const refused = await callTool(base, other, 'pikvm_msd_upload', {
+            file: 'disk.img',
+            confirmImage: 'disk.img',
+            sha256: 'a'.repeat(64),
+          });
+          assert.equal(refused.isError, true);
+          assert.match(refused.content[0].text, /upload already running/);
+          assert.deepEqual(mock.calls, []);
+          release();
+          release = undefined;
+          const failed = await pollJob(base, sessionId, jobId);
+          assert.equal(failed.state, 'failed');
+          assert.match(failed.error.message, /sha256 mismatch/);
+          const next = await callTool(base, sessionId, 'pikvm_msd_upload', {
+            file: 'disk.img',
+            confirmImage: 'disk.img',
+            sha256: 'b'.repeat(64),
+          });
+          assert.equal(next.isError, undefined, next.content[0].text);
+          const nextId = JSON.parse(next.content[0].text).jobId;
+          assert.equal(await waitFor(() => typeof release === 'function'), true);
+          release();
+          release = undefined;
+          const nextFailed = await pollJob(base, sessionId, nextId);
+          assert.equal(nextFailed.state, 'failed');
+        });
+      } finally {
+        if (release) release();
+      }
     });
   });
 
