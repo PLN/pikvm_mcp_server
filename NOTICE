@@ -36,6 +36,7 @@ Modified 2026-10 by PLN: redaction stays bounded, and sharp refuses an oversized
 Modified 2026-10 by PLN: a mouse echo is the frame that move applied (GPL-3.0; see below).
 Modified 2026-10 by PLN: an MSD write waits until the catalog shows that image (GPL-3.0; see below).
 Modified 2026-10 by PLN: the HID-send capture test names the mapping it keeps (GPL-3.0; see below).
+Modified 2026-10 by PLN: a stable wrong size fails at once, and an unseen image is confirmed briefly (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -733,6 +734,20 @@ No code from another pikvm_mcp_server fork was added for these methods.
   the result is PIKVM_MSD_REMOVAL_UNCONFIRMED. The hardware cycle
   requires every name that run created to be absent at the end, and
   still leaves unrelated mcp-hwtest images in place.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  A complete catalog row whose size is already wrong fails at once
+  with PIKVM_MSD_SIZE_MISMATCH. An incomplete row keeps polling until
+  the readiness deadline. That deadline is wall time and includes each
+  GET /api/msd, so a slow read is aborted when the budget ends.
+  Cleanup of an image that never appeared uses MSD_UNSEEN_CONFIRM_MS
+  (750 ms, or the readiness budget when that is shorter). If the image
+  appears during that check, removal is confirmed for the full
+  readiness budget. The upload and fetch descriptions name
+  PIKVM_MSD_IMAGE_INCOMPLETE, PIKVM_MSD_SIZE_MISMATCH,
+  PIKVM_MSD_CANCELLED, and PIKVM_MSD_REMOVAL_UNCONFIRMED next to
+  PIKVM_MSD_CATALOG_TIMEOUT.
   No code from another pikvm_mcp_server fork was copied.
 
 2026-10, by PLN:

@@ -14,6 +14,7 @@
 // Modified 2026-10 by PLN: OCR stays listed until a device says disabled (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: mouse tools pass the resolved click frame (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: MSD jobs wait for the catalog (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: catalog error codes on the upload and fetch tools (GPL-3.0; see NOTICE).
 
 /**
  * MCP server factory for PiKVM tools
@@ -803,7 +804,7 @@ const tools: Tool[] = [
   },
   {
     name: 'pikvm_msd_upload',
-    description: 'Upload a local image into PiKVM storage and return a jobId immediately after the file is confined. Hashing and the kvmd pre-check run in the job, which is hashing, then running, then awaiting_catalog. A sha256 mismatch fails the job and uploads nothing. After kvmd accepts the bytes the job waits for that image to be complete in the catalog. The upload POST is not repeated. A second upload while one is running is refused. file is a bare name under PIKVM_MSD_LOCAL_DIR. confirmImage must equal file. The drive is not changed. Poll pikvm_msd_job. Hidden while PIKVM_MSD_LOCAL_DIR is unset.',
+    description: 'Upload a local image into PiKVM storage and return a jobId immediately after the file is confined. Hashing and the kvmd pre-check run in the job, which is hashing, then running, then awaiting_catalog. A sha256 mismatch fails the job and uploads nothing. After kvmd accepts the bytes the job waits for that image to be present, complete, and the expected size. PIKVM_MSD_CATALOG_TIMEOUT means the write was accepted and the image may still appear. PIKVM_MSD_IMAGE_INCOMPLETE means the row stayed incomplete until the deadline. PIKVM_MSD_SIZE_MISMATCH means a complete row has the wrong size and fails at once. PIKVM_MSD_CANCELLED means the wait was cancelled. PIKVM_MSD_REMOVAL_UNCONFIRMED means cleanup could not prove the image is gone. The upload POST is not repeated. A second upload while one is running is refused. file is a bare name under PIKVM_MSD_LOCAL_DIR. confirmImage must equal file. The drive is not changed. Poll pikvm_msd_job. Hidden while PIKVM_MSD_LOCAL_DIR is unset.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -829,7 +830,7 @@ const tools: Tool[] = [
   },
   {
     name: 'pikvm_msd_fetch_url',
-    description: 'Download an image from an allowlisted https URL into PiKVM storage and return a jobId immediately. The URL must be https, have no userinfo, and match PIKVM_MSD_URL_ALLOWLIST. image defaults to the last path segment. confirmImage must equal the final name. DNS, the address check, the kvmd pre-check, and the download run in the job. After write_remote accepts the bytes the job waits for that image to be complete in the catalog. The remote write is not repeated. A second transfer while one is running is refused. The drive is not changed. Poll pikvm_msd_job. Hidden while the allowlist has no https entry.',
+    description: 'Download an image from an allowlisted https URL into PiKVM storage and return a jobId immediately. The URL must be https, have no userinfo, and match PIKVM_MSD_URL_ALLOWLIST. image defaults to the last path segment. confirmImage must equal the final name. DNS, the address check, the kvmd pre-check, and the download run in the job. After write_remote accepts the bytes the job waits for that image to be complete in the catalog, with the same PIKVM_MSD_CATALOG_TIMEOUT, PIKVM_MSD_IMAGE_INCOMPLETE, PIKVM_MSD_SIZE_MISMATCH, PIKVM_MSD_CANCELLED, and PIKVM_MSD_REMOVAL_UNCONFIRMED results as an upload. The remote write is not repeated. A second transfer while one is running is refused. The drive is not changed. Poll pikvm_msd_job. Hidden while the allowlist has no https entry.',
     inputSchema: {
       type: 'object',
       properties: {

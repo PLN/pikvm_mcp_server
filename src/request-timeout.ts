@@ -2,6 +2,7 @@
 // Modified 2026-10 by PLN: MSD upload job and idle deadlines (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: cap MSD job at 7 days and idle at 1 hour (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: MSD catalog readiness budget (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: short confirm when an image never appeared (GPL-3.0; see NOTICE).
 
 /** Default abort deadline for one ordinary kvmd call. */
 export const REQUEST_TIMEOUT_DEFAULT_MS = 5000;
@@ -59,6 +60,14 @@ export const MSD_READY_TIMEOUT_DEFAULT_MS = 30 * 1000;
 
 /** Ten minutes. A longer catalog wait is clamped to this. */
 export const MSD_READY_TIMEOUT_MAX_MS = 10 * 60 * 1000;
+
+/**
+ * Cleanup budget when the catalog wait never saw the image.
+ * Three polls: an immediate read, then 250 ms, then 500 ms.
+ * A shorter readiness budget wins. If the image appears during
+ * this window, confirmation switches to the readiness budget.
+ */
+export const MSD_UNSEEN_CONFIRM_MS = 750;
 
 /**
  * Parse an MSD deadline. Only a string of digits is accepted.

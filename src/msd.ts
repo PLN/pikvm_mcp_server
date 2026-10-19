@@ -10,6 +10,7 @@
 // Modified 2026-10 by PLN: job reads stay on the device that created them (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: the retained-job cap is per device (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: catalog readiness after a successful write (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: a stable wrong size fails at once, and an unseen image is confirmed briefly (GPL-3.0; see NOTICE).
 
 /**
  * Policy for MSD status, mount, eject, upload, and remove.
@@ -40,6 +41,7 @@ import {
 import {
   MSD_READY_TIMEOUT_DEFAULT_MS,
   MSD_READY_TIMEOUT_MAX_MS,
+  MSD_UNSEEN_CONFIRM_MS,
   normalizeMsdTimeoutMs,
 } from './request-timeout.js';
 import {
@@ -785,9 +787,10 @@ function catalogDelay(ms: number, image: string, signal: AbortSignal): Promise<v
  * One catalog row. Ready means that exact name is present, complete,
  * and the same size we wrote when the size is known. A missing row, or
  * a row whose size is still 0, is stale and keeps waiting. complete
- * false with a positive size is incomplete. A different positive size,
- * or a complete row of the wrong size, is a mismatch. The deadline
- * turns a stale row into PIKVM_MSD_CATALOG_TIMEOUT.
+ * false keeps waiting until the deadline even when the size is already
+ * different: that size can still change. A complete row of the wrong
+ * size is a stable mismatch and fails at once. The deadline turns a
+ * stale row into PIKVM_MSD_CATALOG_TIMEOUT.
  */
 function catalogVerdict(
   row: MsdImageRecord | undefined,
@@ -812,10 +815,49 @@ function catalogFailure(image: string, row: MsdImageRecord | undefined, expected
   return new MsdCatalogTimeoutError(image);
 }
 
+const CATALOG_SEEN = 'catalogSeen';
+
+function withCatalogSeen(err: unknown, seen: boolean): Error {
+  const error = err instanceof Error ? err : new Error('catalog wait failed');
+  if (Object.prototype.hasOwnProperty.call(error, CATALOG_SEEN)) return error;
+  Object.defineProperty(error, CATALOG_SEEN, { value: seen, enumerable: false });
+  return error;
+}
+
+function catalogSeen(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  return (err as { catalogSeen?: boolean }).catalogSeen === true;
+}
+
+/**
+ * One GET /api/msd that cannot outlive `deadlineAt` or `cancel`.
+ * The request time counts against the deadline: a slow read is aborted
+ * instead of being allowed to finish after the budget.
+ */
+async function readMsdState(
+  client: PiKVMClient,
+  deadlineAt: number,
+  cancel?: AbortSignal,
+): Promise<MsdState | 'deadline' | 'cancelled'> {
+  if (cancel?.aborted) return 'cancelled';
+  const left = deadlineAt - Date.now();
+  if (left <= 0) return 'deadline';
+  const attempt = AbortSignal.timeout(left);
+  const signal = cancel ? AbortSignal.any([attempt, cancel]) : attempt;
+  try {
+    return await client.getMsdState(signal);
+  } catch (err) {
+    if (cancel?.aborted) return 'cancelled';
+    if (attempt.aborted || Date.now() >= deadlineAt) return 'deadline';
+    throw err;
+  }
+}
+
 /**
  * GET /api/msd until the image is ready, or the budget ends.
  * Does not POST the upload or write_remote again. Holds no lock;
- * the caller holds the MSD mutex for the whole wait.
+ * the caller holds the MSD mutex for the whole wait. The budget is
+ * wall time from the start, including each catalog read.
  */
 async function waitForCatalog(
   client: PiKVMClient,
@@ -824,21 +866,37 @@ async function waitForCatalog(
   timeoutMs: number,
   signal: AbortSignal,
 ): Promise<void> {
-  const started = Date.now();
+  const deadlineAt = Date.now() + timeoutMs;
   let delayMs = CATALOG_POLL_MIN_MS;
   let last: MsdImageRecord | undefined;
-  for (;;) {
-    throwIfCancelled(image, signal);
-    const state = await client.getMsdState();
-    throwIfCancelled(image, signal);
-    last = state.images[image];
-    const verdict = catalogVerdict(last, expected);
-    if (verdict === 'ready') return;
-    const elapsed = Date.now() - started;
-    if (elapsed >= timeoutMs) throw catalogFailure(image, last, expected);
-    const wait = Math.min(delayMs, timeoutMs - elapsed);
-    await catalogDelay(wait, image, signal);
-    delayMs = Math.min(CATALOG_POLL_MAX_MS, delayMs * 2);
+  let seen = false;
+  try {
+    for (;;) {
+      if (signal.aborted) throw new MsdCancelledError(image);
+      const read = await readMsdState(client, deadlineAt, signal);
+      if (read === 'cancelled') throw new MsdCancelledError(image);
+      if (read === 'deadline') throw catalogFailure(image, last, expected);
+      if (Date.now() >= deadlineAt) {
+        last = read.images[image];
+        if (last) seen = true;
+        const late = catalogVerdict(last, expected);
+        if (late === 'ready') return;
+        throw catalogFailure(image, last, expected);
+      }
+      last = read.images[image];
+      if (last) seen = true;
+      const verdict = catalogVerdict(last, expected);
+      if (verdict === 'ready') return;
+      if (verdict === 'size' && last !== undefined && last.complete === true && expected !== undefined) {
+        throw new MsdSizeMismatchError(image, last.size, expected);
+      }
+      const remain = deadlineAt - Date.now();
+      if (remain <= 0) throw catalogFailure(image, last, expected);
+      await catalogDelay(Math.min(delayMs, remain), image, signal);
+      delayMs = Math.min(CATALOG_POLL_MAX_MS, delayMs * 2);
+    }
+  } catch (err) {
+    throw withCatalogSeen(err, seen);
   }
 }
 
@@ -863,53 +921,74 @@ export function cancelMsdJob(jobId: string): boolean {
  * appears during the budget, it is removed again. Anything else is
  * PIKVM_MSD_REMOVAL_UNCONFIRMED. The MSD mutex is held for the budget
  * so a mount cannot select the name while it is being confirmed.
+ * `unseenMs` is the budget while the name has not been seen. Once it
+ * appears, the budget becomes `timeoutMs` measured from the start.
+ * Each catalog read stops at that deadline.
  */
 export async function confirmImageAbsent(
   client: PiKVMClient,
   device: string,
   image: string,
   timeoutMs: number,
+  unseenMs?: number,
 ): Promise<{ removed: boolean; removeError?: ErrorFields }> {
-  return withMsdLock(device, () => confirmImageAbsentLocked(client, image, timeoutMs));
+  return withMsdLock(device, () => confirmImageAbsentLocked(client, image, timeoutMs, unseenMs));
 }
 
 async function confirmImageAbsentLocked(
   client: PiKVMClient,
   image: string,
   timeoutMs: number,
+  unseenMs?: number,
 ): Promise<{ removed: boolean; removeError?: ErrorFields }> {
   const started = Date.now();
   let delayMs = CATALOG_POLL_MIN_MS;
   let removedOnce = false;
+  let seen = false;
+  let lastAbsent = false;
   const signal = new AbortController().signal;
+  const budgetMs = (): number => (seen || unseenMs === undefined ? timeoutMs : unseenMs);
 
-  const take = async (): Promise<'absent' | 'removed'> => {
-    const state = await client.getMsdState();
-    const row = state.images[image];
-    if (!row) return 'absent';
+  const applyRow = async (state: MsdState): Promise<'absent' | 'removed'> => {
+    if (!state.images[image]) {
+      lastAbsent = true;
+      return 'absent';
+    }
+    lastAbsent = false;
+    seen = true;
     try {
       await client.msdRemove(image);
       removedOnce = true;
       return 'removed';
     } catch (err) {
-      if (err instanceof KvmdError && err.type === 'MsdUnknownImageError') return 'absent';
+      if (err instanceof KvmdError && err.type === 'MsdUnknownImageError') {
+        lastAbsent = true;
+        return 'absent';
+      }
       throw err;
     }
   };
 
   try {
     for (;;) {
-      const step = await take();
+      const deadlineAt = started + budgetMs();
+      if (deadlineAt - Date.now() <= 0) break;
+      const read = await readMsdState(client, deadlineAt);
+      if (read === 'deadline' || read === 'cancelled') break;
+      const step = await applyRow(read);
       if (step === 'absent' && removedOnce) return { removed: true };
-      const elapsed = Date.now() - started;
-      if (elapsed >= timeoutMs) break;
-      await catalogDelay(Math.min(delayMs, timeoutMs - elapsed), image, signal);
+      const remain = started + budgetMs() - Date.now();
+      if (remain <= 0) break;
+      await catalogDelay(Math.min(delayMs, remain), image, signal);
       delayMs = Math.min(CATALOG_POLL_MAX_MS, delayMs * 2);
     }
-    const step = await take();
-    if (step === 'absent') return { removed: true };
-    const after = await client.getMsdState();
-    if (!after.images[image]) return { removed: true };
+    if (lastAbsent) return { removed: true };
+    if (removedOnce) {
+      const follow = await readMsdState(client, Date.now() + CATALOG_POLL_MIN_MS);
+      if (follow !== 'deadline' && follow !== 'cancelled' && !follow.images[image]) {
+        return { removed: true };
+      }
+    }
     return { removed: false, removeError: errorFields(new MsdRemovalUnconfirmedError(image)) };
   } catch (err) {
     return { removed: false, removeError: errorFields(err) };
@@ -921,8 +1000,15 @@ async function removeUploadedImage(
   image: string,
   device: string,
   timeoutMs: number,
+  unseenMs?: number,
 ): Promise<{ removed: boolean; removeError?: ErrorFields }> {
-  return confirmImageAbsent(client, device, image, timeoutMs);
+  return confirmImageAbsent(client, device, image, timeoutMs, unseenMs);
+}
+
+/** Full readiness budget after the image was seen. A short cap when it was not. */
+function cleanupBudgets(err: unknown, readyMs: number): { timeoutMs: number; unseenMs?: number } {
+  if (catalogSeen(err)) return { timeoutMs: readyMs };
+  return { timeoutMs: readyMs, unseenMs: Math.min(readyMs, MSD_UNSEEN_CONFIRM_MS) };
 }
 
 function failJob(job: JobRecord, err: unknown): void {
@@ -1010,11 +1096,14 @@ async function runUpload(
     logMsd('msd_upload', device, file, true, undefined, { bytes: size, sha256: digest });
   } catch (err) {
     if (wrote) {
+      const readyMs = readyBudget(request.readyTimeoutMs);
+      const budgets = cleanupBudgets(err, readyMs);
       const cleanup = await removeUploadedImage(
         client,
         file,
         device,
-        readyBudget(request.readyTimeoutMs),
+        budgets.timeoutMs,
+        budgets.unseenMs,
       );
       job.removed = cleanup.removed;
       if (cleanup.removeError) job.removeError = cleanup.removeError;
@@ -1184,11 +1273,14 @@ async function runFetch(
     logMsd('msd_fetch', device, image, true, undefined, { bytes: last.written });
   } catch (err) {
     if (sawOurImage && !isStateUnknown(err)) {
+      const readyMs = readyBudget(request.readyTimeoutMs);
+      const budgets = cleanupBudgets(err, readyMs);
       const cleanup = await removeUploadedImage(
         client,
         image,
         device,
-        readyBudget(request.readyTimeoutMs),
+        budgets.timeoutMs,
+        budgets.unseenMs,
       );
       job.removed = cleanup.removed;
       if (cleanup.removeError) job.removeError = cleanup.removeError;
