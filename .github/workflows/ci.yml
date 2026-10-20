@@ -1,5 +1,6 @@
 # Modified 2026-10 by PLN: CI test job, actions pinned to v5 (GPL-3.0; see NOTICE).
 # Modified 2026-10 by PLN: CI Node is 22.14.0 (GPL-3.0; see NOTICE).
+# Modified 2026-10 by PLN: npm 12 allowScripts install job (GPL-3.0; see NOTICE).
 # Test-job idea adapted from dvaerum/pikvm_mcp_server
 # .github/workflows/ci.yml @ 00cbfc0207c1be2b28b25679019e7fe9bd9d9654
 # (GPL-3.0, test job only).
@@ -28,3 +29,21 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+
+  # Node 22.14.0 ships npm 10, which does not enforce allowScripts.
+  # npm 12 does, and it requires Node ^22.22.2 || ^24.15.0 || >=26.
+  allow-scripts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22.23.3
+          cache: npm
+      - name: Install npm 12
+        run: npm install -g npm@12.2.1
+      - name: Require npm 12 or newer
+        run: node -e "const major=Number(require('child_process').execSync('npm --version',{encoding:'utf8'}).trim().split('.')[0]); if(!(major>=12)) process.exit(1)"
+      - name: Install with allowScripts enforced
+        run: npm ci --strict-allow-scripts

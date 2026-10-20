@@ -1,5 +1,6 @@
 // Modified 2026-10 by PLN: secret files and LoadCredential (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: skip the group-mode warning for a systemd credential (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: credential skip matches the opened inode (GPL-3.0; see NOTICE).
 // The resolution order follows dvaerum/pikvm_mcp_server src/config.ts
 // resolveSecret at afbe454d42a5b994bf903883a2712c0e77e84a7b (GPL-3.0, a fork
 // of KultivatorConsulting/pikvm_mcp_server). This file is written fresh.
@@ -22,7 +23,8 @@
  * file, so a directory, FIFO, socket, or device is rejected. Other bits
  * (o+rwx) are warned on stderr. Group bits are warned the same way,
  * except for a direct child of $CREDENTIALS_DIRECTORY that is not a
- * symlink and whose directory realpath is under /run/credentials/<name>/.
+ * symlink, whose directory realpath is under /run/credentials/<name>/,
+ * and whose opened device and inode are still that real path.
  * systemd often leaves that file at mode 0440 because of an ACL mask.
  * The reader does not chmod, chown, or copy the file. The value is never
  * logged. The mode check is skipped on Windows. Files larger than
@@ -41,6 +43,7 @@ import {
   openSync,
   readSync,
   realpathSync,
+  statSync,
 } from 'node:fs';
 import path from 'node:path';
 
@@ -125,13 +128,31 @@ function credentialsRootOf(value: string | undefined): string {
 }
 
 /**
+ * The file opened on `fd` is the file now at `resolvedFile`.
+ * realpath and a later stat can observe a replaced path. The skip
+ * applies only when both still name the opened file.
+ */
+function openedFileIs(fd: number, resolvedFile: string): boolean {
+  try {
+    const opened = fstatSync(fd, { bigint: true });
+    const located = statSync(resolvedFile, { bigint: true });
+    return opened.dev === located.dev && opened.ino === located.ino;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Group-bit exemption for one systemd credential file.
  * The opened path must not be a symlink. Its real path must be a direct
  * child of the real CREDENTIALS_DIRECTORY, and that directory must sit
  * under /run/credentials/<name>/ rather than on /run/credentials itself.
+ * fstat(fd) and stat(realpath) must name the same device and inode.
+ * The root is the credentialsRoot argument, not the environment.
  */
 function isSystemdCredentialFile(
   filePath: string,
+  fd: number,
   env: NodeJS.ProcessEnv,
   credentialsRoot: string,
 ): boolean {
@@ -157,13 +178,14 @@ function isSystemdCredentialFile(
   const relative = path.relative(resolvedRoot, resolvedDir);
   if (relative === '' || path.isAbsolute(relative)) return false;
   if (relative.split(path.sep).includes('..')) return false;
-  return true;
+  return openedFileIs(fd, resolvedFile);
 }
 
 function warnLooseMode(
   label: string,
   filePath: string,
   mode: number,
+  fd: number,
   env: NodeJS.ProcessEnv,
   credentialsRoot: string,
 ): void {
@@ -172,7 +194,7 @@ function warnLooseMode(
   const group = (mode & 0o070) !== 0;
   if (!other && !group) return;
   // Other bits always warn. Group bits are skipped only for a systemd credential file.
-  const groupWarn = group && !isSystemdCredentialFile(filePath, env, credentialsRoot);
+  const groupWarn = group && !isSystemdCredentialFile(filePath, fd, env, credentialsRoot);
   if (!other && !groupWarn) return;
   const octal = (mode & 0o777).toString(8).padStart(4, '0');
   let which: string;
@@ -228,6 +250,7 @@ export function readCappedFile(
         label,
         filePath,
         opened.mode,
+        fd,
         options?.env ?? process.env,
         credentialsRootOf(options?.credentialsRoot),
       );

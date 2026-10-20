@@ -7,6 +7,7 @@
 <!-- Modified 2026-10 by PLN: registry hwTest gate (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: Node >=22.9.0, ten skipped tests, Tailscale as an example (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: twelve skipped tests, including host OCR timings (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: npm 12 allowScripts job does not run hardware tests (GPL-3.0; see NOTICE) -->
 
 # Hardware suite
 
@@ -154,7 +155,7 @@ The `hw: snapshot ...` line is the image to put back, with its `connected`, `cdr
 
 ## CI
 
-`npm test` expands `test/*.test.mjs` only. These files live in `test/hw/` and are named `*.hw.test.mjs`, so that glob does not see them. The workflow runs `npm ci`, `npm run typecheck`, and `npm test`. It does not run `npm run test:hw`.
+`npm test` expands `test/*.test.mjs` only. These files live in `test/hw/` and are named `*.hw.test.mjs`, so that glob does not see them. The test job runs `npm ci`, `npm run typecheck`, and `npm test` on Node 22.14.0. A separate job installs with npm 12 and `--strict-allow-scripts`. Neither runs `npm run test:hw`.
 
 On Node >=22.9.0, `node --test test/hw` from the repo root is a directory import (`"type": "module"`) and does not discover the files. Use `npm run test:hw`, which passes `test/hw/*.hw.test.mjs` and `--test-concurrency=1`. A normal test runs `node --import` of the network guard and `node --test --test-concurrency=1` with its working directory set to `test/hw` and the device variable unset. The import and the reporter are file URLs, so the same specifier loads on Windows. The TAP reporter does not print file names, so that test uses `test/hw-discovered-reporter.mjs`, which lists each discovered file. The test asserts that `readonly.hw.test.mjs`, `msd.hw.test.mjs`, `hid.hw.test.mjs`, and `ocr.hw.test.mjs` were all discovered, that all 12 tests skipped, and that stdout and stderr together contain no socket or DNS marker. `node --test` copies a child file's stderr onto the runner's stdout, so the marker is not visible on stderr alone.
 

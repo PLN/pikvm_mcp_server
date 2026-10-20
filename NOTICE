@@ -41,6 +41,7 @@ Modified 2026-10 by PLN: Windows ESM specifiers, POSIX fixture skips, and hardwa
 Modified 2026-10 by PLN: the upload slot is free before a job looks finished (GPL-3.0; see below).
 Modified 2026-10 by PLN: typed eject, rollbackError wording, and catalog cleanup under the MSD lock (GPL-3.0; see below).
 Modified 2026-10 by PLN: systemd 0440 mode and pinned allowScripts (GPL-3.0; see below).
+Modified 2026-10 by PLN: credential inode check and fsevents install pin (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -813,4 +814,16 @@ No code from another pikvm_mcp_server fork was added for these methods.
   The reader does not chmod, chown, or copy the file. package.json
   allowScripts allows sharp@0.33.5 and denies esbuild@0.27.2. A bump
   of either package updates that pin in the same change.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  The group-bit skip still requires a non-symlink direct child of
+  CREDENTIALS_DIRECTORY under /run/credentials/<name>/. It also requires
+  fstat of the opened file to have the same device and inode as stat of
+  that real path, so a path replaced after open does not take the skip.
+  The credentials root is the fixed /run/credentials path (or the test
+  stand-in). CREDENTIALS_DIRECTORY does not choose it. A sibling symlink
+  and a /run/credentialsX prefix still warn. allowScripts denies
+  fsevents@2.3.3. CI installs with npm 12 and --strict-allow-scripts.
+  The Node 22.14.0 test job is unchanged.
   No code from another pikvm_mcp_server fork was copied.
