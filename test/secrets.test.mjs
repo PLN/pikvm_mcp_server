@@ -3,6 +3,8 @@
 // Modified 2026-10 by PLN: bearer whitespace is HTTP-only (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: file-URL import, and POSIX fixture skips (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: systemd 0440 group-bit cases (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: credential skip boundaries and opened inode (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: decoy credential-root environment names (GPL-3.0; see NOTICE).
 
 /**
  * resolveSecret order and file rules. Temp directories are removed.
@@ -10,7 +12,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { chmodSync, mkdirSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -481,6 +483,149 @@ describe('resolveSecret', () => {
       assert.match(warned.lines[0], /0440/);
       assert.match(warned.lines[0], /group bits are set/);
       assert.equal(warned.lines[0].includes('via-link'), false);
+    });
+  });
+
+  test('a symlink to a sibling in the credentials directory still warns', async (t) => {
+    if (!exactModeAvailable()) {
+      t.skip('exact file modes are not available on this platform');
+      return;
+    }
+    if (!symlinkAvailable()) {
+      t.skip('symlinks are not available on this platform');
+      return;
+    }
+    await withCredentialTree(async ({ credentialsRoot, credDir }) => {
+      const sibling = join(credDir, 'sibling-secret');
+      writeMode(sibling, 'sibling-secret\n', 0o440);
+      symlinkSync('sibling-secret', join(credDir, 'pikvm-password'));
+      const warned = capture(() => resolveSecret({
+        name: 'PIKVM_PASSWORD',
+        credName: 'pikvm-password',
+        required: true,
+        env: { CREDENTIALS_DIRECTORY: credDir },
+        credentialsRoot,
+      }));
+      assert.equal(warned.value, 'sibling-secret');
+      assert.equal(warned.lines.length, 1);
+      assert.match(warned.lines[0], /0440/);
+      assert.match(warned.lines[0], /group bits are set/);
+      assert.equal(warned.lines[0].includes('sibling-secret'), false);
+    });
+  });
+
+  test('a /run/credentialsX prefix does not skip the group warning', async (t) => {
+    if (!exactModeAvailable()) {
+      t.skip('exact file modes are not available on this platform');
+      return;
+    }
+    await withCredentialTree(async ({ dir, credentialsRoot }) => {
+      const lookalike = join(dir, 'run', 'credentialsX', 'pikvm-mcp.service');
+      mkdirSync(lookalike, { recursive: true });
+      const file = join(lookalike, 'pikvm-password');
+      writeMode(file, 'lookalike-secret\n', 0o440);
+      const warned = capture(() => resolveSecret({
+        name: 'PIKVM_PASSWORD',
+        credName: 'pikvm-password',
+        required: true,
+        env: { CREDENTIALS_DIRECTORY: lookalike },
+        credentialsRoot,
+      }));
+      assert.equal(warned.value, 'lookalike-secret');
+      assert.equal(warned.lines.length, 1);
+      assert.match(warned.lines[0], /0440/);
+      assert.match(warned.lines[0], /group bits are set/);
+      assert.equal(warned.lines[0].includes('lookalike-secret'), false);
+    });
+  });
+
+  test('the credentials root ignores the environment', async (t) => {
+    if (!exactModeAvailable()) {
+      t.skip('exact file modes are not available on this platform');
+      return;
+    }
+    await withCredentialTree(async ({ dir, credentialsRoot }) => {
+      const decoyRoot = join(dir, 'arbitrary');
+      const arbitrary = join(decoyRoot, 'pikvm-mcp.service');
+      mkdirSync(arbitrary, { recursive: true });
+      const file = join(arbitrary, 'pikvm-password');
+      writeMode(file, 'env-root-secret\n', 0o440);
+      const envKeys = [
+        'CREDENTIALS_DIRECTORY',
+        'PIKVM_CREDENTIALS_ROOT',
+        'CREDENTIALS_ROOT',
+        'PIKVM_MCP_CREDENTIALS_ROOT',
+      ];
+      const saved = new Map(envKeys.map((key) => [key, process.env[key]]));
+      process.env.CREDENTIALS_DIRECTORY = arbitrary;
+      process.env.PIKVM_CREDENTIALS_ROOT = decoyRoot;
+      process.env.CREDENTIALS_ROOT = decoyRoot;
+      process.env.PIKVM_MCP_CREDENTIALS_ROOT = decoyRoot;
+      try {
+        const withRoot = capture(() => resolveSecret({
+          name: 'PIKVM_PASSWORD',
+          credName: 'pikvm-password',
+          required: true,
+          env: { CREDENTIALS_DIRECTORY: arbitrary },
+          credentialsRoot,
+        }));
+        assert.equal(withRoot.value, 'env-root-secret');
+        assert.equal(withRoot.lines.length, 1);
+        assert.match(withRoot.lines[0], /0440/);
+        assert.match(withRoot.lines[0], /group bits are set/);
+        assert.equal(withRoot.lines[0].includes('env-root-secret'), false);
+
+        const productionRoot = capture(() => resolveSecret({
+          name: 'PIKVM_PASSWORD',
+          credName: 'pikvm-password',
+          required: true,
+          env: { CREDENTIALS_DIRECTORY: arbitrary },
+        }));
+        assert.equal(productionRoot.value, 'env-root-secret');
+        assert.equal(productionRoot.lines.length, 1);
+        assert.match(productionRoot.lines[0], /group bits are set/);
+        assert.equal(productionRoot.lines[0].includes('env-root-secret'), false);
+      } finally {
+        for (const [key, value] of saved) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+      }
+    });
+  });
+
+  test('an opened credential inode that is no longer the path still warns', async (t) => {
+    if (!exactModeAvailable()) {
+      t.skip('exact file modes are not available on this platform');
+      return;
+    }
+    await withCredentialTree(async ({ dir, credentialsRoot, credDir }) => {
+      const secret = join(credDir, 'pikvm-password');
+      const decoy = join(dir, 'decoy');
+      writeMode(secret, 'path-secret\n', 0o440);
+      writeMode(decoy, 'opened-secret\n', 0o440);
+      const child = spawnSync(process.execPath, [
+        '--experimental-test-module-mocks',
+        join(REPO, 'test', 'credential-identity-probe.mjs'),
+      ], {
+        cwd: REPO,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          PIKVM_IDENTITY_SECRET: secret,
+          PIKVM_IDENTITY_DECOY: decoy,
+          PIKVM_IDENTITY_DIR: credDir,
+          PIKVM_IDENTITY_ROOT: credentialsRoot,
+        },
+      });
+      assert.equal(child.status, 0, `${child.stderr}\n${child.stdout}`);
+      const reported = JSON.parse(child.stdout);
+      assert.equal(reported.value, 'opened-secret');
+      assert.equal(reported.lines.length, 1);
+      assert.match(reported.lines[0], /0440/);
+      assert.match(reported.lines[0], /group bits are set/);
+      assert.equal(reported.lines[0].includes('opened-secret'), false);
+      assert.equal(reported.lines[0].includes('path-secret'), false);
     });
   });
 
