@@ -2,6 +2,7 @@
 // Modified 2026-10 by PLN: empty secret vars are unset (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: bearer whitespace is HTTP-only (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: file-URL import, and POSIX fixture skips (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: systemd 0440 group-bit cases (GPL-3.0; see NOTICE).
 
 /**
  * resolveSecret order and file rules. Temp directories are removed.
@@ -10,14 +11,14 @@
 
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
-import { chmodSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, test } from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { redactConfig, loadConfig } from '../dist/config.js';
-import { SECRET_MAX_BYTES, resolveSecret } from '../dist/secrets.js';
+import { SECRET_MAX_BYTES, SYSTEMD_CREDENTIALS_ROOT, readSecretAtPath, resolveSecret } from '../dist/secrets.js';
 import { PiKVMClient } from '../dist/pikvm/client.js';
 import { BusyLock } from '../dist/pikvm/lock.js';
 import { createMcpServer } from '../dist/server.js';
@@ -390,6 +391,196 @@ describe('resolveSecret', () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+
+  function writeMode(file, text, mode) {
+    try {
+      unlinkSync(file);
+    } catch {
+      // The first write creates the file.
+    }
+    writeFileSync(file, text);
+    chmodSync(file, mode);
+  }
+
+  async function withCredentialTree(fn) {
+    const dir = await tempDir();
+    try {
+      const credentialsRoot = join(dir, 'run', 'credentials');
+      const credDir = join(credentialsRoot, 'pikvm-mcp.service');
+      mkdirSync(credDir, { recursive: true });
+      await fn({ dir, credentialsRoot, credDir });
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+
+  test('the production credentials root is /run/credentials', () => {
+    assert.equal(SYSTEMD_CREDENTIALS_ROOT, '/run/credentials');
+  });
+
+  test('mode 0440 under /run/credentials skips the group warning and still loads', async (t) => {
+    if (!exactModeAvailable()) {
+      t.skip('exact file modes are not available on this platform');
+      return;
+    }
+    await withCredentialTree(async ({ credentialsRoot, credDir }) => {
+      const file = join(credDir, 'pikvm-password');
+      writeMode(file, 'from-cred\n', 0o440);
+      const loaded = capture(() => resolveSecret({
+        name: 'PIKVM_PASSWORD',
+        credName: 'pikvm-password',
+        required: true,
+        env: { CREDENTIALS_DIRECTORY: credDir },
+        credentialsRoot,
+      }));
+      assert.equal(loaded.value, 'from-cred');
+      assert.deepEqual(loaded.lines, []);
+
+      const viaFile = capture(() => resolveSecret({
+        name: 'PIKVM_PASSWORD',
+        credName: 'pikvm-password',
+        required: true,
+        env: { PIKVM_PASSWORD_FILE: file, CREDENTIALS_DIRECTORY: credDir },
+        credentialsRoot,
+      }));
+      assert.equal(viaFile.value, 'from-cred');
+      assert.deepEqual(viaFile.lines, []);
+
+      const atPath = capture(() => readSecretAtPath(file, 'device default passwordFile', {
+        env: { CREDENTIALS_DIRECTORY: credDir },
+        credentialsRoot,
+      }));
+      assert.equal(atPath.value, 'from-cred');
+      assert.deepEqual(atPath.lines, []);
+    });
+  });
+
+  test('a symlink in the credentials directory still warns', async (t) => {
+    if (!exactModeAvailable()) {
+      t.skip('exact file modes are not available on this platform');
+      return;
+    }
+    if (!symlinkAvailable()) {
+      t.skip('symlinks are not available on this platform');
+      return;
+    }
+    await withCredentialTree(async ({ dir, credentialsRoot, credDir }) => {
+      const real = join(dir, 'real-secret');
+      writeMode(real, 'via-link\n', 0o440);
+      symlinkSync(real, join(credDir, 'pikvm-password'));
+      const warned = capture(() => resolveSecret({
+        name: 'PIKVM_PASSWORD',
+        credName: 'pikvm-password',
+        required: true,
+        env: { CREDENTIALS_DIRECTORY: credDir },
+        credentialsRoot,
+      }));
+      assert.equal(warned.value, 'via-link');
+      assert.equal(warned.lines.length, 1);
+      assert.match(warned.lines[0], /0440/);
+      assert.match(warned.lines[0], /group bits are set/);
+      assert.equal(warned.lines[0].includes('via-link'), false);
+    });
+  });
+
+  test('mode 0440 outside the credentials directory still warns', async (t) => {
+    if (!exactModeAvailable()) {
+      t.skip('exact file modes are not available on this platform');
+      return;
+    }
+    await withCredentialTree(async ({ dir, credentialsRoot, credDir }) => {
+      const outside = join(dir, 'outside');
+      writeMode(outside, 'outside-secret\n', 0o440);
+      const warned = capture(() => resolveSecret({
+        name: 'PIKVM_PASSWORD',
+        credName: 'pikvm-password',
+        required: true,
+        env: { PIKVM_PASSWORD_FILE: outside, CREDENTIALS_DIRECTORY: credDir },
+        credentialsRoot,
+      }));
+      assert.equal(warned.value, 'outside-secret');
+      assert.equal(warned.lines.length, 1);
+      assert.match(warned.lines[0], /0440/);
+      assert.match(warned.lines[0], /group bits are set/);
+
+      const nestedDir = join(credDir, 'nested');
+      mkdirSync(nestedDir);
+      const nested = join(nestedDir, 'pikvm-password');
+      writeMode(nested, 'nested-secret\n', 0o440);
+      const nestedWarn = capture(() => resolveSecret({
+        name: 'PIKVM_PASSWORD',
+        credName: 'pikvm-password',
+        required: true,
+        env: { PIKVM_PASSWORD_FILE: nested, CREDENTIALS_DIRECTORY: credDir },
+        credentialsRoot,
+      }));
+      assert.equal(nestedWarn.value, 'nested-secret');
+      assert.match(nestedWarn.lines[0], /group bits are set/);
+
+      const onRoot = join(credentialsRoot, 'pikvm-password');
+      writeMode(onRoot, 'root-secret\n', 0o440);
+      const rootWarn = capture(() => resolveSecret({
+        name: 'PIKVM_PASSWORD',
+        credName: 'pikvm-password',
+        required: true,
+        env: { CREDENTIALS_DIRECTORY: credentialsRoot },
+        credentialsRoot,
+      }));
+      assert.equal(rootWarn.value, 'root-secret');
+      assert.match(rootWarn.lines[0], /group bits are set/);
+    });
+  });
+
+  test('a credentials directory outside /run/credentials still warns', async (t) => {
+    if (!exactModeAvailable()) {
+      t.skip('exact file modes are not available on this platform');
+      return;
+    }
+    await withCredentialTree(async ({ dir, credentialsRoot }) => {
+      const elsewhere = join(dir, 'elsewhere');
+      mkdirSync(elsewhere);
+      const file = join(elsewhere, 'pikvm-password');
+      writeMode(file, 'elsewhere-secret\n', 0o440);
+      const warned = capture(() => resolveSecret({
+        name: 'PIKVM_PASSWORD',
+        credName: 'pikvm-password',
+        required: true,
+        env: { CREDENTIALS_DIRECTORY: elsewhere },
+        credentialsRoot,
+      }));
+      assert.equal(warned.value, 'elsewhere-secret');
+      assert.equal(warned.lines.length, 1);
+      assert.match(warned.lines[0], /0440/);
+      assert.match(warned.lines[0], /group bits are set/);
+    });
+  });
+
+  test('other bits under /run/credentials still warn', async (t) => {
+    if (!exactModeAvailable()) {
+      t.skip('exact file modes are not available on this platform');
+      return;
+    }
+    await withCredentialTree(async ({ credentialsRoot, credDir }) => {
+      for (const mode of [0o444, 0o441]) {
+        const file = join(credDir, 'pikvm-password');
+        const text = `other-${mode.toString(8)}\n`;
+        writeMode(file, text, mode);
+        const warned = capture(() => resolveSecret({
+          name: 'PIKVM_PASSWORD',
+          credName: 'pikvm-password',
+          required: true,
+          env: { CREDENTIALS_DIRECTORY: credDir },
+          credentialsRoot,
+        }));
+        assert.equal(warned.value, text.slice(0, -1));
+        assert.equal(warned.lines.length, 1);
+        assert.match(warned.lines[0], new RegExp(mode.toString(8).padStart(4, '0')));
+        assert.match(warned.lines[0], /other bits are set/);
+        assert.equal(warned.lines[0].includes('group'), false);
+        assert.equal(warned.lines[0].includes(text.trim()), false);
+      }
+    });
   });
 
   test('an oversize file is rejected without its body', async () => {

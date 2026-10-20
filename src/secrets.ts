@@ -1,4 +1,5 @@
 // Modified 2026-10 by PLN: secret files and LoadCredential (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: skip the group-mode warning for a systemd credential (GPL-3.0; see NOTICE).
 // The resolution order follows dvaerum/pikvm_mcp_server src/config.ts
 // resolveSecret at afbe454d42a5b994bf903883a2712c0e77e84a7b (GPL-3.0, a fork
 // of KultivatorConsulting/pikvm_mcp_server). This file is written fresh.
@@ -18,10 +19,14 @@
  * A NUL byte in the file is an error that names the variable and the path.
  * The file is opened O_RDONLY|O_NONBLOCK and then fstat'd, so a FIFO does
  * not block. Symlinks are followed. The opened target must be a regular
- * file, so a directory, FIFO, socket, or device is rejected. A mode with
- * any group or other bits (looser than 0600) is warned on stderr. The
- * value is never logged. The mode check is skipped on Windows. Files
- * larger than SECRET_MAX_BYTES are rejected before the body is read.
+ * file, so a directory, FIFO, socket, or device is rejected. Other bits
+ * (o+rwx) are warned on stderr. Group bits are warned the same way,
+ * except for a direct child of $CREDENTIALS_DIRECTORY that is not a
+ * symlink and whose directory realpath is under /run/credentials/<name>/.
+ * systemd often leaves that file at mode 0440 because of an ACL mask.
+ * The reader does not chmod, chown, or copy the file. The value is never
+ * logged. The mode check is skipped on Windows. Files larger than
+ * SECRET_MAX_BYTES are rejected before the body is read.
  *
  * A registry passwordFile uses readSecretAtPath, the same reader. The
  * registry JSON itself is not a secret: readCappedFile does not warn
@@ -32,13 +37,31 @@ import {
   closeSync,
   constants,
   fstatSync,
+  lstatSync,
   openSync,
   readSync,
+  realpathSync,
 } from 'node:fs';
 import path from 'node:path';
 
 /** A wrong path must not be read into memory. */
 export const SECRET_MAX_BYTES = 64 * 1024;
+
+/**
+ * Parent of systemd system-service credential directories.
+ * Production uses this path. Tests pass a directory they can create.
+ */
+export const SYSTEMD_CREDENTIALS_ROOT = '/run/credentials';
+
+export interface SecretModeOptions {
+  /** Environment that may set CREDENTIALS_DIRECTORY. Defaults to process.env. */
+  env?: NodeJS.ProcessEnv;
+  /**
+   * Stand-in for /run/credentials. Omitted in production.
+   * An empty string is the production root.
+   */
+  credentialsRoot?: string;
+}
 
 /** Follow symlinks. O_NONBLOCK so a FIFO open returns instead of waiting. */
 const SECRET_OPEN_FLAGS = constants.O_RDONLY | (constants.O_NONBLOCK ?? 0);
@@ -52,6 +75,8 @@ export interface ResolveSecretSpec {
   required?: boolean;
   /** Defaults to process.env. Tests pass a plain object. */
   env?: NodeJS.ProcessEnv;
+  /** Stand-in for /run/credentials. Omitted in production. */
+  credentialsRoot?: string;
 }
 
 interface RequiredSecret extends ResolveSecretSpec {
@@ -94,11 +119,67 @@ function errorCode(err: unknown): string {
   return 'unknown';
 }
 
-function warnLooseMode(label: string, filePath: string, mode: number): void {
+function credentialsRootOf(value: string | undefined): string {
+  if (value === undefined || value === '') return SYSTEMD_CREDENTIALS_ROOT;
+  return value;
+}
+
+/**
+ * Group-bit exemption for one systemd credential file.
+ * The opened path must not be a symlink. Its real path must be a direct
+ * child of the real CREDENTIALS_DIRECTORY, and that directory must sit
+ * under /run/credentials/<name>/ rather than on /run/credentials itself.
+ */
+function isSystemdCredentialFile(
+  filePath: string,
+  env: NodeJS.ProcessEnv,
+  credentialsRoot: string,
+): boolean {
+  const credDir = env.CREDENTIALS_DIRECTORY;
+  if (credDir === undefined || credDir === '') return false;
+  try {
+    if (lstatSync(filePath).isSymbolicLink()) return false;
+  } catch {
+    return false;
+  }
+  let resolvedFile: string;
+  let resolvedDir: string;
+  let resolvedRoot: string;
+  try {
+    resolvedFile = realpathSync(filePath);
+    resolvedDir = realpathSync(credDir);
+    resolvedRoot = realpathSync(credentialsRoot);
+  } catch {
+    return false;
+  }
+  if (path.dirname(resolvedFile) !== resolvedDir) return false;
+  if (resolvedDir === resolvedRoot) return false;
+  const relative = path.relative(resolvedRoot, resolvedDir);
+  if (relative === '' || path.isAbsolute(relative)) return false;
+  if (relative.split(path.sep).includes('..')) return false;
+  return true;
+}
+
+function warnLooseMode(
+  label: string,
+  filePath: string,
+  mode: number,
+  env: NodeJS.ProcessEnv,
+  credentialsRoot: string,
+): void {
   if (process.platform === 'win32') return;
-  if ((mode & 0o077) === 0) return;
+  const other = (mode & 0o007) !== 0;
+  const group = (mode & 0o070) !== 0;
+  if (!other && !group) return;
+  // Other bits always warn. Group bits are skipped only for a systemd credential file.
+  const groupWarn = group && !isSystemdCredentialFile(filePath, env, credentialsRoot);
+  if (!other && !groupWarn) return;
   const octal = (mode & 0o777).toString(8).padStart(4, '0');
-  console.error(`${label} (${filePath}) is mode ${octal}; group or other bits are set`);
+  let which: string;
+  if (groupWarn && other) which = 'group or other bits are set';
+  else if (other) which = 'other bits are set';
+  else which = 'group bits are set';
+  console.error(`${label} (${filePath}) is mode ${octal}; ${which}`);
 }
 
 function decodeSecretFile(bytes: Buffer, label: string, filePath: string): string {
@@ -121,7 +202,13 @@ function decodeSecretFile(bytes: Buffer, label: string, filePath: string): strin
  * checked on the fd before the body is read. `warnMode` is for secrets.
  * A registry document passes false.
  */
-export function readCappedFile(filePath: string, label: string, maxBytes: number, warnMode: boolean): Buffer {
+export function readCappedFile(
+  filePath: string,
+  label: string,
+  maxBytes: number,
+  warnMode: boolean,
+  options?: SecretModeOptions,
+): Buffer {
   let fd: number | undefined;
   try {
     try {
@@ -136,7 +223,15 @@ export function readCappedFile(filePath: string, label: string, maxBytes: number
     if (opened.size > maxBytes) {
       throw new Error(`${label} (${filePath}): larger than ${maxBytes} bytes`);
     }
-    if (warnMode) warnLooseMode(label, filePath, opened.mode);
+    if (warnMode) {
+      warnLooseMode(
+        label,
+        filePath,
+        opened.mode,
+        options?.env ?? process.env,
+        credentialsRootOf(options?.credentialsRoot),
+      );
+    }
     const buf = Buffer.alloc(opened.size);
     let off = 0;
     while (off < opened.size) {
@@ -150,10 +245,15 @@ export function readCappedFile(filePath: string, label: string, maxBytes: number
   }
 }
 
-function readSecretFile(filePath: string, label: string, missingIsUnset: boolean): string | undefined {
+function readSecretFile(
+  filePath: string,
+  label: string,
+  missingIsUnset: boolean,
+  options?: SecretModeOptions,
+): string | undefined {
   let buf: Buffer;
   try {
-    buf = readCappedFile(filePath, label, SECRET_MAX_BYTES, true);
+    buf = readCappedFile(filePath, label, SECRET_MAX_BYTES, true, options);
   } catch (err) {
     if (missingIsUnset && err instanceof Error && err.message.endsWith('(ENOENT)')) return undefined;
     throw err;
@@ -162,8 +262,12 @@ function readSecretFile(filePath: string, label: string, missingIsUnset: boolean
 }
 
 /** passwordFile and a LoadCredential segment. Errors name `label` and the path, not the value. */
-export function readSecretAtPath(filePath: string, label: string): string {
-  const value = readSecretFile(filePath, label, false);
+export function readSecretAtPath(
+  filePath: string,
+  label: string,
+  options?: SecretModeOptions,
+): string {
+  const value = readSecretFile(filePath, label, false, options);
   if (value === undefined) {
     throw new Error(`${label} (${filePath}): cannot read (ENOENT)`);
   }
@@ -186,6 +290,7 @@ export function resolveSecret(spec: RequiredSecret): string;
 export function resolveSecret(spec: ResolveSecretSpec): string | undefined;
 export function resolveSecret(spec: ResolveSecretSpec): string | undefined {
   const env = spec.env ?? process.env;
+  const modeOptions: SecretModeOptions = { env, credentialsRoot: spec.credentialsRoot };
   const name = spec.name;
   const fileVar = `${name}_FILE`;
   assertCredName(spec.credName);
@@ -200,7 +305,7 @@ export function resolveSecret(spec: ResolveSecretSpec): string | undefined {
   }
 
   if (filePath !== undefined) {
-    const fromFile = readSecretFile(filePath, fileVar, false);
+    const fromFile = readSecretFile(filePath, fileVar, false, modeOptions);
     if (fromFile === undefined) {
       throw new Error(`${fileVar} (${filePath}): cannot read (ENOENT)`);
     }
@@ -210,7 +315,7 @@ export function resolveSecret(spec: ResolveSecretSpec): string | undefined {
   const credDir = env.CREDENTIALS_DIRECTORY;
   if (credDir !== undefined && credDir !== '') {
     const full = credentialPath(credDir, spec.credName);
-    const fromCred = readSecretFile(full, `${name} from CREDENTIALS_DIRECTORY`, true);
+    const fromCred = readSecretFile(full, `${name} from CREDENTIALS_DIRECTORY`, true, modeOptions);
     if (fromCred !== undefined) return fromCred;
   }
 
