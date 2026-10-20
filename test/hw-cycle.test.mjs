@@ -3,6 +3,7 @@
 // Modified 2026-10 by PLN: restore a leftover image this run did not create (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: catalog confirmation uses a short budget (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: bounded MSD test teardown and fetch (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: teardown still runs after a hung test body (GPL-3.0; see NOTICE).
 
 /**
  * Forced-failure dry run. The kvmd mock stands in for the device.
@@ -37,6 +38,7 @@ import {
   bounded,
   finishWith,
   msdTest,
+  onTestTeardown,
   runBounded,
 } from './msd-bounds.mjs';
 
@@ -79,11 +81,11 @@ async function withCycle(mockOptions, fn) {
   });
   await finishWith(
     () => fn({ mock, dir, session, pikvm }),
-    () => runBounded([
+    onTestTeardown(() => runBounded([
       () => session.close(),
       () => bounded('cycle mock close', mock.close()),
       () => bounded('fixture cleanup', rm(dir, { recursive: true, force: true })),
-    ]),
+    ])),
   );
 }
 
@@ -120,28 +122,29 @@ async function optionalIsoTool(bin, args, pattern) {
 }
 
 describe('MSD cycle media', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
-msdTest('the generated ISO is at least 300 sectors and has a PVD', async () => {
-  const bytes = hwIsoBytes();
-  assertIsoLayout(bytes);
-  assert.deepEqual(bytes, hwIsoBytes());
-  assert.equal(isHwTestImageName('mcp-hwtest-1-ab.iso'), true);
-  assert.equal(isHwTestImageName('mcp-hwtest.iso'), false);
-  assert.equal(isHwTestImageName('keep.img'), false);
-  assert.equal(isHwTestImageName('mcp-hwtest-../x.iso'), false);
-  const dir = await mkdtemp(join(tmpdir(), 'pikvm-hwmedia-'));
-  try {
-    const name = hwTestImageName();
-    const prepared = await prepareHwImage(dir, name);
-    assert.equal(prepared.bytes, HW_ISO_BYTES);
-    assert.match(name, /^mcp-hwtest-\d+-[0-9a-f]+\.iso$/);
-    const stored = await readFile(prepared.path);
-    assertIsoLayout(stored);
-    await optionalIsoTool('file', ['-b', prepared.path], /ISO 9660/i);
-    await optionalIsoTool('isoinfo', ['-d', '-i', prepared.path], /CD001|Volume size is/i);
-  } finally {
-    await bounded('fixture cleanup', rm(dir, { recursive: true, force: true }));
-  }
-});
+  msdTest('the generated ISO is at least 300 sectors and has a PVD', async () => {
+    const bytes = hwIsoBytes();
+    assertIsoLayout(bytes);
+    assert.deepEqual(bytes, hwIsoBytes());
+    assert.equal(isHwTestImageName('mcp-hwtest-1-ab.iso'), true);
+    assert.equal(isHwTestImageName('mcp-hwtest.iso'), false);
+    assert.equal(isHwTestImageName('keep.img'), false);
+    assert.equal(isHwTestImageName('mcp-hwtest-../x.iso'), false);
+    const dir = await mkdtemp(join(tmpdir(), 'pikvm-hwmedia-'));
+    await finishWith(
+      async () => {
+        const name = hwTestImageName();
+        const prepared = await prepareHwImage(dir, name);
+        assert.equal(prepared.bytes, HW_ISO_BYTES);
+        assert.match(name, /^mcp-hwtest-\d+-[0-9a-f]+\.iso$/);
+        const stored = await readFile(prepared.path);
+        assertIsoLayout(stored);
+        await optionalIsoTool('file', ['-b', prepared.path], /ISO 9660/i);
+        await optionalIsoTool('isoinfo', ['-d', '-i', prepared.path], /CD001|Volume size is/i);
+      },
+      onTestTeardown(() => bounded('fixture cleanup', rm(dir, { recursive: true, force: true }))),
+    );
+  });
 });
 
 describe('MSD cycle dry run', { concurrency: false, timeout: MSD_FILE_TIMEOUT_MS }, () => {

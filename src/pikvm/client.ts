@@ -18,6 +18,7 @@
 // Modified 2026-10 by PLN: one resolved click frame for the move and the echo (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a catalog read stops at the caller's deadline (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: full-resolution snapshot for host OCR (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: hash reads use the MSD job ceiling (GPL-3.0; see NOTICE).
 // AbortSignal.timeout and PIKVM_UNREACHABLE / PIKVM_AUTH_FAILED no-retry codes
 // adapted from dtrukr/pikvm_mcp_server src/pikvm/client.ts @ d120243 (GPL-3.0).
 // Snapshot HTTP 503 retry-once adapted from dvaerum/pikvm_mcp_server
@@ -827,6 +828,9 @@ const testDispatchers = new WeakMap<PiKVMClient, Dispatcher>();
 /** Configured password for tool-error redaction. Not a client method. */
 const redactionPasswords = new WeakMap<PiKVMClient, string>();
 
+/** Resolved MSD job ceiling. Hashing reads this. Not a client method. */
+const msdJobTimeouts = new WeakMap<PiKVMClient, number>();
+
 /** Test-only. Shrinks HID abort timers without putting a scale on PiKVMConfig. */
 export function setHidDeadlineScaleForTests(client: PiKVMClient, scale: number): void {
   if (!Number.isFinite(scale) || scale <= 0) return;
@@ -841,6 +845,15 @@ export function setDispatcherForTests(client: PiKVMClient, dispatcher: Dispatche
 /** Package-internal. The tool error path redacts with this password. */
 export function redactionPassword(client: PiKVMClient): string {
   return redactionPasswords.get(client) ?? '';
+}
+
+/**
+ * Resolved PIKVM_MSD_JOB_TIMEOUT_MS for this client.
+ * Hashing uses the same ceiling on its own timer. The upload POST
+ * still starts a fresh ceiling of this length.
+ */
+export function msdJobTimeoutOf(client: PiKVMClient): number {
+  return msdJobTimeouts.get(client) ?? MSD_JOB_TIMEOUT_DEFAULT_MS;
 }
 
 interface ResolvedPiKVMConfig extends PiKVMConfig {
@@ -903,6 +916,7 @@ export class PiKVMClient {
     };
     this.config = resolved;
     redactionPasswords.set(this, this.config.password);
+    msdJobTimeouts.set(this, this.config.msdJobTimeoutMs);
 
     // headersTimeout and bodyTimeout 0 turn off undici's 300s defaults.
     // Each call sets its own AbortSignal, including HID ceilings.

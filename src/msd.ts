@@ -13,6 +13,7 @@
 // Modified 2026-10 by PLN: a stable wrong size fails at once, and an unseen image is confirmed briefly (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: the upload slot is free before a job looks finished (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: eject expectImage is typed, and catalog cleanup keeps the MSD lock (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: hash reads stop at the MSD job ceiling (GPL-3.0; see NOTICE).
 
 /**
  * Policy for MSD status, mount, eject, upload, and remove.
@@ -28,13 +29,14 @@
  */
 
 import { createHash, randomBytes } from 'node:crypto';
-import { constants } from 'node:fs';
+import fs, { constants } from 'node:fs';
 import { lstat, open, realpath } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import {
   KvmdError,
+  msdJobTimeoutOf,
   type MsdDriveState,
   type MsdImageRecord,
   type MsdState,
@@ -177,6 +179,19 @@ export class MsdSizeMismatchError extends Error {
   }
 }
 
+/**
+ * Hashing did not finish before PIKVM_MSD_JOB_TIMEOUT_MS.
+ * The upload POST is not sent. The file is closed and the slot is free.
+ */
+export class MsdHashTimeoutError extends Error {
+  readonly type = 'PIKVM_MSD_HASH_TIMEOUT';
+
+  constructor(ms: number) {
+    super(`hash timeout after ${ms}ms`);
+    this.name = 'MsdHashTimeoutError';
+  }
+}
+
 /** Cancelled while waiting for the catalog. The write is not sent again. */
 export class MsdCancelledError extends Error {
   readonly type = 'PIKVM_MSD_CANCELLED';
@@ -291,6 +306,7 @@ function errorFields(err: unknown): ErrorFields {
     || err instanceof MsdImageIncompleteError
     || err instanceof MsdSizeMismatchError
     || err instanceof MsdCancelledError
+    || err instanceof MsdHashTimeoutError
     || err instanceof MsdRemovalUnconfirmedError
   ) {
     return {
@@ -695,16 +711,91 @@ function normalizeSha256(value: string): string {
   return hex;
 }
 
-async function hashFd(fh: FileHandle, size: number): Promise<string> {
+const HASH_CHUNK = 64 * 1024;
+
+/**
+ * Wall clock for hashing only. Cleared when hashing returns.
+ * Same length as the upload POST ceiling, and it does not start that ceiling.
+ * setTimeout, not AbortSignal.timeout: a delay of 2^31 or more fires after 1 ms.
+ */
+function startHashDeadline(ms: number): { signal: AbortSignal; done: () => void } {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => {
+    ctrl.abort(new DOMException('The operation was aborted due to timeout', 'TimeoutError'));
+  }, ms);
+  return {
+    signal: ctrl.signal,
+    done() {
+      clearTimeout(timer);
+    },
+  };
+}
+
+/**
+ * One positioned read. fs.read, not FileHandle.read: the handle read
+ * holds a ref, and FileHandle.close then waits for that read. A hung
+ * filesystem would keep the upload slot until the read returned.
+ * Lookup is on the fs object so a test can replace fs.read.
+ * After abort the late callback is ignored, so it cannot reject twice.
+ */
+function readSlice(
+  fh: FileHandle,
+  buf: Buffer,
+  length: number,
+  position: number,
+  signal: AbortSignal,
+  timeoutMs: number,
+): Promise<number> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new MsdHashTimeoutError(timeoutMs));
+      return;
+    }
+    let settled = false;
+    const finish = (settle: () => void) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener('abort', onAbort);
+      settle();
+    };
+    const onAbort = () => {
+      finish(() => reject(new MsdHashTimeoutError(timeoutMs)));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    fs.read(fh.fd, buf, 0, length, position, (err, bytesRead) => {
+      finish(() => {
+        if (err) reject(err);
+        else resolve(bytesRead);
+      });
+    });
+  });
+}
+
+async function hashFd(
+  fh: FileHandle,
+  size: number,
+  signal: AbortSignal,
+  timeoutMs: number,
+): Promise<string> {
   const hash = createHash('sha256');
-  const buf = Buffer.alloc(64 * 1024);
+  const buf = Buffer.alloc(HASH_CHUNK);
   let offset = 0;
   while (offset < size) {
-    const { bytesRead } = await fh.read(buf, 0, Math.min(buf.length, size - offset), offset);
+    if (signal.aborted) throw new MsdHashTimeoutError(timeoutMs);
+    const bytesRead = await readSlice(
+      fh,
+      buf,
+      Math.min(buf.length, size - offset),
+      offset,
+      signal,
+      timeoutMs,
+    );
+    if (signal.aborted) throw new MsdHashTimeoutError(timeoutMs);
     if (bytesRead === 0) break;
     hash.update(buf.subarray(0, bytesRead));
     offset += bytesRead;
   }
+  if (signal.aborted) throw new MsdHashTimeoutError(timeoutMs);
   if (offset !== size) throw new Error('short read while hashing');
   return hash.digest('hex');
 }
@@ -1095,7 +1186,14 @@ async function runUpload(
   let cleaned = false;
   try {
     if (request.beforeHash) await request.beforeHash();
-    const prehash = await hashFd(fh, size);
+    const hashBudgetMs = msdJobTimeoutOf(client);
+    const hashDeadline = startHashDeadline(hashBudgetMs);
+    let prehash: string;
+    try {
+      prehash = await hashFd(fh, size, hashDeadline.signal, hashBudgetMs);
+    } finally {
+      hashDeadline.done();
+    }
     if (expected !== undefined && prehash !== expected) throw new Error('sha256 mismatch');
     await assertUploadAllowed(client, file, size);
     job.state = 'running';
@@ -1230,6 +1328,8 @@ async function runUpload(
 /**
  * Confine the path, then return a jobId. Hashing and the kvmd pre-check
  * run in the job (state hashing, then running, then awaiting_catalog).
+ * Hashing stops at PIKVM_MSD_JOB_TIMEOUT_MS. That timer is not the
+ * upload POST ceiling: the POST starts its own when hashing has finished.
  * A sha256 mismatch fails the job and does not POST. A second upload
  * while one is running throws before it opens a file.
  */

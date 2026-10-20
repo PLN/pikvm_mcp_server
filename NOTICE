@@ -45,6 +45,8 @@ Modified 2026-10 by PLN: credential inode check and fsevents install pin (GPL-3.
 Modified 2026-10 by PLN: decoy credential-root names and a sharp load (GPL-3.0; see below).
 Modified 2026-10 by PLN: the slot-free upload test releases the second job (GPL-3.0; see below).
 Modified 2026-10 by PLN: bounded MSD test teardown and fetch (GPL-3.0; see below).
+Modified 2026-10 by PLN: hash reads stop at the MSD job ceiling (GPL-3.0; see below).
+Modified 2026-10 by PLN: caller locations, labeled body timeouts, and teardown after a hung test (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -845,9 +847,40 @@ No code from another pikvm_mcp_server fork was added for these methods.
   fails on its own, so the rest of the file still runs. Server close,
   session close, and fixture removal reject when they exceed 10 seconds,
   and the error names the operation. The timer is cleared when the work
-  finishes. Test fetches abort through AbortSignal.timeout. The hardware
+  finishes. Test fetches abort through AbortSignal.timeout.   The hardware
   MSD cycle is not given the 30 second ceiling: its job budget is already
   120 seconds, and an optional URL fetch can run longer. Its tool calls
   abort after 60 seconds, and its session close and fixture removal use
   the same 10 second bound.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  Local hashing before an MSD upload stops at PIKVM_MSD_JOB_TIMEOUT_MS
+  (default 21600000, six hours, clamped to 7 days). That timer starts
+  when hashing starts and is cleared when hashing finishes. It is not
+  the upload POST deadline: the POST still starts a fresh ceiling of
+  the same length. A hash read that is still going when the ceiling
+  ends stops, the file is closed, the upload slot is released, and
+  the job fails with PIKVM_MSD_HASH_TIMEOUT (hash timeout after <ms>ms).
+  The upload POST is not sent. There is no new environment variable.
+  cancelMsdJob during hashing is unchanged: it is still observed at
+  the catalog wait.
+  Hashing uses fs.read on the handle's descriptor, not FileHandle.read.
+  FileHandle.read holds a ref, and FileHandle.close then waits for
+  that read. Closing the handle after a hung fs.read releases the
+  descriptor without waiting for the read callback. A late callback
+  is ignored. On a filesystem whose read never returns, the kernel
+  call may still be in flight after the descriptor is closed; the
+  process no longer holds that fd and the upload slot is free.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  An MSD test body that hangs still runs teardown. Helpers register
+  close and restore on the test's after hook, which the runner calls
+  when the 30 second ceiling cancels the test. node:test records the
+  location of the function that calls test(). The wrappers call test()
+  from a one-line script attributed to the caller, so a failure points
+  at that line. AbortSignal.timeout stays armed after fetch returns.
+  A stall in the response body is reported with the operation name
+  instead of a raw TimeoutError.
   No code from another pikvm_mcp_server fork was copied.

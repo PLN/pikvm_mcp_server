@@ -1,13 +1,22 @@
 // Modified 2026-10 by PLN: bounded MSD test teardown and fetch (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: caller locations, body timeouts, and teardown after a hang (GPL-3.0; see NOTICE).
 
 /**
  * Ceilings for the MSD tests. Each subtest is finite and shorter than
  * the file, so one stall fails that subtest and the rest of the file
  * still runs. Teardown and fetch use a shorter bound and reject with
  * the operation's name. The timer is cleared when the work finishes.
+ * A hang in the test body still runs teardown: helpers register it on
+ * the test's after hook, which the runner calls when the ceiling fires.
+ * node:test records the location of the function that calls test().
+ * These wrappers call test() from a one-line script attributed to the
+ * real caller, so a failure points at that line.
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks';
 import test from 'node:test';
+import vm from 'node:vm';
+import { fileURLToPath } from 'node:url';
 
 export const MSD_SUBTEST_TIMEOUT_MS = 30_000;
 export const MSD_UPLOAD_SUITE_TIMEOUT_MS = 120_000;
@@ -15,6 +24,10 @@ export const MSD_FILE_TIMEOUT_MS = 300_000;
 export const MSD_TEARDOWN_TIMEOUT_MS = 10_000;
 export const MSD_FETCH_TIMEOUT_MS = 10_000;
 export const MSD_HW_FETCH_TIMEOUT_MS = 60_000;
+
+const here = fileURLToPath(import.meta.url);
+const currentTest = new AsyncLocalStorage();
+const BODY_METHODS = ['arrayBuffer', 'blob', 'bytes', 'formData', 'json', 'text'];
 
 function errorText(err) {
   if (err instanceof Error && err.message) return err.message;
@@ -50,14 +63,66 @@ export function closed(server, label, ms = MSD_TEARDOWN_TIMEOUT_MS) {
   });
 }
 
-export async function boundedFetch(url, init = {}, label = 'fetch', ms = MSD_FETCH_TIMEOUT_MS) {
-  const signal = init.signal ?? AbortSignal.timeout(ms);
-  try {
-    return await fetch(url, { ...init, signal });
-  } catch (err) {
-    if (init.signal == null && err && err.name === 'TimeoutError') {
-      throw new Error(`${label} timed out after ${ms}ms`, { cause: err });
+function labelTimeout(err, label, ms) {
+  if (err && err.name === 'TimeoutError') {
+    throw new Error(`${label} timed out after ${ms}ms`, { cause: err });
+  }
+  throw err;
+}
+
+function wrapMethod(target, method, label, ms) {
+  const orig = target[method];
+  if (typeof orig !== 'function') return;
+  target[method] = async (...args) => {
+    try {
+      return await orig.apply(target, args);
+    } catch (err) {
+      labelTimeout(err, label, ms);
     }
+  };
+}
+
+/**
+ * AbortSignal.timeout stays armed after fetch() resolves. A stall in
+ * res.json() or res.text() is the same signal, and the error is a raw
+ * TimeoutError unless the body method is wrapped with the call's label.
+ */
+function wrapFetchBody(res, label, ms) {
+  for (const method of BODY_METHODS) wrapMethod(res, method, label, ms);
+  return res;
+}
+
+function wrapDispatchBody(res, label, ms) {
+  const body = res && res.body;
+  if (!body) return res;
+  for (const method of BODY_METHODS) wrapMethod(body, method, label, ms);
+  if (typeof body[Symbol.asyncIterator] === 'function') {
+    const orig = body[Symbol.asyncIterator].bind(body);
+    body[Symbol.asyncIterator] = function labeledIterator() {
+      const iterator = orig();
+      const next = iterator.next.bind(iterator);
+      iterator.next = async (...args) => {
+        try {
+          return await next(...args);
+        } catch (err) {
+          labelTimeout(err, label, ms);
+        }
+      };
+      return iterator;
+    };
+  }
+  return res;
+}
+
+export async function boundedFetch(url, init = {}, label = 'fetch', ms = MSD_FETCH_TIMEOUT_MS) {
+  const ownSignal = init.signal == null;
+  const signal = ownSignal ? AbortSignal.timeout(ms) : init.signal;
+  try {
+    const res = await fetch(url, { ...init, signal });
+    if (ownSignal) wrapFetchBody(res, label, ms);
+    return res;
+  } catch (err) {
+    if (ownSignal) labelTimeout(err, label, ms);
     throw err;
   }
 }
@@ -66,11 +131,11 @@ export async function boundedDispatch(dispatch, url, init = {}, label = 'request
   const ownSignal = init.signal == null;
   const signal = ownSignal ? AbortSignal.timeout(ms) : init.signal;
   try {
-    return await dispatch(url, { ...init, signal });
+    const res = await dispatch(url, { ...init, signal });
+    if (ownSignal) wrapDispatchBody(res, label, ms);
+    return res;
   } catch (err) {
-    if (ownSignal && err && err.name === 'TimeoutError') {
-      throw new Error(`${label} timed out after ${ms}ms`, { cause: err });
-    }
+    if (ownSignal) labelTimeout(err, label, ms);
     throw err;
   }
 }
@@ -109,6 +174,23 @@ export async function finishWith(work, teardown) {
   return result;
 }
 
+/**
+ * Run teardown when the test ends, including when its ceiling cancels it.
+ * The same function is what finishWith awaits, so a normal exit does not
+ * close twice. Outside an msdTest there is no after hook, and the
+ * returned function is still the teardown.
+ */
+export function onTestTeardown(fn) {
+  let running;
+  const once = () => {
+    if (!running) running = Promise.resolve().then(() => fn());
+    return running;
+  };
+  const t = currentTest.getStore();
+  if (t) t.after(() => once());
+  return once;
+}
+
 function combine(primary, extra) {
   const err = new Error(`${errorText(primary)}; ${errorText(extra)}`);
   err.cause = primary;
@@ -125,12 +207,41 @@ function withTimeout(options) {
   return { ...options, timeout };
 }
 
+function callerSite() {
+  const frames = new Error().stack.split('\n').slice(1);
+  for (const frame of frames) {
+    const match = frame.match(/\(?((?:file:\/\/)?[^():]+):(\d+):(\d+)\)?$/);
+    if (!match) continue;
+    let file = match[1];
+    if (file.startsWith('file://')) file = fileURLToPath(file);
+    if (file === here) continue;
+    return { file, line: Number(match[2]), column: Number(match[3]) };
+  }
+  return undefined;
+}
+
+function runRegistered(source, fields) {
+  const site = callerSite();
+  const context = vm.createContext({ test, ...fields });
+  const script = new vm.Script(source, site ? {
+    filename: site.file,
+    lineOffset: site.line - 1,
+    columnOffset: Math.max(0, site.column - 1),
+  } : undefined);
+  return script.runInContext(context);
+}
+
 export function msdTest(name, options, fn) {
   if (typeof options === 'function') {
     fn = options;
     options = undefined;
   }
-  return test(name, withTimeout(options), fn);
+  const wrapped = (t) => currentTest.run(t, () => fn(t));
+  return runRegistered('test(name, options, fn)', {
+    name,
+    options: withTimeout(options),
+    fn: wrapped,
+  });
 }
 
 export function msdSubtest(t, name, options, fn) {
@@ -138,5 +249,11 @@ export function msdSubtest(t, name, options, fn) {
     fn = options;
     options = undefined;
   }
-  return t.test(name, withTimeout(options), fn);
+  const wrapped = (inner) => currentTest.run(inner, () => fn(inner));
+  return runRegistered('t.test(name, options, fn)', {
+    t,
+    name,
+    options: withTimeout(options),
+    fn: wrapped,
+  });
 }
