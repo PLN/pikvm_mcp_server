@@ -1,12 +1,16 @@
 // Modified 2026-10 by PLN: opt-in MSD hardware cycle (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: MSD also needs the device armMsd (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: cleanup confirms created names on this device (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: bounded MSD test teardown and fetch (GPL-3.0; see NOTICE).
 
 /**
  * MSD write cycle. Skipped unless PIKVM_HW_TEST_DEVICE is set, and
  * skipped again unless PIKVM_HW_TEST_ALLOW_MSD is 1 or force and
  * PIKVM_MCP_ARM_MSD is 1. force is dangerous: it disconnects a drive
  * that is already in use. Cleanup still runs if the process is not killed.
+ * Session close and fixture removal use the shared bound. This cycle
+ * does not use the 30s subtest ceiling: its job budget is already
+ * 120 seconds, and an optional URL fetch can run longer.
  */
 
 import assert from 'node:assert/strict';
@@ -18,6 +22,7 @@ import { hwSkipReason } from './gate.mjs';
 import { hwTestImageName, prepareHwImage } from './media.mjs';
 import { openHardwareSession } from './session.mjs';
 import { runMsdWriteCycle } from './cycle.mjs';
+import { MSD_HW_FETCH_TIMEOUT_MS, bounded, runBounded } from '../msd-bounds.mjs';
 
 const skip = hwSkipReason();
 
@@ -40,7 +45,10 @@ describe('MSD hardware cycle', { concurrency: false }, () => {
     try {
       const prepared = await prepareHwImage(dir, imageName);
       console.log(`hw: image ${imageName} (${prepared.bytes} bytes)`);
-      session = await openHardwareSession({ msd: { localDir: dir } });
+      session = await openHardwareSession({
+        msd: { localDir: dir },
+        fetchTimeoutMs: MSD_HW_FETCH_TIMEOUT_MS,
+      });
       if (session.armMsd !== true) {
         throw new Error(`device ${session.device} armMsd is off; the hardware MSD check is refused`);
       }
@@ -60,8 +68,10 @@ describe('MSD hardware cycle', { concurrency: false }, () => {
       }
       assert.deepEqual(outcome.leftovers, []);
     } finally {
-      if (session) await session.close();
-      await rm(dir, { recursive: true, force: true });
+      await runBounded([
+        () => (session ? session.close() : Promise.resolve()),
+        () => bounded('hardware fixture cleanup', rm(dir, { recursive: true, force: true })),
+      ]);
     }
   });
 });

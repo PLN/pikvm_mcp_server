@@ -2,6 +2,7 @@
 // Modified 2026-10 by PLN: 1 MiB ISO and leftover names (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: restore a leftover image this run did not create (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: catalog confirmation uses a short budget (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: bounded MSD test teardown and fetch (GPL-3.0; see NOTICE).
 
 /**
  * Forced-failure dry run. The kvmd mock stands in for the device.
@@ -15,7 +16,7 @@ import { execFile } from 'node:child_process';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, test } from 'node:test';
+import { describe } from 'node:test';
 import { promisify } from 'node:util';
 import { PiKVMClient } from '../dist/pikvm/client.js';
 import { parseUrlAllowlist } from '../dist/url-policy.js';
@@ -30,6 +31,14 @@ import {
 import { openToolSession } from './hw/session.mjs';
 import { runMsdWriteCycle } from './hw/cycle.mjs';
 import { startKvmdMock } from './kvmd-mock.mjs';
+import {
+  MSD_FETCH_TIMEOUT_MS,
+  MSD_FILE_TIMEOUT_MS,
+  bounded,
+  finishWith,
+  msdTest,
+  runBounded,
+} from './msd-bounds.mjs';
 
 const execFileAsync = promisify(execFile);
 const ALLOW = parseUrlAllowlist('https://images.example/hw');
@@ -66,14 +75,16 @@ async function withCycle(mockOptions, fn) {
     msd: msdConfig(dir),
     armMsd: true,
     armHid: false,
+    fetchTimeoutMs: MSD_FETCH_TIMEOUT_MS,
   });
-  try {
-    await fn({ mock, dir, session, pikvm });
-  } finally {
-    await session.close();
-    await mock.close();
-    await rm(dir, { recursive: true, force: true });
-  }
+  await finishWith(
+    () => fn({ mock, dir, session, pikvm }),
+    () => runBounded([
+      () => session.close(),
+      () => bounded('cycle mock close', mock.close()),
+      () => bounded('fixture cleanup', rm(dir, { recursive: true, force: true })),
+    ]),
+  );
 }
 
 function assertIsoLayout(bytes) {
@@ -108,7 +119,8 @@ async function optionalIsoTool(bin, args, pattern) {
   }
 }
 
-test('the generated ISO is at least 300 sectors and has a PVD', async () => {
+describe('MSD cycle media', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
+msdTest('the generated ISO is at least 300 sectors and has a PVD', async () => {
   const bytes = hwIsoBytes();
   assertIsoLayout(bytes);
   assert.deepEqual(bytes, hwIsoBytes());
@@ -127,12 +139,13 @@ test('the generated ISO is at least 300 sectors and has a PVD', async () => {
     await optionalIsoTool('file', ['-b', prepared.path], /ISO 9660/i);
     await optionalIsoTool('isoinfo', ['-d', '-i', prepared.path], /CD001|Volume size is/i);
   } finally {
-    await rm(dir, { recursive: true, force: true });
+    await bounded('fixture cleanup', rm(dir, { recursive: true, force: true }));
   }
 });
+});
 
-describe('MSD cycle dry run', { concurrency: false }, () => {
-  test('a connected drive is skipped and not changed', async () => {
+describe('MSD cycle dry run', { concurrency: false, timeout: MSD_FILE_TIMEOUT_MS }, () => {
+  msdTest('a connected drive is skipped and not changed', async () => {
     await withCycle({
       images: ['disk.img', 'keep.img'],
       drive: { image: 'disk.img', connected: true, cdrom: false, rw: true },
@@ -154,7 +167,7 @@ describe('MSD cycle dry run', { concurrency: false }, () => {
     });
   });
 
-  test('a busy drive is skipped', async () => {
+  msdTest('a busy drive is skipped', async () => {
     await withCycle({
       images: ['disk.img'],
       busyFor: 4,
@@ -172,7 +185,7 @@ describe('MSD cycle dry run', { concurrency: false }, () => {
     });
   });
 
-  test('a forced failure restores the snapshot and leaves other mcp-hwtest names', async () => {
+  msdTest('a forced failure restores the snapshot and leaves other mcp-hwtest names', async () => {
     const imageName = hwTestImageName();
     const logs = [];
     await withCycle({
@@ -207,7 +220,7 @@ describe('MSD cycle dry run', { concurrency: false }, () => {
     });
   });
 
-  test('a selected leftover mcp-hwtest image is restored', async () => {
+  msdTest('a selected leftover mcp-hwtest image is restored', async () => {
     const imageName = hwTestImageName();
     const logs = [];
     await withCycle({
@@ -239,7 +252,7 @@ describe('MSD cycle dry run', { concurrency: false }, () => {
     });
   });
 
-  test('the full cycle uploads, ejects twice, fetches, and leaves the snapshot', async () => {
+  msdTest('the full cycle uploads, ejects twice, fetches, and leaves the snapshot', async () => {
     const imageName = hwTestImageName();
     const fetchImageName = hwTestImageName('url');
     await withCycle({
@@ -273,7 +286,7 @@ describe('MSD cycle dry run', { concurrency: false }, () => {
     });
   });
 
-  test('cdrom and rw are restored when the snapshot has no image', async () => {
+  msdTest('cdrom and rw are restored when the snapshot has no image', async () => {
     const imageName = hwTestImageName();
     await withCycle({
       images: [],
@@ -300,7 +313,7 @@ describe('MSD cycle dry run', { concurrency: false }, () => {
     });
   });
 
-  test('a non-https fetch URL fails before any upload', async () => {
+  msdTest('a non-https fetch URL fails before any upload', async () => {
     await withCycle({ images: ['disk.img'] }, async ({ mock, session }) => {
       await assert.rejects(
         () => runMsdWriteCycle(session.call, {

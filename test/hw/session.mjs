@@ -6,6 +6,7 @@
 // Modified 2026-10 by PLN: hardware logs go through redactUrl (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: probe OCR before the hardware session (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: hardware session uses the resolved OCR engine (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: bounded MSD test teardown and fetch (GPL-3.0; see NOTICE).
 
 /**
  * In-process MCP HTTP session aimed at one PiKVMClient.
@@ -28,6 +29,7 @@ import { createMcpServer } from '../../dist/server.js';
 import { ocrUsesKvmdProbe, resolveOcr } from '../../dist/ocr.js';
 import { resolveDevice } from '../../dist/msd.js';
 import { hwDeviceRequest } from './gate.mjs';
+import { bounded, boundedFetch, closed, runBounded } from '../msd-bounds.mjs';
 
 const CALIBRATION = { rounds: 2, verifyRounds: 1, moveDelayMs: 20 };
 
@@ -41,15 +43,17 @@ function rpcHeaders(token, sessionId) {
   return headers;
 }
 
-async function rpc(base, token, { sessionId, method, params }) {
-  return fetch(`${base}/mcp`, {
+async function rpc(base, token, { sessionId, method, params, fetchTimeoutMs }) {
+  const init = {
     method: 'POST',
     headers: rpcHeaders(token, sessionId),
     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
-  });
+  };
+  if (fetchTimeoutMs == null) return fetch(`${base}/mcp`, init);
+  return boundedFetch(`${base}/mcp`, init, `mcp ${method}`, fetchTimeoutMs);
 }
 
-async function openSession(base, token) {
+async function openSession(base, token, fetchTimeoutMs) {
   const res = await rpc(base, token, {
     method: 'initialize',
     params: {
@@ -57,6 +61,7 @@ async function openSession(base, token) {
       capabilities: {},
       clientInfo: { name: 'hw-suite', version: '1.0' },
     },
+    fetchTimeoutMs,
   });
   const body = await res.json();
   if (res.status !== 200) {
@@ -64,15 +69,19 @@ async function openSession(base, token) {
   }
   const sessionId = res.headers.get('mcp-session-id');
   if (!sessionId) throw new Error('initialize response has no mcp-session-id');
-  await fetch(`${base}/mcp`, {
+  const note = {
     method: 'POST',
     headers: rpcHeaders(token, sessionId),
     body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }),
-  });
+  };
+  if (fetchTimeoutMs == null) await fetch(`${base}/mcp`, note);
+  else await boundedFetch(`${base}/mcp`, note, 'mcp notifications/initialized', fetchTimeoutMs);
   return sessionId;
 }
 
-export async function openToolSession({ pikvm, msd, armHid, armMsd, calibration, fleet, screenshot, ocr }) {
+export async function openToolSession({
+  pikvm, msd, armHid, armMsd, calibration, fleet, screenshot, ocr, fetchTimeoutMs,
+}) {
   const token = randomBytes(24).toString('hex');
   const lock = fleet ? fleet.devices.get(fleet.defaultName).lock : new BusyLock();
   const httpServer = await startHttpServer({
@@ -94,13 +103,14 @@ export async function openToolSession({ pikvm, msd, armHid, armMsd, calibration,
   const address = httpServer.address();
   const port = address && typeof address === 'object' ? address.port : 0;
   const base = `http://127.0.0.1:${port}`;
-  const sessionId = await openSession(base, token);
+  const sessionId = await openSession(base, token, fetchTimeoutMs);
   return {
     async call(name, args) {
       const res = await rpc(base, token, {
         sessionId,
         method: 'tools/call',
         params: { name, arguments: args },
+        fetchTimeoutMs,
       });
       const body = await res.json();
       if (res.status !== 200) {
@@ -109,8 +119,10 @@ export async function openToolSession({ pikvm, msd, armHid, armMsd, calibration,
       return body.result;
     },
     async close() {
-      await new Promise((resolve) => httpServer.close(resolve));
-      await pikvm.close();
+      await runBounded([
+        () => closed(httpServer, 'tool session http server close'),
+        () => bounded('tool session client close', pikvm.close()),
+      ]);
     },
   };
 }
@@ -151,6 +163,7 @@ export async function openHardwareSession(overrides = {}) {
       calibration: config.calibration,
       screenshot: config.screenshot,
       ocr,
+      fetchTimeoutMs: overrides.fetchTimeoutMs,
     });
     const deviceConfig = {
       ...config,
@@ -169,10 +182,14 @@ export async function openHardwareSession(overrides = {}) {
         return session.call(name, { ...(args ?? {}), device: ctx.name });
       },
       async close() {
-        await session.close();
+        const others = [];
         for (const other of fleet.devices.values()) {
-          if (other.client !== ctx.client) await other.client.close();
+          if (other.client !== ctx.client) others.push(other);
         }
+        await runBounded([
+          () => session.close(),
+          ...others.map((other) => () => bounded('tool session client close', other.client.close())),
+        ]);
       },
       config: deviceConfig,
       pikvm: ctx.client,
@@ -198,6 +215,7 @@ export async function openHardwareSession(overrides = {}) {
     calibration: config.calibration,
     screenshot: config.screenshot,
     ocr,
+    fetchTimeoutMs: overrides.fetchTimeoutMs,
   });
   return {
     ...session,

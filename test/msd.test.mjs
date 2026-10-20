@@ -14,13 +14,15 @@
 // Modified 2026-10 by PLN: a finished job has already released the upload slot (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: incomplete size polling, slot-before-mount, and catalog cleanup (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: the slot-free upload test releases the second job (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: bounded MSD test teardown and fetch (GPL-3.0; see NOTICE).
 
 /**
  * MSD tools against the mock. The HTTP harness matches test/http.test.mjs.
- * No real PiKVM is contacted.
+ * No real PiKVM is contacted. Subtest ceilings and teardown bounds live
+ * in test/msd-bounds.mjs.
  */
 
-import test from 'node:test';
+import { describe } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import net from 'node:net';
@@ -40,6 +42,17 @@ import { parseUrlAllowlist } from '../dist/url-policy.js';
 import { startHttpServer } from '../dist/http.js';
 import { startKvmdMock } from './kvmd-mock.mjs';
 import { fifoAvailable, symlinkAvailable } from './posix-caps.mjs';
+import {
+  MSD_FILE_TIMEOUT_MS,
+  MSD_UPLOAD_SUITE_TIMEOUT_MS,
+  bounded,
+  boundedFetch,
+  closed,
+  finishWith,
+  msdSubtest,
+  msdTest,
+  runBounded,
+} from './msd-bounds.mjs';
 
 const execFileAsync = promisify(execFile);
 const TOKEN = 'test-bearer-token-0123456789abcdef';
@@ -77,11 +90,11 @@ function rpcHeaders(sessionId) {
 }
 
 async function rpc(base, { sessionId, method, params }) {
-  return fetch(`${base}/mcp`, {
+  return boundedFetch(`${base}/mcp`, {
     method: 'POST',
     headers: rpcHeaders(sessionId),
     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
-  });
+  }, `mcp ${method}`);
 }
 
 async function openSession(base) {
@@ -97,11 +110,11 @@ async function openSession(base) {
   assert.equal(res.status, 200, `initialize failed: ${JSON.stringify(body)}`);
   const sessionId = res.headers.get('mcp-session-id');
   assert.ok(sessionId, 'initialize response must set mcp-session-id');
-  await fetch(`${base}/mcp`, {
+  await boundedFetch(`${base}/mcp`, {
     method: 'POST',
     headers: rpcHeaders(sessionId),
     body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }),
-  });
+  }, 'mcp notifications/initialized');
   return sessionId;
 }
 
@@ -143,13 +156,16 @@ async function withSession(mockOptions, flags, fn) {
   });
   const { port } = httpServer.address();
   const base = `http://127.0.0.1:${port}`;
-  try {
-    const sessionId = await openSession(base);
-    await fn({ mock, base, sessionId });
-  } finally {
-    await new Promise((resolve) => httpServer.close(resolve));
-    await mock.close();
-  }
+  await finishWith(
+    async () => {
+      const sessionId = await openSession(base);
+      await fn({ mock, base, sessionId });
+    },
+    () => runBounded([
+      () => closed(httpServer, 'withSession http server close'),
+      () => bounded('withSession mock close', mock.close()),
+    ]),
+  );
 }
 
 function freePort() {
@@ -159,12 +175,13 @@ function freePort() {
     server.listen(0, '127.0.0.1', () => {
       const address = server.address();
       const port = address && typeof address === 'object' ? address.port : 0;
-      server.close(() => resolve(port));
+      closed(server, 'free-port server close').then(() => resolve(port), reject);
     });
   });
 }
 
-test('MSD arm-gate allows only the read-only list', () => {
+describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
+msdTest('MSD arm-gate allows only the read-only list', () => {
   assert.deepEqual([...MSD_READ_ONLY_TOOLS], ['pikvm_msd_status', 'pikvm_msd_job']);
   assert.equal(msdToolRequiresArm('pikvm_msd_status'), false);
   assert.equal(msdToolRequiresArm('pikvm_msd_job'), false);
@@ -183,7 +200,7 @@ test('MSD arm-gate allows only the read-only list', () => {
   assert.equal(ARM_GATED_TOOLS.has('pikvm_msd_remove'), false);
 });
 
-test('HTTP: MSD disarmed blocks mount and eject, status still reads', async () => {
+msdTest('HTTP: MSD disarmed blocks mount and eject, status still reads', async () => {
   await withSession(
     { images: ['disk.img'] },
     { armGateEnforced: true, msdArmGateEnforced: true },
@@ -221,7 +238,7 @@ test('HTTP: MSD disarmed blocks mount and eject, status still reads', async () =
   );
 });
 
-test('HTTP: ARM_HID armed does not arm MSD', async () => {
+msdTest('HTTP: ARM_HID armed does not arm MSD', async () => {
   await withSession(
     { images: ['disk.img'] },
     { armGateEnforced: false, msdArmGateEnforced: true },
@@ -241,7 +258,7 @@ test('HTTP: ARM_HID armed does not arm MSD', async () => {
   );
 });
 
-test('confirmImage mismatch makes no kvmd call', async () => {
+msdTest('confirmImage mismatch makes no kvmd call', async () => {
   await withSession({ images: ['disk.img'] }, OPEN, async ({ mock, base, sessionId }) => {
     const result = await callTool(base, sessionId, 'pikvm_msd_mount', {
       image: 'disk.img',
@@ -257,7 +274,7 @@ test('confirmImage mismatch makes no kvmd call', async () => {
   });
 });
 
-test('expectImage mismatch makes no mutating kvmd call', async () => {
+msdTest('expectImage mismatch makes no mutating kvmd call', async () => {
   await withSession(
     { images: ['disk.img'], drive: { image: 'disk.img', connected: true, cdrom: true, rw: false } },
     OPEN,
@@ -277,7 +294,7 @@ test('expectImage mismatch makes no mutating kvmd call', async () => {
   );
 });
 
-test('eject twice: the second reports alreadyDisconnected', async () => {
+msdTest('eject twice: the second reports alreadyDisconnected', async () => {
   await withSession({ images: ['disk.img'] }, OPEN, async ({ mock, base, sessionId }) => {
     const mounted = await callTool(base, sessionId, 'pikvm_msd_mount', {
       image: 'disk.img',
@@ -306,7 +323,7 @@ test('eject twice: the second reports alreadyDisconnected', async () => {
   });
 });
 
-test('mount failure rolls back to the snapshot', async () => {
+msdTest('mount failure rolls back to the snapshot', async () => {
   await withSession(
     { images: ['disk.img'], failSetConnected: true },
     OPEN,
@@ -335,7 +352,7 @@ test('mount failure rolls back to the snapshot', async () => {
   );
 });
 
-test('a failed mount rollback reports rollbackError', async () => {
+msdTest('a failed mount rollback reports rollbackError', async () => {
   await withSession(
     {
       images: ['orig.img', 'next.img'],
@@ -368,7 +385,7 @@ test('a failed mount rollback reports rollbackError', async () => {
   );
 });
 
-test('cdrom and non-writable images report rw false after kvmd coercion', async () => {
+msdTest('cdrom and non-writable images report rw false after kvmd coercion', async () => {
   await withSession({ images: ['disk.img', 'os.iso'] }, OPEN, async ({ mock, base, sessionId }) => {
     const cdrom = await callTool(base, sessionId, 'pikvm_msd_mount', {
       image: 'disk.img',
@@ -405,7 +422,7 @@ test('cdrom and non-writable images report rw false after kvmd coercion', async 
   });
 });
 
-test('mount refuses to eject a connected drive unless expectImage matches', async () => {
+msdTest('mount refuses to eject a connected drive unless expectImage matches', async () => {
   await withSession(CONNECTED, OPEN, async ({ mock, base, sessionId }) => {
     const mountOther = {
       image: 'other.img',
@@ -440,7 +457,7 @@ test('mount refuses to eject a connected drive unless expectImage matches', asyn
   });
 });
 
-test('a URL image makes no MSD POST', async () => {
+msdTest('a URL image makes no MSD POST', async () => {
   await withSession(CONNECTED, OPEN, async ({ mock, base, sessionId }) => {
     const result = await callTool(base, sessionId, 'pikvm_msd_mount', {
       image: 'nbd://host/disk',
@@ -456,7 +473,7 @@ test('a URL image makes no MSD POST', async () => {
   });
 });
 
-test('an unknown image makes no MSD POST', async () => {
+msdTest('an unknown image makes no MSD POST', async () => {
   await withSession(CONNECTED, OPEN, async ({ mock, base, sessionId }) => {
     const result = await callTool(base, sessionId, 'pikvm_msd_mount', {
       image: 'missing.img',
@@ -472,7 +489,7 @@ test('an unknown image makes no MSD POST', async () => {
   });
 });
 
-test('an incomplete image makes no MSD POST', async () => {
+msdTest('an incomplete image makes no MSD POST', async () => {
   await withSession({
     images: ['disk.img', { name: 'part.img', complete: false }],
     drive: { image: 'disk.img', connected: true, cdrom: false, rw: false },
@@ -491,7 +508,7 @@ test('an incomplete image makes no MSD POST', async () => {
   });
 });
 
-test('a busy kvmd makes no MSD POST', async () => {
+msdTest('a busy kvmd makes no MSD POST', async () => {
   await withSession({ ...CONNECTED, busyFor: 1 }, OPEN, async ({ mock, base, sessionId }) => {
     const result = await callTool(base, sessionId, 'pikvm_msd_mount', {
       image: 'other.img',
@@ -507,7 +524,7 @@ test('a busy kvmd makes no MSD POST', async () => {
   });
 });
 
-test('an offline kvmd makes no MSD POST', async () => {
+msdTest('an offline kvmd makes no MSD POST', async () => {
   await withSession({
     ...CONNECTED,
     online: false,
@@ -526,7 +543,7 @@ test('an offline kvmd makes no MSD POST', async () => {
   });
 });
 
-test('rollback keeps every error, including an unrestorable URL image', async () => {
+msdTest('rollback keeps every error, including an unrestorable URL image', async () => {
   await withSession({
     images: ['disk.img'],
     drive: { image: 'nbd://host/disk', connected: true, cdrom: false, rw: false },
@@ -552,7 +569,7 @@ test('rollback keeps every error, including an unrestorable URL image', async ()
   });
 });
 
-test('eject surfaces a kvmd error other than MsdDisconnectedError', async () => {
+msdTest('eject surfaces a kvmd error other than MsdDisconnectedError', async () => {
   await withSession({
     images: ['disk.img'],
     drive: { image: 'disk.img', connected: true, cdrom: true, rw: false },
@@ -578,7 +595,7 @@ test('eject surfaces a kvmd error other than MsdDisconnectedError', async () => 
   });
 });
 
-test('MSD mount is single-flight across HTTP sessions', { timeout: 15000 }, async () => {
+msdTest('MSD mount is single-flight across HTTP sessions', { timeout: 15000 }, async () => {
   await withSession(
     { images: ['a.img', 'b.img'], holdMutations: 1 },
     OPEN,
@@ -618,7 +635,7 @@ test('MSD mount is single-flight across HTTP sessions', { timeout: 15000 }, asyn
   );
 });
 
-test('HTTP process: PIKVM_MCP_ARM_HID=1 leaves MSD disarmed', { timeout: 20000 }, async () => {
+msdTest('HTTP process: PIKVM_MCP_ARM_HID=1 leaves MSD disarmed', { timeout: 20000 }, async () => {
   const mock = await startKvmdMock({ images: ['disk.img'] });
   const port = await freePort();
   const env = { ...process.env };
@@ -671,12 +688,14 @@ test('HTTP process: PIKVM_MCP_ARM_HID=1 leaves MSD disarmed', { timeout: 20000 }
     assert.equal(JSON.parse(status.content[0].text).online, true);
   } finally {
     child.kill('SIGTERM');
-    await new Promise((resolve) => child.once('exit', resolve));
-    await mock.close();
+    await runBounded([
+      () => waitChild(child, 'HTTP child exit'),
+      () => bounded('HTTP child mock close', mock.close()),
+    ]);
   }
 });
 
-test('stdio: MSD mount is ungated', { timeout: 20000 }, async () => {
+msdTest('stdio: MSD mount is ungated', { timeout: 20000 }, async () => {
   const mock = await startKvmdMock({ images: ['disk.img'] });
   const env = { ...process.env };
   delete env.PIKVM_MCP_PORT;
@@ -748,8 +767,10 @@ test('stdio: MSD mount is ungated', { timeout: 20000 }, async () => {
     assert.doesNotMatch(stderr, /MSD arm-gate/);
   } finally {
     child.kill('SIGTERM');
-    await new Promise((resolve) => child.once('exit', resolve));
-    await mock.close();
+    await runBounded([
+      () => waitChild(child, 'stdio child exit'),
+      () => bounded('stdio child mock close', mock.close()),
+    ]);
   }
 });
 
@@ -769,13 +790,25 @@ function uploadMsd(dir, extra = {}) {
   };
 }
 
+function waitChild(child, label) {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return bounded(label, new Promise((resolve) => {
+    child.once('exit', resolve);
+  })).catch((err) => {
+    child.kill('SIGKILL');
+    child.stdout?.destroy();
+    child.stderr?.destroy();
+    child.stdin?.destroy();
+    throw err;
+  });
+}
+
 async function withDir(fn) {
   const dir = await mkdtemp(join(tmpdir(), 'pikvm-msd-'));
-  try {
-    await fn(dir);
-  } finally {
-    await rm(dir, { recursive: true, force: true });
-  }
+  await finishWith(
+    () => fn(dir),
+    () => bounded('fixture cleanup', rm(dir, { recursive: true, force: true })),
+  );
 }
 
 async function toolNames(base, sessionId) {
@@ -942,7 +975,7 @@ async function withEioAfterFirstRead(fn) {
   }
 }
 
-test('expectImage is checked when the drive is disconnected', async () => {
+msdTest('expectImage is checked when the drive is disconnected', async () => {
   await withSession({
     images: ['disk.img', 'other.img'],
     drive: { image: 'disk.img', connected: false, cdrom: false, rw: false },
@@ -971,11 +1004,11 @@ test('expectImage is checked when the drive is disconnected', async () => {
   });
 });
 
-test('upload, remove, and job polling', { timeout: 120000 }, async (t) => {
+msdTest('upload, remove, and job polling', { timeout: MSD_UPLOAD_SUITE_TIMEOUT_MS }, async (t) => {
   const body = Buffer.from('abcd');
   const sum = digest(body);
 
-  await t.test('pikvm_msd_upload is hidden until the local directory is set', async () => {
+  await msdSubtest(t, 'pikvm_msd_upload is hidden until the local directory is set', async () => {
     await withSession({ images: [] }, OPEN, async ({ base, sessionId }) => {
       const hidden = await toolNames(base, sessionId);
       assert.equal(hidden.includes('pikvm_msd_upload'), false);
@@ -996,7 +1029,7 @@ test('upload, remove, and job polling', { timeout: 120000 }, async (t) => {
     });
   });
 
-  await t.test('path rejections make no kvmd call', async () => {
+  await msdSubtest(t, 'path rejections make no kvmd call', async () => {
     await withDir(async (dir) => {
       await writeFile(join(dir, 'real.img'), body);
       await mkdir(join(dir, 'dir.img'));
@@ -1030,7 +1063,7 @@ test('upload, remove, and job polling', { timeout: 120000 }, async (t) => {
     });
   });
 
-  await t.test('pre-check refusals make no MSD POST', async () => {
+  await msdSubtest(t, 'pre-check refusals make no MSD POST', async () => {
     await withDir(async (dir) => {
       await writeFile(join(dir, 'disk.img'), body);
       const cases = [
@@ -1063,7 +1096,7 @@ test('upload, remove, and job polling', { timeout: 120000 }, async (t) => {
     });
   });
 
-  await t.test('a happy upload reaches done with the same bytes and sha256', async () => {
+  await msdSubtest(t, 'a happy upload reaches done with the same bytes and sha256', async () => {
     await withDir(async (dir) => {
       await writeFile(join(dir, 'disk.img'), body);
       await withSession({ images: [], free: 1000 }, uploadMsd(dir), async ({ mock, base, sessionId }) => {
@@ -1089,7 +1122,7 @@ test('upload, remove, and job polling', { timeout: 120000 }, async (t) => {
     });
   });
 
-  await t.test('job polling sees running before done', async () => {
+  await msdSubtest(t, 'job polling sees running before done', async () => {
     await withDir(async (dir) => {
       await writeFile(join(dir, 'disk.img'), body);
       await withSession({ images: [], writeHoldMs: 400 }, uploadMsd(dir), async ({ mock, base, sessionId }) => {
@@ -1113,7 +1146,7 @@ test('upload, remove, and job polling', { timeout: 120000 }, async (t) => {
     });
   });
 
-  await t.test('a mid-upload reset is PIKVM_MSD_STATE_UNKNOWN on the job', async () => {
+  await msdSubtest(t, 'a mid-upload reset is PIKVM_MSD_STATE_UNKNOWN on the job', async () => {
     await withDir(async (dir) => {
       await writeFile(join(dir, 'disk.img'), body);
       await withSession({ images: [], resetDuringWrite: true }, uploadMsd(dir), async ({ base, sessionId }) => {
@@ -1129,7 +1162,7 @@ test('upload, remove, and job polling', { timeout: 120000 }, async (t) => {
     });
   });
 
-  await t.test('a sha256 mismatch fails the job before any kvmd call', async () => {
+  await msdSubtest(t, 'a sha256 mismatch fails the job before any kvmd call', async () => {
     await withDir(async (dir) => {
       await writeFile(join(dir, 'disk.img'), body);
       await withSession({ images: [] }, uploadMsd(dir), async ({ mock, base, sessionId }) => {
@@ -1149,7 +1182,7 @@ test('upload, remove, and job polling', { timeout: 120000 }, async (t) => {
     });
   });
 
-  await t.test('the jobId returns before hashing finishes', async () => {
+  await msdSubtest(t, 'the jobId returns before hashing finishes', async () => {
     await withDir(async (dir) => {
       await writeFile(join(dir, 'disk.img'), body);
       let release;
@@ -1182,7 +1215,7 @@ test('upload, remove, and job polling', { timeout: 120000 }, async (t) => {
     });
   });
 
-  await t.test('a second upload fails immediately while one is hashing', async () => {
+  await msdSubtest(t, 'a second upload fails immediately while one is hashing', async () => {
     await withDir(async (dir) => {
       await writeFile(join(dir, 'disk.img'), body);
       let release;
@@ -1219,7 +1252,7 @@ test('upload, remove, and job polling', { timeout: 120000 }, async (t) => {
     });
   });
 
-  await t.test('a file changed before the stream fails the job and the image is removed', async () => {
+  await msdSubtest(t, 'a file changed before the stream fails the job and the image is removed', async () => {
     await withDir(async (dir) => {
       const file = join(dir, 'disk.img');
       await writeFile(file, body);
@@ -1252,7 +1285,7 @@ test('upload, remove, and job polling', { timeout: 120000 }, async (t) => {
     });
   });
 
-  await t.test('finished jobs past the cap are dropped', async () => {
+  await msdSubtest(t, 'finished jobs past the cap are dropped', async () => {
     await withDir(async (dir) => {
       await writeFile(join(dir, 'disk.img'), body);
       await withSession({ images: [] }, uploadMsd(dir, { jobLimit: 2 }), async ({ base, sessionId }) => {
@@ -1278,7 +1311,7 @@ test('upload, remove, and job polling', { timeout: 120000 }, async (t) => {
     });
   });
 
-  await t.test('a failed job stays unfinished until the upload slot is free', async (inner) => {
+  await msdSubtest(t, 'a failed job stays unfinished until the upload slot is free', async (inner) => {
     watchCrashes(inner);
     await withDir(async (dir) => {
       await writeFile(join(dir, 'disk.img'), body);
@@ -1331,7 +1364,7 @@ test('upload, remove, and job polling', { timeout: 120000 }, async (t) => {
     });
   });
 
-  await t.test('a finished job is dropped after its ttl', async () => {
+  await msdSubtest(t, 'a finished job is dropped after its ttl', async () => {
     await withDir(async (dir) => {
       await writeFile(join(dir, 'disk.img'), body);
       await withSession({ images: [] }, uploadMsd(dir, { jobTtlMs: 400 }), async ({ base, sessionId }) => {
@@ -1351,7 +1384,7 @@ test('upload, remove, and job polling', { timeout: 120000 }, async (t) => {
     });
   });
 
-  await t.test('a screenshot is not blocked during an upload', async () => {
+  await msdSubtest(t, 'a screenshot is not blocked during an upload', async () => {
     await withDir(async (dir) => {
       await writeFile(join(dir, 'disk.img'), body);
       await withSession({ images: [], writeHoldMs: 1200 }, uploadMsd(dir), async ({ mock, base, sessionId }) => {
@@ -1374,7 +1407,7 @@ test('upload, remove, and job polling', { timeout: 120000 }, async (t) => {
     });
   });
 
-  await t.test('mount and eject do not queue behind an upload', async () => {
+  await msdSubtest(t, 'mount and eject do not queue behind an upload', async () => {
     await withDir(async (dir) => {
       await writeFile(join(dir, 'disk.img'), body);
       await withSession({
@@ -1408,7 +1441,7 @@ test('upload, remove, and job polling', { timeout: 120000 }, async (t) => {
     });
   });
 
-  await t.test('mount of an image with an active upload makes no POST', async () => {
+  await msdSubtest(t, 'mount of an image with an active upload makes no POST', async () => {
     await withDir(async (dir) => {
       await writeFile(join(dir, 'disk.img'), body);
       let release;
@@ -1444,7 +1477,7 @@ test('upload, remove, and job polling', { timeout: 120000 }, async (t) => {
     });
   });
 
-  await t.test('remove refuses while the drive is connected', async () => {
+  await msdSubtest(t, 'remove refuses while the drive is connected', async () => {
     await withSession({
       images: ['disk.img'],
       drive: { image: 'disk.img', connected: true, cdrom: true, rw: false },
@@ -1508,7 +1541,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
   return failed.error.message;
 }
 
-  await t.test('pikvm_msd_fetch_url is hidden until the allowlist has an https entry', async () => {
+  await msdSubtest(t, 'pikvm_msd_fetch_url is hidden until the allowlist has an https entry', async () => {
     await withSession({ images: [] }, OPEN, async ({ base, sessionId }) => {
       const hidden = await toolNames(base, sessionId);
       assert.equal(hidden.includes('pikvm_msd_fetch_url'), false);
@@ -1525,7 +1558,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
     });
   });
 
-  await t.test('url policy refusals make no kvmd call', async () => {
+  await msdSubtest(t, 'url policy refusals make no kvmd call', async () => {
     const cases = [
       ['not allowlisted', FETCH_ALLOW, { url: 'https://other.example/iso/disk.img', confirmImage: 'disk.img' }, /not allowlisted/, {}],
       ['http', FETCH_ALLOW, { url: 'http://images.example/iso/disk.img', confirmImage: 'disk.img' }, /https/, {}],
@@ -1545,7 +1578,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
     }
   });
 
-  await t.test('an allowlisted tailscale address reaches write_remote', async () => {
+  await msdSubtest(t, 'an allowlisted tailscale address reaches write_remote', async () => {
     const rows = [
       ['v4', 'https://100.101.102.103/,100.101.102.103/32', 'https://100.101.102.103/disk.img', async () => { throw new Error('dns'); }],
       ['v6', `${FETCH_ALLOW},fd7a:115c:a1e0::/48`, FETCH_URL, async () => ['fd7a:115c:a1e0::50']],
@@ -1570,7 +1603,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
     }
   });
 
-  await t.test('ALLOW_PRIVATE lets an rfc1918 address through and not metadata', async () => {
+  await msdSubtest(t, 'ALLOW_PRIVATE lets an rfc1918 address through and not metadata', async () => {
     await withSession({ images: [] }, fetchFlags(FETCH_ALLOW, {
       allowPrivate: true,
       resolveUrl: async () => ['10.1.2.3'],
@@ -1586,7 +1619,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
     });
   });
 
-  await t.test('ndjson progress maps into the job', async () => {
+  await msdSubtest(t, 'ndjson progress maps into the job', async () => {
     await withSession({
       images: [],
       remote: {
@@ -1613,7 +1646,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
     });
   });
 
-  await t.test('an error line fails the job and removes the incomplete image', async () => {
+  await msdSubtest(t, 'an error line fails the job and removes the incomplete image', async () => {
     await withSession({
       images: [],
       remote: {
@@ -1638,7 +1671,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
     });
   });
 
-  await t.test('a short stream is STATE_UNKNOWN and skips cleanup', async () => {
+  await msdSubtest(t, 'a short stream is STATE_UNKNOWN and skips cleanup', async () => {
     await withSession({
       images: [],
       remote: {
@@ -1660,7 +1693,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
     });
   });
 
-  await t.test('a second transfer fails fast and mount of that image makes no POST', async () => {
+  await msdSubtest(t, 'a second transfer fails fast and mount of that image makes no POST', async () => {
     await withDir(async (dir) => {
       await writeFile(join(dir, 'disk.img'), Buffer.from('abcd'));
       let release;
@@ -1710,7 +1743,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
     });
   });
 
-  await t.test('logs omit the query string and an explicit image is sent', async () => {
+  await msdSubtest(t, 'logs omit the query string and an explicit image is sent', async () => {
     const logged = [];
     const orig = console.error;
     console.error = (...args) => {
@@ -1740,7 +1773,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
     assert.equal(fetchLogs.some((line) => line.includes('supersecret') || line.includes('token=')), false);
   });
 
-  await t.test('pre-check refusals make no MSD POST', async () => {
+  await msdSubtest(t, 'pre-check refusals make no MSD POST', async () => {
     const cases = [
       ['connected', { images: ['other.img'], drive: { image: 'other.img', connected: true, cdrom: false, rw: false } }, 'MsdConnectedError'],
       ['exists', { images: ['disk.img'] }, 'MsdImageExistsError'],
@@ -1760,7 +1793,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
     }
   });
 
-  await t.test('service and embedded addresses make no kvmd call', async () => {
+  await msdSubtest(t, 'service and embedded addresses make no kvmd call', async () => {
     const wide = `${FETCH_ALLOW},100.64.0.0/10,fd7a:115c:a1e0::/48`;
     const cases = [
       ['aws', 'fd00:ec2::254', true],
@@ -1790,7 +1823,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
     }
   });
 
-  await t.test('decimal octal and hex loopback literals make no kvmd call', async () => {
+  await msdSubtest(t, 'decimal octal and hex loopback literals make no kvmd call', async () => {
     const allow = 'https://127.0.0.1/';
     for (const url of [
       'https://2130706433/disk.img',
@@ -1805,7 +1838,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
     }
   });
 
-  await t.test('a trailing-dot host matches the allowlist', async () => {
+  await msdSubtest(t, 'a trailing-dot host matches the allowlist', async () => {
     let seen = '';
     await withSession({ images: [] }, fetchFlags(FETCH_ALLOW, {
       resolveUrl: async (host) => {
@@ -1828,7 +1861,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
     });
   });
 
-  await t.test('derived names with encoded separators are refused', async () => {
+  await msdSubtest(t, 'derived names with encoded separators are refused', async () => {
     const cases = [
       ['dot slash', 'https://images.example/iso/%2e%2e%2fsecret.img', '../secret.img', /bare image name/],
       ['slash', 'https://images.example/iso/foo%2Fbar.img', 'foo/bar.img', /bare image name/],
@@ -1844,7 +1877,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
     }
   });
 
-  await t.test('confirmImage must echo the derived name', async () => {
+  await msdSubtest(t, 'confirmImage must echo the derived name', async () => {
     await withSession({ images: [] }, fetchFlags(FETCH_ALLOW), async ({ mock, base, sessionId }) => {
       const result = await callTool(base, sessionId, 'pikvm_msd_fetch_url', {
         url: FETCH_URL,
@@ -1856,7 +1889,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
     });
   });
 
-  await t.test('a DNS failure makes no kvmd call', async () => {
+  await msdSubtest(t, 'a DNS failure makes no kvmd call', async () => {
     await withSession({ images: [] }, fetchFlags(FETCH_ALLOW, {
       resolveUrl: async () => { throw new Error('dns down'); },
     }), async ({ mock, base, sessionId }) => {
@@ -1867,7 +1900,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
     });
   });
 
-  await t.test('an early write_remote error does not remove', async () => {
+  await msdSubtest(t, 'an early write_remote error does not remove', async () => {
     const bodies = [
       [400, 'ValidatorError', 'missing Content-Length for https://alice:s3cret@images.example/iso/disk.img?token=supersecret'],
       [404, 'NotFoundError', 'not found'],
@@ -1900,7 +1933,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
     }
   });
 
-  await t.test('an error after another image progress does not remove', async () => {
+  await msdSubtest(t, 'an error after another image progress does not remove', async () => {
     await withSession({
       images: ['other.img'],
       remote: {
@@ -1923,7 +1956,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
     });
   });
 
-  await t.test('kvmd removing the incomplete image is already gone', async () => {
+  await msdSubtest(t, 'kvmd removing the incomplete image is already gone', async () => {
     await withSession({
       images: [],
       remote: {
@@ -1949,7 +1982,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
     });
   });
 
-  await t.test('connect timeout is the value sent to write_remote', async () => {
+  await msdSubtest(t, 'connect timeout is the value sent to write_remote', async () => {
     await withSession({ images: [] }, fetchFlags(FETCH_ALLOW, {
       connectTimeoutSec: 12,
     }), async ({ mock, base, sessionId }) => {
@@ -1965,7 +1998,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
     });
   });
 
-  await t.test('a connection reset mid-upload does not crash the process', async () => {
+  await msdSubtest(t, 'a connection reset mid-upload does not crash the process', async () => {
     await withDir(async (dir) => {
       await writeFile(join(dir, 'disk.img'), Buffer.alloc(256 * 1024, 4));
       await withStalledFsRead(200, () => whileWatchingProcess(async () => {
@@ -1987,7 +2020,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
     });
   });
 
-  await t.test('an idle timeout mid-upload does not crash the process', async () => {
+  await msdSubtest(t, 'an idle timeout mid-upload does not crash the process', async () => {
     await withDir(async (dir) => {
       await writeFile(join(dir, 'disk.img'), Buffer.alloc(64 * 1024, 5));
       const flags = uploadMsd(dir, { maxBytes: 1024 * 1024 });
@@ -2012,7 +2045,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
     });
   });
 
-  await t.test('a source read error mid-upload does not crash the process', async () => {
+  await msdSubtest(t, 'a source read error mid-upload does not crash the process', async () => {
     await withDir(async (dir) => {
       await writeFile(join(dir, 'disk.img'), Buffer.from('abcd'));
       await writeFile(join(dir, 'next.img'), Buffer.from('wxyz'));
@@ -2073,7 +2106,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
   }
 
   for (const kind of ['upload', 'fetch']) {
-    await t.test(`${kind}: a delayed catalog succeeds with one write`, async (inner) => {
+    await msdSubtest(t, `${kind}: a delayed catalog succeeds with one write`, async (inner) => {
       watchCrashes(inner);
       const run = kind === 'upload' ? withUpload : withFetch;
       await run({ images: [], catalogHidePolls: 3 }, 4000, async ({ mock, base, sessionId }) => {
@@ -2116,7 +2149,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
       });
     });
 
-    await t.test(`${kind}: an incomplete catalog row that becomes complete succeeds`, async (inner) => {
+    await msdSubtest(t, `${kind}: an incomplete catalog row that becomes complete succeeds`, async (inner) => {
       watchCrashes(inner);
       const run = kind === 'upload' ? withUpload : withFetch;
       await run({ images: [], catalogIncompletePolls: 2 }, 2000, async ({ mock, base, sessionId }) => {
@@ -2132,7 +2165,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
       });
     });
 
-    await t.test(`${kind}: an image that never appears is PIKVM_MSD_CATALOG_TIMEOUT`, async (inner) => {
+    await msdSubtest(t, `${kind}: an image that never appears is PIKVM_MSD_CATALOG_TIMEOUT`, async (inner) => {
       watchCrashes(inner);
       const run = kind === 'upload' ? withUpload : withFetch;
       await run({ images: [], catalogHidePolls: 1000 }, 300, async ({ mock, base, sessionId }) => {
@@ -2148,7 +2181,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
       });
     });
 
-    await t.test(`${kind}: an image that stays incomplete is incomplete`, async (inner) => {
+    await msdSubtest(t, `${kind}: an image that stays incomplete is incomplete`, async (inner) => {
       watchCrashes(inner);
       const run = kind === 'upload' ? withUpload : withFetch;
       await run({ images: [], catalogIncompletePolls: 1000 }, 300, async ({ mock, base, sessionId }) => {
@@ -2164,7 +2197,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
       });
     });
 
-    await t.test(`${kind}: a size mismatch fails the job`, async (inner) => {
+    await msdSubtest(t, `${kind}: a size mismatch fails the job`, async (inner) => {
       watchCrashes(inner);
       const run = kind === 'upload' ? withUpload : withFetch;
       await run({ images: [], catalogSize: 9 }, 300, async ({ mock, base, sessionId }) => {
@@ -2179,7 +2212,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
       });
     });
 
-    await t.test(`${kind}: cancellation during readiness does not write again`, async (inner) => {
+    await msdSubtest(t, `${kind}: cancellation during readiness does not write again`, async (inner) => {
       watchCrashes(inner);
       const run = kind === 'upload' ? withUpload : withFetch;
       await run({ images: [], catalogHidePolls: 1000 }, 800, async ({ mock, base, sessionId }) => {
@@ -2197,7 +2230,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
       });
     });
 
-    await t.test(`${kind}: a complete wrong size fails before the budget ends`, async (inner) => {
+    await msdSubtest(t, `${kind}: a complete wrong size fails before the budget ends`, async (inner) => {
       watchCrashes(inner);
       const budget = 3000;
       const run = kind === 'upload' ? withUpload : withFetch;
@@ -2217,7 +2250,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
       });
     });
 
-    await t.test(`${kind}: an image that never appears is confirmed without another full budget`, async (inner) => {
+    await msdSubtest(t, `${kind}: an image that never appears is confirmed without another full budget`, async (inner) => {
       watchCrashes(inner);
       const budget = 2000;
       const run = kind === 'upload' ? withUpload : withFetch;
@@ -2239,7 +2272,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
       });
     });
 
-    await t.test(`${kind}: an image that comes back after remove uses the full confirm budget`, async (inner) => {
+    await msdSubtest(t, `${kind}: an image that comes back after remove uses the full confirm budget`, async (inner) => {
       watchCrashes(inner);
       const budget = 2000;
       const run = kind === 'upload' ? withUpload : withFetch;
@@ -2266,7 +2299,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
       });
     });
 
-    await t.test(`${kind}: a slow catalog read stops near the readiness deadline`, async (inner) => {
+    await msdSubtest(t, `${kind}: a slow catalog read stops near the readiness deadline`, async (inner) => {
       watchCrashes(inner);
       const budget = 500;
       const run = kind === 'upload' ? withUpload : withFetch;
@@ -2292,7 +2325,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
       });
     });
 
-    await t.test(`${kind}: an incomplete wrong size keeps polling`, async (inner) => {
+    await msdSubtest(t, `${kind}: an incomplete wrong size keeps polling`, async (inner) => {
       watchCrashes(inner);
       const run = kind === 'upload' ? withUpload : withFetch;
       await run({ images: [], catalogIncompletePolls: 2, catalogSize: 9 }, 4000, async ({ mock, base, sessionId }) => {
@@ -2312,7 +2345,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
       });
     });
 
-    await t.test(`${kind}: an incomplete wrong size stays incomplete until the deadline`, async (inner) => {
+    await msdSubtest(t, `${kind}: an incomplete wrong size stays incomplete until the deadline`, async (inner) => {
       watchCrashes(inner);
       const budget = 500;
       const run = kind === 'upload' ? withUpload : withFetch;
@@ -2331,7 +2364,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
       });
     });
 
-    await t.test(`${kind}: catalog failure cleanup holds the MSD lock`, async (inner) => {
+    await msdSubtest(t, `${kind}: catalog failure cleanup holds the MSD lock`, async (inner) => {
       watchCrashes(inner);
       const run = kind === 'upload' ? withUpload : withFetch;
       await run({
@@ -2369,7 +2402,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
     });
   }
 
-  await t.test('an image absent at remove time, then visible, is confirmed gone', async (inner) => {
+  await msdSubtest(t, 'an image absent at remove time, then visible, is confirmed gone', async (inner) => {
     watchCrashes(inner);
     await withUpload({ images: [], catalogHidePolls: 3 }, 300, async ({ mock, base, sessionId }) => {
       const started = await startTransfer('upload', base, sessionId);
@@ -2384,7 +2417,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
     });
   });
 
-  await t.test('a successful upload is done, with the slot free, before mount', async (inner) => {
+  await msdSubtest(t, 'a successful upload is done, with the slot free, before mount', async (inner) => {
     watchCrashes(inner);
     await withDir(async (dir) => {
       await writeFile(join(dir, 'disk.img'), Buffer.from('abcd'));
@@ -2460,7 +2493,7 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
     });
   });
 
-  await t.test('a close failure after the catalog removes the image under the lock', async (inner) => {
+  await msdSubtest(t, 'a close failure after the catalog removes the image under the lock', async (inner) => {
     watchCrashes(inner);
     await withDir(async (dir) => {
       await writeFile(join(dir, 'disk.img'), Buffer.from('abcd'));
@@ -2515,4 +2548,5 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
       }
     });
   });
+});
 });
