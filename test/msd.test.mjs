@@ -13,6 +13,7 @@
 // Modified 2026-10 by PLN: symlink and FIFO path checks follow the platform (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a finished job has already released the upload slot (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: incomplete size polling, slot-before-mount, and catalog cleanup (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: the slot-free upload test releases the second job (GPL-3.0; see NOTICE).
 
 /**
  * MSD tools against the mock. The HTTP harness matches test/http.test.mjs.
@@ -2389,8 +2390,16 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
       await writeFile(join(dir, 'disk.img'), Buffer.from('abcd'));
       await writeFile(join(dir, 'next.img'), Buffer.from('wxyz'));
       let release;
+      // The hook pauses only the first upload. The sha256-mismatch upload
+      // below also closes through this hook; blocking it keeps the
+      // process-wide slot held after this test returns.
+      let pauseSlotRelease = true;
       const flags = uploadMsd(dir, {
-        beforeSlotRelease: () => new Promise((resolve) => { release = resolve; }),
+        beforeSlotRelease: () => {
+          if (!pauseSlotRelease) return undefined;
+          pauseSlotRelease = false;
+          return new Promise((resolve) => { release = resolve; });
+        },
       });
       try {
         await withSession({
@@ -2432,7 +2441,8 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
             sha256: 'b'.repeat(64),
           });
           assert.equal(next.isError, undefined, next.content[0].text);
-          assert.equal(typeof JSON.parse(next.content[0].text).jobId, 'string');
+          const nextId = JSON.parse(next.content[0].text).jobId;
+          assert.equal(typeof nextId, 'string');
           mock.releaseHold();
           const mounted = await mountPromise;
           assert.equal(mounted.isError, undefined, mounted.content[0].text);
@@ -2440,6 +2450,9 @@ async function refusedFetch(base, sessionId, mock, args, pattern) {
           assert.equal(mock.calls.filter((call) => (
             call.path === '/api/msd/write' && call.query.includes('next.img')
           )).length, 0);
+          const nextFailed = await pollJob(base, sessionId, nextId);
+          assert.equal(nextFailed.state, 'failed');
+          assert.match(nextFailed.error.message, /sha256 mismatch/);
         });
       } finally {
         if (release) release();
