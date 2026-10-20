@@ -1,6 +1,7 @@
 # Modified 2026-10 by PLN: CI test job, actions pinned to v5 (GPL-3.0; see NOTICE).
 # Modified 2026-10 by PLN: CI Node is 22.14.0 (GPL-3.0; see NOTICE).
 # Modified 2026-10 by PLN: npm 12 allowScripts install job (GPL-3.0; see NOTICE).
+# Modified 2026-10 by PLN: sharp loads after the strict install (GPL-3.0; see NOTICE).
 # Test-job idea adapted from dvaerum/pikvm_mcp_server
 # .github/workflows/ci.yml @ 00cbfc0207c1be2b28b25679019e7fe9bd9d9654
 # (GPL-3.0, test job only).
@@ -47,3 +48,5 @@ jobs:
         run: node -e "const major=Number(require('child_process').execSync('npm --version',{encoding:'utf8'}).trim().split('.')[0]); if(!(major>=12)) process.exit(1)"
       - name: Install with allowScripts enforced
         run: npm ci --strict-allow-scripts
+      - name: Load sharp
+        run: node -e "require('sharp')"

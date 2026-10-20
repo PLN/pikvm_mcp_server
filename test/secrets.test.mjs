@@ -4,6 +4,7 @@
 // Modified 2026-10 by PLN: file-URL import, and POSIX fixture skips (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: systemd 0440 group-bit cases (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: credential skip boundaries and opened inode (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: decoy credential-root environment names (GPL-3.0; see NOTICE).
 
 /**
  * resolveSecret order and file rules. Temp directories are removed.
@@ -544,12 +545,22 @@ describe('resolveSecret', () => {
       return;
     }
     await withCredentialTree(async ({ dir, credentialsRoot }) => {
-      const arbitrary = join(dir, 'arbitrary', 'pikvm-mcp.service');
+      const decoyRoot = join(dir, 'arbitrary');
+      const arbitrary = join(decoyRoot, 'pikvm-mcp.service');
       mkdirSync(arbitrary, { recursive: true });
       const file = join(arbitrary, 'pikvm-password');
       writeMode(file, 'env-root-secret\n', 0o440);
-      const saved = process.env.CREDENTIALS_DIRECTORY;
+      const envKeys = [
+        'CREDENTIALS_DIRECTORY',
+        'PIKVM_CREDENTIALS_ROOT',
+        'CREDENTIALS_ROOT',
+        'PIKVM_MCP_CREDENTIALS_ROOT',
+      ];
+      const saved = new Map(envKeys.map((key) => [key, process.env[key]]));
       process.env.CREDENTIALS_DIRECTORY = arbitrary;
+      process.env.PIKVM_CREDENTIALS_ROOT = decoyRoot;
+      process.env.CREDENTIALS_ROOT = decoyRoot;
+      process.env.PIKVM_MCP_CREDENTIALS_ROOT = decoyRoot;
       try {
         const withRoot = capture(() => resolveSecret({
           name: 'PIKVM_PASSWORD',
@@ -575,8 +586,10 @@ describe('resolveSecret', () => {
         assert.match(productionRoot.lines[0], /group bits are set/);
         assert.equal(productionRoot.lines[0].includes('env-root-secret'), false);
       } finally {
-        if (saved === undefined) delete process.env.CREDENTIALS_DIRECTORY;
-        else process.env.CREDENTIALS_DIRECTORY = saved;
+        for (const [key, value] of saved) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
       }
     });
   });
