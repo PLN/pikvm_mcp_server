@@ -3,6 +3,7 @@
 // Modified 2026-10 by PLN: http and https on one host are the same device (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: per-device screenshot preview defaults (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: per-device OCR narrowing (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: secret mode check uses the registry env (GPL-3.0; see NOTICE).
 // Host normalisation follows the idea of dtrukr/pikvm_mcp_server
 // normalizeHost at 097b529 (GPL-3.0, a fork of
 // KultivatorConsulting/pikvm_mcp_server). This file is written fresh.
@@ -142,7 +143,7 @@ function resolvePassword(device: string, raw: Record<string, unknown>, env: Node
     if (typeof raw.passwordFile !== 'string' || raw.passwordFile === '') {
       throw new Error(`device ${device} passwordFile: must be a non-empty string`);
     }
-    return readSecretAtPath(raw.passwordFile, `device ${device} passwordFile`);
+    return readSecretAtPath(raw.passwordFile, `device ${device} passwordFile`, { env });
   }
   if (typeof raw.passwordCredential !== 'string' || raw.passwordCredential === '') {
     throw new Error(`device ${device} passwordCredential: must be a single path segment`);
@@ -157,7 +158,7 @@ function resolvePassword(device: string, raw: Record<string, unknown>, env: Node
   } catch {
     throw new Error(`device ${device} passwordCredential: must be a single path segment`);
   }
-  return readSecretAtPath(full, `device ${device} passwordCredential`);
+  return readSecretAtPath(full, `device ${device} passwordCredential`, { env });
 }
 
 function resolveDeviceTls(
