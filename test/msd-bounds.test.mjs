@@ -1,4 +1,5 @@
 // Modified 2026-10 by PLN: bounded MSD test teardown and fetch (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: caller locations and labeled body timeouts (GPL-3.0; see NOTICE).
 
 /**
  * The MSD bound helper. A hang rejects with the operation name, the
@@ -6,8 +7,14 @@
  */
 
 import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
 import http from 'node:http';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe } from 'node:test';
+import { promisify } from 'node:util';
+import { fileURLToPath } from 'node:url';
 import {
   MSD_FETCH_TIMEOUT_MS,
   MSD_FILE_TIMEOUT_MS,
@@ -21,6 +28,9 @@ import {
   msdTest,
   runBounded,
 } from './msd-bounds.mjs';
+
+const execFileAsync = promisify(execFile);
+const BOUNDS = fileURLToPath(new URL('./msd-bounds.mjs', import.meta.url));
 
 describe('MSD test bounds', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
   msdTest('ceilings stay ordered', () => {
@@ -144,6 +154,81 @@ describe('MSD test bounds', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
       server.closeAllConnections();
       await closed(server, 'listen server close');
     }
+  });
+
+  msdTest('a stalled response body names the call', async () => {
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.write('{');
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address();
+    try {
+      const res = await boundedFetch(
+        `http://127.0.0.1:${port}/mcp`,
+        { method: 'GET' },
+        'mcp initialize',
+        80,
+      );
+      await assert.rejects(
+        () => res.json(),
+        (err) => {
+          assert.equal(err.message, 'mcp initialize timed out after 80ms');
+          assert.equal(err.cause.name, 'TimeoutError');
+          return true;
+        },
+      );
+    } finally {
+      server.closeAllConnections();
+      await closed(server, 'listen server close');
+    }
+  });
+
+  msdTest('a failure location is the caller, and a hung body still exits', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'pikvm-msd-loc-'));
+    const file = join(dir, 'loc.test.mjs');
+    const source = [
+      "import http from 'node:http';",
+      "import assert from 'node:assert/strict';",
+      `import { msdTest, onTestTeardown } from ${JSON.stringify(BOUNDS)};`,
+      "msdTest('assert line', () => {",
+      '  assert.equal(1, 2);',
+      '});',
+      "msdTest('timeout line', { timeout: 300 }, async () => {",
+      "  const server = http.createServer((_req, res) => res.end('ok'));",
+      "  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));",
+      "  onTestTeardown(() => new Promise((resolve) => server.close(() => resolve())));",
+      '  await new Promise(() => {});',
+      '});',
+      '',
+    ].join('\n');
+    await writeFile(file, source);
+    let stdout = '';
+    let code = 0;
+    try {
+      const env = { ...process.env };
+      delete env.NODE_TEST_CONTEXT;
+      const result = await execFileAsync(process.execPath, [
+        '--test',
+        '--test-concurrency=1',
+        file,
+      ], { encoding: 'utf8', timeout: 5000, env });
+      stdout = result.stdout;
+    } catch (err) {
+      stdout = `${err.stdout || ''}\n${err.stderr || ''}`;
+      code = err.code;
+      assert.notEqual(err.killed, true, 'hung body kept the test process alive');
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+    assert.equal(code, 1);
+    const locations = [...stdout.matchAll(/^ {2}location: '([^']+)'/gm)].map((match) => match[1]);
+    assert.deepEqual(locations.map((location) => location.replace(/.*loc\.test\.mjs/, 'loc.test.mjs')), [
+      'loc.test.mjs:4:1',
+      'loc.test.mjs:7:1',
+    ]);
+    assert.equal(locations.some((location) => location.includes('msd-bounds.mjs')), false);
+    assert.match(stdout, /test timed out after 300ms/);
   });
 
   msdTest('a refused fetch is not reported as a timeout', async () => {

@@ -3,6 +3,7 @@
 // Modified 2026-10 by PLN: source-error flag and partial-image message (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a kvmd 302 is an unexpected redirect (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: bounded MSD test teardown and fetch (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: teardown still runs after a hung test body (GPL-3.0; see NOTICE).
 
 /**
  * Plain kvmd MSD client methods against the mock. No MCP tools.
@@ -25,6 +26,7 @@ import {
   closed,
   finishWith,
   msdTest,
+  onTestTeardown,
   runBounded,
 } from './msd-bounds.mjs';
 
@@ -46,7 +48,7 @@ async function withMock(options, fn, clientExtra) {
   const client = makeClient(mock, clientExtra);
   await finishWith(
     () => fn(mock, client),
-    () => bounded('withMock close', mock.close()),
+    onTestTeardown(() => bounded('withMock close', mock.close())),
   );
 }
 
@@ -72,12 +74,13 @@ async function waitFor(fn, ms = 1000) {
 
 function listen(handler) {
   const server = http.createServer(handler);
+  const close = onTestTeardown(() => closed(server, 'listen server close'));
   return new Promise((resolve) => {
     server.listen(0, '127.0.0.1', () => {
       const { port } = server.address();
       resolve({
         origin: `http://127.0.0.1:${port}`,
-        close: () => closed(server, 'listen server close'),
+        close,
       });
     });
   });

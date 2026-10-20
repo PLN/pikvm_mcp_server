@@ -18,6 +18,7 @@
 // Modified 2026-10 by PLN: test hook before the upload slot is released (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: host OCR returns one JSON text block (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: fleet comments, typed eject, and rollbackError wording (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: hash timeout on the upload tool (GPL-3.0; see NOTICE).
 
 /**
  * MCP server factory for PiKVM tools
@@ -839,7 +840,7 @@ const tools: Tool[] = [
   },
   {
     name: 'pikvm_msd_upload',
-    description: 'Upload a local image into PiKVM storage and return a jobId immediately after the file is confined. Hashing and the kvmd pre-check run in the job, which is hashing, then running, then awaiting_catalog. A sha256 mismatch fails the job and uploads nothing. After kvmd accepts the bytes the job waits for that image to be present, complete, and the expected size. PIKVM_MSD_CATALOG_TIMEOUT means the write was accepted and the image may still appear. PIKVM_MSD_IMAGE_INCOMPLETE means the row stayed incomplete until the deadline. PIKVM_MSD_SIZE_MISMATCH means a complete row has the wrong size and fails at once. An incomplete row whose size already differs keeps waiting. PIKVM_MSD_CANCELLED means the wait was cancelled. PIKVM_MSD_REMOVAL_UNCONFIRMED means cleanup could not prove the image is gone. The upload POST is not repeated. Catalog-failure cleanup holds the MSD lock until that check finishes. A file-close failure after the image is in the catalog removes it before the job is failed. A second upload while one is running is refused. file is a bare name under PIKVM_MSD_LOCAL_DIR. confirmImage must equal file. The drive is not changed. Poll pikvm_msd_job. Hidden while PIKVM_MSD_LOCAL_DIR is unset.',
+    description: 'Upload a local image into PiKVM storage and return a jobId immediately after the file is confined. Hashing and the kvmd pre-check run in the job, which is hashing, then running, then awaiting_catalog. A sha256 mismatch fails the job and uploads nothing. A hash read that is still going when PIKVM_MSD_JOB_TIMEOUT_MS ends fails the job with PIKVM_MSD_HASH_TIMEOUT, closes the file, releases the upload slot, and uploads nothing. That ceiling is a separate timer from the upload POST. After kvmd accepts the bytes the job waits for that image to be present, complete, and the expected size. PIKVM_MSD_CATALOG_TIMEOUT means the write was accepted and the image may still appear. PIKVM_MSD_IMAGE_INCOMPLETE means the row stayed incomplete until the deadline. PIKVM_MSD_SIZE_MISMATCH means a complete row has the wrong size and fails at once. An incomplete row whose size already differs keeps waiting. PIKVM_MSD_CANCELLED means the wait was cancelled. PIKVM_MSD_REMOVAL_UNCONFIRMED means cleanup could not prove the image is gone. The upload POST is not repeated. Catalog-failure cleanup holds the MSD lock until that check finishes. A file-close failure after the image is in the catalog removes it before the job is failed. A second upload while one is running is refused. file is a bare name under PIKVM_MSD_LOCAL_DIR. confirmImage must equal file. The drive is not changed. Poll pikvm_msd_job. Hidden while PIKVM_MSD_LOCAL_DIR is unset.',
     inputSchema: {
       type: 'object',
       properties: {

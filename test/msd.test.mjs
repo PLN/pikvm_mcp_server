@@ -15,6 +15,7 @@
 // Modified 2026-10 by PLN: incomplete size polling, slot-before-mount, and catalog cleanup (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: the slot-free upload test releases the second job (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: bounded MSD test teardown and fetch (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: hash timeout releases the upload slot (GPL-3.0; see NOTICE).
 
 /**
  * MSD tools against the mock. The HTTP harness matches test/http.test.mjs.
@@ -51,6 +52,7 @@ import {
   finishWith,
   msdSubtest,
   msdTest,
+  onTestTeardown,
   runBounded,
 } from './msd-bounds.mjs';
 
@@ -161,10 +163,10 @@ async function withSession(mockOptions, flags, fn) {
       const sessionId = await openSession(base);
       await fn({ mock, base, sessionId });
     },
-    () => runBounded([
+    onTestTeardown(() => runBounded([
       () => closed(httpServer, 'withSession http server close'),
       () => bounded('withSession mock close', mock.close()),
-    ]),
+    ])),
   );
 }
 
@@ -807,7 +809,7 @@ async function withDir(fn) {
   const dir = await mkdtemp(join(tmpdir(), 'pikvm-msd-'));
   await finishWith(
     () => fn(dir),
-    () => bounded('fixture cleanup', rm(dir, { recursive: true, force: true })),
+    onTestTeardown(() => bounded('fixture cleanup', rm(dir, { recursive: true, force: true }))),
   );
 }
 
@@ -863,14 +865,17 @@ async function whileWatchingProcess(fn) {
   };
   process.on('uncaughtException', onException);
   process.on('unhandledRejection', onRejection);
+  const stop = onTestTeardown(() => {
+    process.off('uncaughtException', onException);
+    process.off('unhandledRejection', onRejection);
+  });
   let failure;
   try {
     await fn();
   } catch (err) {
     failure = err;
   } finally {
-    process.off('uncaughtException', onException);
-    process.off('unhandledRejection', onRejection);
+    await stop();
   }
   assert.equal(crashes.length, 0, crashes.map(crashReason).join('\n\n'));
   if (failure) throw failure;
@@ -923,21 +928,28 @@ async function withStalledFsRead(ms, fn) {
     if (stalledUploadFds.has(fd)) closedStalledFds.push(fd);
     return origCloseSync.call(fs, fd);
   };
-  try {
-    await fn();
-  } finally {
+  const restore = onTestTeardown(() => {
     proto.read = origHandleRead;
     fs.read = origRead;
     fs.close = origClose;
     fs.closeSync = origCloseSync;
     stalledUploadFds.clear();
     closedStalledFds.length = 0;
+  });
+  try {
+    await fn();
+  } finally {
+    await restore();
   }
 }
 
-/** A raw-fd upload stream calls fs.read. The file-handle stream does not. */
+/**
+ * Hashing calls fs.read and does not fs.close that fd.
+ * The upload stream uses FileHandle.read. A raw-fd upload stream
+ * would fs.close the fd it read, which is the double-close that
+ * used to surface as an uncaught EBADF.
+ */
 function assertNoRawUploadRead() {
-  assert.equal(stalledUploadFds.size, 0);
   assert.equal(closedStalledFds.length, 0);
 }
 
@@ -951,7 +963,7 @@ function finishStalledRead(ms) {
 }
 
 /**
- * The first FileHandle.read is the hash. The next one is the upload
+ * Hashing uses fs.read. The first FileHandle.read is the upload
  * stream, and it rejects with EIO once. Later reads, including a
  * follow-up upload, succeed.
  */
@@ -963,16 +975,55 @@ async function withEioAfterFirstRead(fn) {
   let reads = 0;
   proto.read = function eioAfterFirst(...args) {
     reads += 1;
-    if (reads === 2) {
+    if (reads === 1) {
       return Promise.reject(Object.assign(new Error('disk read failed'), { code: 'EIO' }));
     }
     return orig.apply(this, args);
   };
+  const restore = onTestTeardown(() => {
+    proto.read = orig;
+  });
   try {
     await fn();
   } finally {
-    proto.read = orig;
+    await restore();
   }
+}
+
+/**
+ * The first fs.read is the hash, and its callback is never called.
+ * Later reads, including the next upload, use the real fs.read.
+ * The fd from the hung call is what the test checks is closed.
+ */
+async function withHungHashRead(fn) {
+  const orig = fs.read;
+  const hung = { fd: -1, armed: false, callback: undefined };
+  fs.read = function hungHashRead(fd, buffer, offset, length, position, callback) {
+    if (!hung.armed) {
+      hung.armed = true;
+      hung.fd = fd;
+      hung.callback = callback;
+      return;
+    }
+    return orig.call(fs, fd, buffer, offset, length, position, callback);
+  };
+  const restore = onTestTeardown(() => {
+    fs.read = orig;
+  });
+  try {
+    await fn(hung);
+  } finally {
+    await restore();
+  }
+}
+
+function assertFdClosed(fd) {
+  return new Promise((resolve, reject) => {
+    fs.fstat(fd, (err) => {
+      if (err && err.code === 'EBADF') resolve();
+      else reject(err || new Error(`fd ${fd} is still open`));
+    });
+  });
 }
 
 msdTest('expectImage is checked when the drive is disconnected', async () => {
@@ -1249,6 +1300,48 @@ msdTest('upload, remove, and job polling', { timeout: MSD_UPLOAD_SUITE_TIMEOUT_M
       } finally {
         if (release) release();
       }
+    });
+  });
+
+  await msdSubtest(t, 'a stuck hash read fails within the job ceiling and frees the slot', async () => {
+    await withDir(async (dir) => {
+      await writeFile(join(dir, 'disk.img'), body);
+      await writeFile(join(dir, 'next.img'), Buffer.from('wxyz'));
+      await withHungHashRead((hung) => whileWatchingProcess(async () => {
+        const flags = uploadMsd(dir);
+        flags.msdJobTimeoutMs = 500;
+        await withSession({ images: [] }, flags, async ({ mock, base, sessionId }) => {
+          const began = Date.now();
+          const started = await callTool(base, sessionId, 'pikvm_msd_upload', {
+            file: 'disk.img',
+            confirmImage: 'disk.img',
+          });
+          assert.equal(started.isError, undefined, started.content[0].text);
+          const { jobId } = JSON.parse(started.content[0].text);
+          const failed = await pollJob(base, sessionId, jobId, 4000);
+          const elapsed = Date.now() - began;
+          assert.equal(failed.state, 'failed');
+          assert.equal(failed.error.type, 'PIKVM_MSD_HASH_TIMEOUT');
+          assert.match(failed.error.message, /hash timeout/);
+          assert.ok(elapsed >= 400, `hash failed before the ceiling (${elapsed}ms)`);
+          assert.ok(elapsed < 4000, `hash hung past the bound (${elapsed}ms)`);
+          assert.ok(hung.fd >= 0, 'hash never called fs.read');
+          await assertFdClosed(hung.fd);
+          hung.callback(Object.assign(new Error('closed'), { code: 'EBADF' }));
+          hung.callback(null, body.length);
+          await new Promise((resolve) => setTimeout(resolve, 30));
+          assert.equal(mock.calls.some((call) => call.path === '/api/msd/write'), false);
+          const again = await callTool(base, sessionId, 'pikvm_msd_upload', {
+            file: 'next.img',
+            confirmImage: 'next.img',
+          });
+          assert.equal(again.isError, undefined, again.content[0].text);
+          assert.equal(again.content[0].text.includes('MsdUploadBusyError'), false);
+          const done = await pollJob(base, sessionId, JSON.parse(again.content[0].text).jobId);
+          assert.equal(done.state, 'done');
+          assert.equal(mock.bytes.get('next.img').toString(), 'wxyz');
+        });
+      }));
     });
   });
 
