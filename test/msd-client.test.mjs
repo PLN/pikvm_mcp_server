@@ -2,19 +2,31 @@
 // Modified 2026-10 by PLN: MSD deadline caps and upload error codes (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: source-error flag and partial-image message (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a kvmd 302 is an unexpected redirect (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: bounded MSD test teardown and fetch (GPL-3.0; see NOTICE).
 
 /**
  * Plain kvmd MSD client methods against the mock. No MCP tools.
  * Also pins undici 7.24.1 Content-Length and timer behaviour.
+ * Subtest ceilings and teardown bounds live in test/msd-bounds.mjs.
  */
 
-import test from 'node:test';
+import { describe } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { Readable } from 'node:stream';
 import { Agent, request } from 'undici';
 import { KvmdError, PiKVMClient } from '../dist/pikvm/client.js';
 import { startKvmdMock } from './kvmd-mock.mjs';
+import {
+  MSD_FETCH_TIMEOUT_MS,
+  MSD_FILE_TIMEOUT_MS,
+  bounded,
+  boundedDispatch,
+  closed,
+  finishWith,
+  msdTest,
+  runBounded,
+} from './msd-bounds.mjs';
 
 function makeClient(mock, extra = {}) {
   return new PiKVMClient({
@@ -32,11 +44,14 @@ function makeClient(mock, extra = {}) {
 async function withMock(options, fn, clientExtra) {
   const mock = await startKvmdMock(options);
   const client = makeClient(mock, clientExtra);
-  try {
-    await fn(mock, client);
-  } finally {
-    await mock.close();
-  }
+  await finishWith(
+    () => fn(mock, client),
+    () => bounded('withMock close', mock.close()),
+  );
+}
+
+function msdRequest(url, init, label = 'msd client request') {
+  return boundedDispatch(request, url, init, label);
 }
 
 function bodyOf(text) {
@@ -62,13 +77,14 @@ function listen(handler) {
       const { port } = server.address();
       resolve({
         origin: `http://127.0.0.1:${port}`,
-        close: () => new Promise((done) => server.close(done)),
+        close: () => closed(server, 'listen server close'),
       });
     });
   });
 }
 
-test('msdWrite sends an exact Content-Length, no chunked encoding, and the same bytes', async () => {
+describe('MSD client', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
+msdTest('msdWrite sends an exact Content-Length, no chunked encoding, and the same bytes', async () => {
   const payload = 'hello-msd-image';
   await withMock({}, async (mock, client) => {
     const result = await client.msdWrite('disk.img', bodyOf(payload), payload.length, {
@@ -88,7 +104,7 @@ test('msdWrite sends an exact Content-Length, no chunked encoding, and the same 
   });
 });
 
-test('msdWrite defaults remove_incomplete to 1', async () => {
+msdTest('msdWrite defaults remove_incomplete to 1', async () => {
   await withMock({}, async (mock, client) => {
     await client.msdWrite('disk.img', bodyOf('ab'), 2);
     const call = mock.calls.find((c) => c.path === '/api/msd/write');
@@ -97,7 +113,7 @@ test('msdWrite defaults remove_incomplete to 1', async () => {
   });
 });
 
-test('a body that ends short of Content-Length is a mismatch and leaves an incomplete image', async () => {
+msdTest('a body that ends short of Content-Length is a mismatch and leaves an incomplete image', async () => {
   await withMock({}, async (mock, client) => {
     await assert.rejects(
       () => client.msdWrite('short.img', bodyOf('ab'), 6, { removeIncomplete: false }),
@@ -120,7 +136,7 @@ test('a body that ends short of Content-Length is a mismatch and leaves an incom
   });
 });
 
-test('undici rejects a short body and an overrunning chunk; an exact boundary can succeed', async () => {
+msdTest('undici rejects a short body and an overrunning chunk; an exact boundary can succeed', async () => {
   const agent = new Agent({ headersTimeout: 0, bodyTimeout: 0 });
   const seen = [];
   const srv = await listen(async (req, res) => {
@@ -141,7 +157,7 @@ test('undici rejects a short body and an overrunning chunk; an exact boundary ca
     res.end('ok');
   });
   try {
-    const exact = await request(`${srv.origin}/exact`, {
+    const exact = await msdRequest(`${srv.origin}/exact`, {
       method: 'POST',
       dispatcher: agent,
       headers: { 'content-length': '6' },
@@ -152,7 +168,7 @@ test('undici rejects a short body and an overrunning chunk; an exact boundary ca
     assert.deepEqual(seen.at(-1), { cl: '6', te: null, body: 'abcdef' });
 
     await assert.rejects(
-      () => request(`${srv.origin}/short`, {
+      () => msdRequest(`${srv.origin}/short`, {
         method: 'POST',
         dispatcher: agent,
         headers: { 'content-length': '6' },
@@ -165,7 +181,7 @@ test('undici rejects a short body and an overrunning chunk; an exact boundary ca
       },
     );
     await assert.rejects(
-      () => request(`${srv.origin}/long`, {
+      () => msdRequest(`${srv.origin}/long`, {
         method: 'POST',
         dispatcher: agent,
         headers: { 'content-length': '4' },
@@ -189,7 +205,7 @@ test('undici rejects a short body and an overrunning chunk; an exact boundary ca
         }, 30);
       },
     });
-    const late = await request(`${srv.origin}/boundary`, {
+    const late = await msdRequest(`${srv.origin}/boundary`, {
       method: 'POST',
       dispatcher: agent,
       headers: { 'content-length': '6' },
@@ -199,16 +215,18 @@ test('undici rejects a short body and an overrunning chunk; an exact boundary ca
     await late.body.text();
     assert.equal(seen.at(-1).body, 'abcdef');
   } finally {
-    await srv.close();
-    await agent.close();
+    await runBounded([
+      () => srv.close(),
+      () => bounded('undici agent close', agent.close()),
+    ]);
   }
 });
 
-test('the mock rejects a chunked or missing Content-Length write', async () => {
+msdTest('the mock rejects a chunked or missing Content-Length write', async () => {
   await withMock({}, async (mock) => {
     const agent = new Agent({ headersTimeout: 0, bodyTimeout: 0 });
     try {
-      const res = await request(`${mock.url}/api/msd/write?image=a.img`, {
+      const res = await msdRequest(`${mock.url}/api/msd/write?image=a.img`, {
         method: 'POST',
         dispatcher: agent,
         body: Readable.from([Buffer.from('abc')]),
@@ -221,12 +239,12 @@ test('the mock rejects a chunked or missing Content-Length write', async () => {
       assert.equal(call.contentLength, null);
       assert.equal(call.transferEncoding, 'chunked');
     } finally {
-      await agent.close();
+      await bounded('undici agent close', agent.close());
     }
   });
 });
 
-test('typed errors: connected, busy, exists, and no image', async () => {
+msdTest('typed errors: connected, busy, exists, and no image', async () => {
   await withMock({}, async (mock, client) => {
     await client.msdWrite('disk.img', bodyOf('abcd'), 4);
     await client.msdSetParams({ image: 'disk.img', cdrom: false, rw: false });
@@ -307,7 +325,7 @@ test('typed errors: connected, busy, exists, and no image', async () => {
   });
 });
 
-test('getMsdState reads the parts map and legacy storage.free', async () => {
+msdTest('getMsdState reads the parts map and legacy storage.free', async () => {
   await withMock({ free: 111 }, async (mock, client) => {
     const state = await client.getMsdState();
     assert.equal(state.free, 111);
@@ -361,7 +379,7 @@ test('getMsdState reads the parts map and legacy storage.free', async () => {
   });
 });
 
-test('msdWriteRemote yields NDJSON progress and throws on an error line', async () => {
+msdTest('msdWriteRemote yields NDJSON progress and throws on an error line', async () => {
   await withMock({}, async (mock, client) => {
     const progress = [];
     for await (const row of client.msdWriteRemote('https://example.test/pics/a.iso', {
@@ -412,7 +430,7 @@ test('msdWriteRemote yields NDJSON progress and throws on an error line', async 
   });
 });
 
-test('remove_incomplete drops a failed write and keeps an incomplete image otherwise', async () => {
+msdTest('remove_incomplete drops a failed write and keeps an incomplete image otherwise', async () => {
   await withMock({ failMidWrite: true }, async (mock, client) => {
     await assert.rejects(
       () => client.msdWrite('gone.img', bodyOf('abcdef'), 6, { removeIncomplete: true }),
@@ -440,7 +458,7 @@ test('remove_incomplete drops a failed write and keeps an incomplete image other
   });
 });
 
-test('MSD POSTs are not retried and a remote redirect is not followed', async () => {
+msdTest('MSD POSTs are not retried and a remote redirect is not followed', async () => {
   const kvmdBody = (error, errorMsg) => ({ ok: false, result: { error, error_msg: errorMsg } });
   await withMock({
     routes: {
@@ -493,7 +511,7 @@ test('MSD POSTs are not retried and a remote redirect is not followed', async ()
   });
 });
 
-test('msdSetParams never sends a URL and shows cdrom rw coercion', async () => {
+msdTest('msdSetParams never sends a URL and shows cdrom rw coercion', async () => {
   await withMock({}, async (mock, client) => {
     await assert.rejects(
       () => client.msdSetParams({ image: 'https://example.test/a.iso' }),
@@ -507,14 +525,14 @@ test('msdSetParams never sends a URL and shows cdrom rw coercion', async () => {
   });
 });
 
-test('an upload is not killed by the ordinary request timeout', async () => {
+msdTest('an upload is not killed by the ordinary request timeout', async () => {
   await withMock({ writeHoldMs: 700 }, async (_mock, client) => {
     const result = await client.msdWrite('slow.img', bodyOf('abcd'), 4);
     assert.equal(result.written, 4);
   }, { requestTimeoutMs: 150, msdJobTimeoutMs: 8000, msdIdleTimeoutMs: 8000 });
 });
 
-test('the job ceiling aborts a write that never returns headers', { timeout: 15000 }, async () => {
+msdTest('the job ceiling aborts a write that never returns headers', { timeout: 15000 }, async () => {
   const started = Date.now();
   await withMock({ writeHoldMs: 8000 }, async (mock, client) => {
     await assert.rejects(
@@ -534,7 +552,7 @@ test('the job ceiling aborts a write that never returns headers', { timeout: 150
   assert.ok(elapsed < 4000, `job ceiling waited too long: ${elapsed}ms`);
 });
 
-test('the idle gap aborts a stalled upload and allows a slow progress stream', { timeout: 15000 }, async () => {
+msdTest('the idle gap aborts a stalled upload and allows a slow progress stream', { timeout: 15000 }, async () => {
   const started = Date.now();
   await withMock({}, async (_mock, client) => {
     let pushed = false;
@@ -570,7 +588,7 @@ test('the idle gap aborts a stalled upload and allows a slow progress stream', {
   }, { msdJobTimeoutMs: 20000, msdIdleTimeoutMs: 400 });
 });
 
-test('undici headersTimeout waits for headers and does not cap a writing body', { timeout: 20000 }, async () => {
+msdTest('undici headersTimeout waits for headers and does not cap a writing body', { timeout: 20000 }, async () => {
   const agent = new Agent({ headersTimeout: 0, bodyTimeout: 0 });
   const late = await listen(async (req, res) => {
     for await (const _chunk of req) { /* drain */ }
@@ -582,14 +600,14 @@ test('undici headersTimeout waits for headers and does not cap a writing body', 
   try {
     const started = Date.now();
     await assert.rejects(
-      () => request(`${late.origin}/late`, {
+      () => msdRequest(`${late.origin}/late`, {
         method: 'POST',
         dispatcher: agent,
         headers: { 'content-length': '2' },
         body: Readable.from([Buffer.from('hi')]),
         headersTimeout: 700,
         bodyTimeout: 10000,
-        signal: AbortSignal.timeout(10000),
+        signal: AbortSignal.timeout(MSD_FETCH_TIMEOUT_MS),
       }),
       (err) => {
         assert.equal(err.code, 'UND_ERR_HEADERS_TIMEOUT');
@@ -619,24 +637,26 @@ test('undici headersTimeout waits for headers and does not cap a writing body', 
         this.push(next);
       },
     });
-    const res = await request(`${slow.origin}/slow`, {
+    const res = await msdRequest(`${slow.origin}/slow`, {
       method: 'POST',
       dispatcher: agent,
       headers: { 'content-length': String(6 * 32) },
       body,
       headersTimeout: 400,
       bodyTimeout: 10000,
-      signal: AbortSignal.timeout(10000),
+      signal: AbortSignal.timeout(MSD_FETCH_TIMEOUT_MS),
     });
     assert.equal(res.statusCode, 200);
     assert.equal(await res.body.text(), 'ok');
   } finally {
-    await slow.close();
-    await agent.close();
+    await runBounded([
+      () => slow.close(),
+      () => bounded('undici agent close', agent.close()),
+    ]);
   }
 });
 
-test('undici bodyTimeout is the gap between response bytes', { timeout: 20000 }, async () => {
+msdTest('undici bodyTimeout is the gap between response bytes', { timeout: 20000 }, async () => {
   const agent = new Agent({ headersTimeout: 0, bodyTimeout: 0 });
   const stall = await listen(async (_req, res) => {
     res.writeHead(200, { 'content-type': 'application/x-ndjson' });
@@ -649,7 +669,7 @@ test('undici bodyTimeout is the gap between response bytes', { timeout: 20000 },
     const started = Date.now();
     await assert.rejects(
       async () => {
-        const res = await request(`${stall.origin}/stall`, {
+        const res = await msdRequest(`${stall.origin}/stall`, {
           method: 'GET',
           dispatcher: agent,
           headersTimeout: 10000,
@@ -677,7 +697,7 @@ test('undici bodyTimeout is the gap between response bytes', { timeout: 20000 },
     res.end();
   });
   try {
-    const res = await request(`${drip.origin}/drip`, {
+    const res = await msdRequest(`${drip.origin}/drip`, {
       method: 'GET',
       dispatcher: agent,
       headersTimeout: 400,
@@ -687,21 +707,23 @@ test('undici bodyTimeout is the gap between response bytes', { timeout: 20000 },
     for await (const chunk of res.body) text += chunk;
     assert.match(text, /"n":5/);
   } finally {
-    await drip.close();
-    await agent.close();
+    await runBounded([
+      () => drip.close(),
+      () => bounded('undici agent close', agent.close()),
+    ]);
   }
 });
 
 const MSD_UNKNOWN = 'image may be partial or complete; re-read /api/msd; do not resend';
 
-test('99999999999 for both MSD deadlines is clamped and the upload still finishes', { timeout: 5000 }, async () => {
+msdTest('99999999999 for both MSD deadlines is clamped and the upload still finishes', { timeout: 5000 }, async () => {
   await withMock({}, async (_mock, client) => {
     const result = await client.msdWrite('huge.img', bodyOf('abcd'), 4);
     assert.equal(result.written, 4);
   }, { msdJobTimeoutMs: 99999999999, msdIdleTimeoutMs: 99999999999 });
 });
 
-test('NDJSON progress split across chunks is reassembled', async () => {
+msdTest('NDJSON progress split across chunks is reassembled', async () => {
   const line = `${JSON.stringify({ ok: true, result: { image: { name: 'split.iso', size: 4, written: 4 } } })}\r\n`;
   const mid = Math.floor(line.length / 2);
   await withMock({ remote: { chunks: [line.slice(0, mid), line.slice(mid)] } }, async (_mock, client) => {
@@ -713,7 +735,7 @@ test('NDJSON progress split across chunks is reassembled', async () => {
   });
 });
 
-test('msdWriteRemote raises when the stream ends short of size', async () => {
+msdTest('msdWriteRemote raises when the stream ends short of size', async () => {
   await withMock({
     remote: {
       lines: [
@@ -740,7 +762,7 @@ test('msdWriteRemote raises when the stream ends short of size', async () => {
   });
 });
 
-test('a mid-body abort keeps a complete:false image unless remove_incomplete', { timeout: 15000 }, async () => {
+msdTest('a mid-body abort keeps a complete:false image unless remove_incomplete', { timeout: 15000 }, async () => {
   const stalled = () => {
     let pushed = false;
     return new Readable({
@@ -776,7 +798,7 @@ test('a mid-body abort keeps a complete:false image unless remove_incomplete', {
   }, { msdJobTimeoutMs: 20000, msdIdleTimeoutMs: 400 });
 });
 
-test('a local source read error is PIKVM_SOURCE_READ_ERROR', async () => {
+msdTest('a local source read error is PIKVM_SOURCE_READ_ERROR', async () => {
   await withMock({}, async (mock, client) => {
     const src = new Readable({
       read() {
@@ -799,7 +821,7 @@ test('a local source read error is PIKVM_SOURCE_READ_ERROR', async () => {
   });
 });
 
-test('a source read error after the first chunk is PIKVM_SOURCE_READ_ERROR', async () => {
+msdTest('a source read error after the first chunk is PIKVM_SOURCE_READ_ERROR', async () => {
   await withMock({}, async (_mock, client) => {
     let sent = false;
     const src = new Readable({
@@ -827,7 +849,7 @@ test('a source read error after the first chunk is PIKVM_SOURCE_READ_ERROR', asy
   });
 });
 
-test('an idle timeout while kvmd is not reading is PIKVM_MSD_STATE_UNKNOWN', { timeout: 15000 }, async () => {
+msdTest('an idle timeout while kvmd is not reading is PIKVM_MSD_STATE_UNKNOWN', { timeout: 15000 }, async () => {
   const stalled = new Readable({
     read() {
       this.push(Buffer.alloc(64 * 1024, 1));
@@ -848,12 +870,13 @@ test('an idle timeout while kvmd is not reading is PIKVM_MSD_STATE_UNKNOWN', { t
   }, { msdJobTimeoutMs: 20000, msdIdleTimeoutMs: 400 });
 });
 
-test('connection refused before an upload is sent stays PIKVM_UNREACHABLE', async () => {
-  const port = await new Promise((resolve) => {
+msdTest('connection refused before an upload is sent stays PIKVM_UNREACHABLE', async () => {
+  const port = await new Promise((resolve, reject) => {
     const server = http.createServer();
+    server.once('error', reject);
     server.listen(0, '127.0.0.1', () => {
       const { port: p } = server.address();
-      server.close(() => resolve(p));
+      closed(server, 'probe server close').then(() => resolve(p), reject);
     });
   });
   const client = new PiKVMClient({
@@ -877,7 +900,7 @@ test('connection refused before an upload is sent stays PIKVM_UNREACHABLE', asyn
   );
 });
 
-test('a socket reset and HTTP 504 on an upload are PIKVM_MSD_STATE_UNKNOWN', async () => {
+msdTest('a socket reset and HTTP 504 on an upload are PIKVM_MSD_STATE_UNKNOWN', async () => {
   await withMock({
     routes: { 'POST /api/msd/write': { drop: true } },
   }, async (_mock, client) => {
@@ -922,4 +945,5 @@ test('a socket reset and HTTP 504 on an upload are PIKVM_MSD_STATE_UNKNOWN', asy
       },
     );
   });
+});
 });

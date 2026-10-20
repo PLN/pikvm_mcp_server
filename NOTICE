@@ -44,6 +44,7 @@ Modified 2026-10 by PLN: systemd 0440 mode and pinned allowScripts (GPL-3.0; see
 Modified 2026-10 by PLN: credential inode check and fsevents install pin (GPL-3.0; see below).
 Modified 2026-10 by PLN: decoy credential-root names and a sharp load (GPL-3.0; see below).
 Modified 2026-10 by PLN: the slot-free upload test releases the second job (GPL-3.0; see below).
+Modified 2026-10 by PLN: bounded MSD test teardown and fetch (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -836,4 +837,17 @@ No code from another pikvm_mcp_server fork was added for these methods.
   A root taken from one of those names would skip the group warning, and
   the test still expects the warning. The npm 12 install job loads sharp
   after npm ci --strict-allow-scripts.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  MSD mock tests give each subtest a 30 second ceiling, under a 5 minute
+  file ceiling. The upload suite stays at 120 seconds. A stalled subtest
+  fails on its own, so the rest of the file still runs. Server close,
+  session close, and fixture removal reject when they exceed 10 seconds,
+  and the error names the operation. The timer is cleared when the work
+  finishes. Test fetches abort through AbortSignal.timeout. The hardware
+  MSD cycle is not given the 30 second ceiling: its job budget is already
+  120 seconds, and an optional URL fetch can run longer. Its tool calls
+  abort after 60 seconds, and its session close and fixture removal use
+  the same 10 second bound.
   No code from another pikvm_mcp_server fork was copied.
