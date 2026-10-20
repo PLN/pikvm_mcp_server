@@ -43,6 +43,7 @@ Modified 2026-10 by PLN: typed eject, rollbackError wording, and catalog cleanup
 Modified 2026-10 by PLN: systemd 0440 mode and pinned allowScripts (GPL-3.0; see below).
 Modified 2026-10 by PLN: credential inode check and fsevents install pin (GPL-3.0; see below).
 Modified 2026-10 by PLN: decoy credential-root names and a sharp load (GPL-3.0; see below).
+Modified 2026-10 by PLN: the slot-free upload test releases the second job (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
