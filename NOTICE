@@ -53,6 +53,7 @@ Modified 2026-10 by PLN: catalog budgets use a monotonic clock (GPL-3.0; see bel
 Modified 2026-10 by PLN: removal confirm stays hidden across an extra catalog GET (GPL-3.0; see below).
 Modified 2026-10 by PLN: a catalog read is not started with under 1 ms left (GPL-3.0; see below).
 Modified 2026-10 by PLN: Node 24 and Windows test locations, and the CI matrix (GPL-3.0; see below).
+Modified 2026-10 by PLN: hash reads use the idle timeout (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 

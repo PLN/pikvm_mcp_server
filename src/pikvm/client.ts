@@ -19,6 +19,7 @@
 // Modified 2026-10 by PLN: a catalog read stops at the caller's deadline (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: full-resolution snapshot for host OCR (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: hash reads use the MSD job ceiling (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: hash reads use the idle timeout (GPL-3.0; see NOTICE).
 // AbortSignal.timeout and PIKVM_UNREACHABLE / PIKVM_AUTH_FAILED no-retry codes
 // adapted from dtrukr/pikvm_mcp_server src/pikvm/client.ts @ d120243 (GPL-3.0).
 // Snapshot HTTP 503 retry-once adapted from dvaerum/pikvm_mcp_server
@@ -35,7 +36,11 @@
 // setTimeout plus AbortController, and undici headersTimeout.
 // PIKVM_MSD_IDLE_TIMEOUT_MS (default 60 seconds, max 1 hour) aborts when
 // the request body or the response body stops moving, and is also undici
-// bodyTimeout. AbortSignal.timeout is not used: above 2^32-1 it throws
+// bodyTimeout. The same value is the per-read no-progress bound while
+// hashing a local file before the upload POST. That timer resets when a
+// read returns bytes and does not cap total hash time. A stalled hash
+// read fails with PIKVM_MSD_HASH_IDLE_TIMEOUT and does not POST.
+// AbortSignal.timeout is not used: above 2^32-1 it throws
 // RangeError, and a delay of 2^31 or more makes the timer fire after 1 ms.
 // Checked on undici 7.24.1: headersTimeout does not abort a request body
 // that is still being written without socket backpressure. Once the body
@@ -129,8 +134,10 @@ export interface PiKVMConfig {
    */
   msdJobTimeoutMs?: number;
   /**
-   * Idle gap while an MSD upload body or progress stream is moving.
+   * Idle gap while an MSD upload body or progress stream is moving,
+   * and the per-read no-progress bound while hashing a local file.
    * Default 60 seconds. The wait for response headers uses the job ceiling.
+   * A hash read resets this bound when it returns bytes.
    */
   msdIdleTimeoutMs?: number;
   /** One OCR snapshot. Default 30000. A timeout is not retried. */
@@ -831,6 +838,9 @@ const redactionPasswords = new WeakMap<PiKVMClient, string>();
 /** Resolved MSD job ceiling. Hashing reads this. Not a client method. */
 const msdJobTimeouts = new WeakMap<PiKVMClient, number>();
 
+/** Resolved MSD idle gap. Hashing reads this. Not a client method. */
+const msdIdleTimeouts = new WeakMap<PiKVMClient, number>();
+
 /** Test-only. Shrinks HID abort timers without putting a scale on PiKVMConfig. */
 export function setHidDeadlineScaleForTests(client: PiKVMClient, scale: number): void {
   if (!Number.isFinite(scale) || scale <= 0) return;
@@ -854,6 +864,16 @@ export function redactionPassword(client: PiKVMClient): string {
  */
 export function msdJobTimeoutOf(client: PiKVMClient): number {
   return msdJobTimeouts.get(client) ?? MSD_JOB_TIMEOUT_DEFAULT_MS;
+}
+
+/**
+ * Resolved PIKVM_MSD_IDLE_TIMEOUT_MS for this client.
+ * Hashing uses it as the per-read no-progress bound. The upload body
+ * and the progress stream use the same value. It does not cap total
+ * hash time.
+ */
+export function msdIdleTimeoutOf(client: PiKVMClient): number {
+  return msdIdleTimeouts.get(client) ?? MSD_IDLE_TIMEOUT_DEFAULT_MS;
 }
 
 interface ResolvedPiKVMConfig extends PiKVMConfig {
@@ -917,6 +937,7 @@ export class PiKVMClient {
     this.config = resolved;
     redactionPasswords.set(this, this.config.password);
     msdJobTimeouts.set(this, this.config.msdJobTimeoutMs);
+    msdIdleTimeouts.set(this, this.config.msdIdleTimeoutMs);
 
     // headersTimeout and bodyTimeout 0 turn off undici's 300s defaults.
     // Each call sets its own AbortSignal, including HID ceilings.
