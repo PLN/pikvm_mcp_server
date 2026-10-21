@@ -3,6 +3,7 @@
 // Modified 2026-10 by PLN: duplicate devices, shared origin, and per-device job cap (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: http and https on one host are the same device (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: the registry mode assertion follows the platform (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: POSIX mode checks assert the mode is exact (GPL-3.0; see NOTICE).
 
 /**
  * Registry parsing, per-device locks, and the hardware hwTest gate.
@@ -211,7 +212,10 @@ describe('device registry', { concurrency: false }, () => {
       writeFileSync(file, registryJson({
         lab1: device({ passwordFile, tls: { mode: 'verify' } }),
       }), { mode: 0o666 });
-      if (exactModeAvailable()) chmodSync(file, 0o666);
+      if (process.platform !== 'win32') {
+        assert.equal(exactModeAvailable(), true);
+        chmodSync(file, 0o666);
+      }
       const { value, lines } = capture(() => withEnv({
         PIKVM_DEVICES_FILE: file,
         PIKVM_HOST: 'https://pikvm.example.ts.net',
@@ -221,9 +225,7 @@ describe('device registry', { concurrency: false }, () => {
       assert.equal(value.pikvm.host, 'https://100.64.0.8');
       assert.equal(value.pikvm.tls.default.mode, 'verify');
       assert.equal(lines.filter((line) => line.includes('PIKVM_HOST was ignored')).length, 1);
-      if (exactModeAvailable()) {
-        assert.equal(lines.some((line) => line.includes('devices.json') && line.includes('mode')), false);
-      }
+      assert.equal(lines.some((line) => line.includes('devices.json') && line.includes('mode')), false);
       const shown = JSON.stringify(redactConfig(value));
       assert.equal(shown.includes('pw-1'), false);
       assert.equal(shown.includes(PATH_SENTINEL), false);

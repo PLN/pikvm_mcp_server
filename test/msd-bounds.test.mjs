@@ -1,6 +1,7 @@
 // Modified 2026-10 by PLN: bounded MSD test teardown and fetch (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: caller locations and labeled body timeouts (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: TAP locations and a Windows file URL (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: stack paths and node internal frames (GPL-3.0; see NOTICE).
 
 /**
  * The MSD bound helper. A hang rejects with the operation name, the
@@ -27,7 +28,9 @@ import {
   finishWith,
   msdTest,
   runBounded,
+  callerFromStack,
   stackFrameSite,
+  waitForMsdUploadSlots,
 } from './msd-bounds.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -183,6 +186,44 @@ describe('MSD test bounds', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
       server.closeAllConnections();
       await closed(server, 'listen server close');
     }
+  });
+
+  msdTest('a bare stack frame does not keep the at prefix', () => {
+    const site = stackFrameSite('    at /path:1:2');
+    assert.deepEqual(site, { file: '/path', line: 1, column: 2 });
+    assert.equal(site.file.includes('at '), false);
+  });
+
+  msdTest('a POSIX path may contain a colon or parentheses', () => {
+    const colon = stackFrameSite('    at fn (/tmp/a:b/file.js:10:20)');
+    assert.deepEqual(colon, { file: '/tmp/a:b/file.js', line: 10, column: 20 });
+    const parens = stackFrameSite('    at fn (/tmp/a(b)/file.js:3:4)');
+    assert.deepEqual(parens, { file: '/tmp/a(b)/file.js', line: 3, column: 4 });
+  });
+
+  msdTest('a UNC file URL keeps the server and the share', () => {
+    const site = stackFrameSite('    at fn (file://server/share/repo/test/loc.test.mjs:7:1)');
+    assert.deepEqual(site, {
+      file: '\\\\server\\share\\repo\\test\\loc.test.mjs',
+      line: 7,
+      column: 1,
+    });
+  });
+
+  msdTest('a node internal frame is not the caller', () => {
+    const site = callerFromStack([
+      'Error: boom',
+      '    at process.processTicksAndRejections (node:internal/process/task_queues:105:5)',
+      '    at fn (/tmp/a:b/c(d)/caller.mjs:8:3)',
+    ].join('\n'));
+    assert.deepEqual(site, { file: '/tmp/a:b/c(d)/caller.mjs', line: 8, column: 3 });
+    assert.equal(callerFromStack('    at node:internal/modules/cjs/loader:1:2'), undefined);
+  });
+
+  msdTest('an idle upload slot wait resolves', async () => {
+    const started = performance.now();
+    await waitForMsdUploadSlots(1000);
+    assert.ok(performance.now() - started < 1000);
   });
 
   msdTest('a windows stack frame keeps the drive letter', () => {

@@ -4,6 +4,7 @@
 // Modified 2026-10 by PLN: catalog confirmation uses a short budget (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: bounded MSD test teardown and fetch (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: teardown still runs after a hung test body (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: teardown waits for the upload slot (GPL-3.0; see NOTICE).
 
 /**
  * Forced-failure dry run. The kvmd mock stands in for the device.
@@ -40,6 +41,7 @@ import {
   msdTest,
   onTestTeardown,
   runBounded,
+  waitForMsdUploadSlots,
 } from './msd-bounds.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -82,6 +84,7 @@ async function withCycle(mockOptions, fn) {
   await finishWith(
     () => fn({ mock, dir, session, pikvm }),
     onTestTeardown(() => runBounded([
+      () => waitForMsdUploadSlots(),
       () => session.close(),
       () => bounded('cycle mock close', mock.close()),
       () => bounded('fixture cleanup', rm(dir, { recursive: true, force: true })),
