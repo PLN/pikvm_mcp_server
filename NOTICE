@@ -51,6 +51,7 @@ Modified 2026-10 by PLN: hash timeout releases the upload slot before close (GPL
 Modified 2026-10 by PLN: catalog budgets use a monotonic clock (GPL-3.0; see below).
 Modified 2026-10 by PLN: removal confirm stays hidden across an extra catalog GET (GPL-3.0; see below).
 Modified 2026-10 by PLN: a catalog read is not started with under 1 ms left (GPL-3.0; see below).
+Modified 2026-10 by PLN: Node 24 and Windows test locations, and the CI matrix (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -935,4 +936,16 @@ No code from another pikvm_mcp_server fork was added for these methods.
   wall clock, as do the job TTL, the HTTP idle sweep, and certificate
   expiry.
   beforeSlotRelease does not run on the hash-timeout path.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  The MSD caller-location child uses the TAP reporter. Node 24's
+  default reporter does not print the location rows that test parses.
+  The generated import is a file URL, so a Windows path is a valid
+  ESM specifier. Stack frames keep a Windows drive letter, including
+  file:///C:/ URLs. The credential inode probe omits the node:fs
+  default export from the module mock. Node 24 refuses to redefine
+  constants when that default export is included. CI runs the test
+  job on Ubuntu with Node 22.14.0 and Node 24, and on Windows with
+  Node 22.14.0. The allow-scripts job is unchanged.
   No code from another pikvm_mcp_server fork was copied.

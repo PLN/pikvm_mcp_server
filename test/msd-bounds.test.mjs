@@ -1,5 +1,6 @@
 // Modified 2026-10 by PLN: bounded MSD test teardown and fetch (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: caller locations and labeled body timeouts (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: TAP locations and a Windows file URL (GPL-3.0; see NOTICE).
 
 /**
  * The MSD bound helper. A hang rejects with the operation name, the
@@ -14,7 +15,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe } from 'node:test';
 import { promisify } from 'node:util';
-import { fileURLToPath } from 'node:url';
 import {
   MSD_FETCH_TIMEOUT_MS,
   MSD_FILE_TIMEOUT_MS,
@@ -27,10 +27,11 @@ import {
   finishWith,
   msdTest,
   runBounded,
+  stackFrameSite,
 } from './msd-bounds.mjs';
 
 const execFileAsync = promisify(execFile);
-const BOUNDS = fileURLToPath(new URL('./msd-bounds.mjs', import.meta.url));
+const BOUNDS = new URL('./msd-bounds.mjs', import.meta.url).href;
 
 describe('MSD test bounds', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
   msdTest('ceilings stay ordered', () => {
@@ -184,6 +185,19 @@ describe('MSD test bounds', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
     }
   });
 
+  msdTest('a windows stack frame keeps the drive letter', () => {
+    const drive = stackFrameSite('    at msdTest (C:\\repo\\test\\loc.test.mjs:4:1)');
+    assert.deepEqual(drive, {
+      file: 'C:\\repo\\test\\loc.test.mjs',
+      line: 4,
+      column: 1,
+    });
+    const url = stackFrameSite('    at msdTest (file:///C:/repo/test/loc.test.mjs:7:1)');
+    assert.equal(url.line, 7);
+    assert.equal(url.column, 1);
+    assert.match(url.file, /C:[\\/]repo[\\/]test[\\/]loc\.test\.mjs$/);
+  });
+
   msdTest('a failure location is the caller, and a hung body still exits', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'pikvm-msd-loc-'));
     const file = join(dir, 'loc.test.mjs');
@@ -210,6 +224,7 @@ describe('MSD test bounds', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
       delete env.NODE_TEST_CONTEXT;
       const result = await execFileAsync(process.execPath, [
         '--test',
+        '--test-reporter=tap',
         '--test-concurrency=1',
         file,
       ], { encoding: 'utf8', timeout: 5000, env });

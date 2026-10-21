@@ -1,4 +1,5 @@
 // Modified 2026-10 by PLN: opened-inode credential probe (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: the fs mock omits the default export (GPL-3.0; see NOTICE).
 
 /**
  * Opens the credential path as a different file, then resolves the secret.
@@ -14,16 +15,17 @@ const decoyPath = process.env.PIKVM_IDENTITY_DECOY;
 const credDir = process.env.PIKVM_IDENTITY_DIR;
 const credentialsRoot = process.env.PIKVM_IDENTITY_ROOT;
 const realOpenSync = fs.openSync;
+const namedExports = {};
+for (const key of Object.keys(fs)) {
+  if (key === 'default') continue;
+  namedExports[key] = fs[key];
+}
+namedExports.openSync = function openSync(filePath, flags, mode) {
+  const target = filePath === secretPath ? decoyPath : filePath;
+  return realOpenSync(target, flags, mode);
+};
 
-mock.module('node:fs', {
-  namedExports: {
-    ...fs,
-    openSync(filePath, flags, mode) {
-      const target = filePath === secretPath ? decoyPath : filePath;
-      return realOpenSync(target, flags, mode);
-    },
-  },
-});
+mock.module('node:fs', { namedExports });
 
 const { resolveSecret } = await import('../dist/secrets.js');
 
