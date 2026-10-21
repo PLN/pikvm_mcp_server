@@ -1,4 +1,5 @@
 // Modified 2026-10 by PLN: POSIX capability probes for fixtures (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: a FIFO counts only when the path is a FIFO (GPL-3.0; see NOTICE).
 
 /**
  * Cached probes for fixtures that need a symlink, a FIFO, or an exact
@@ -49,8 +50,11 @@ export function symlinkAvailable() {
 export function fifoAvailable() {
   if (fifo !== undefined) return fifo;
   fifo = probe('fifo', (dir) => {
-    execFileSync('mkfifo', [join(dir, 'pipe')], { stdio: 'ignore' });
-    return true;
+    const pipe = join(dir, 'pipe');
+    execFileSync('mkfifo', [pipe], { stdio: 'ignore' });
+    // Git for Windows ships mkfifo. It can exit 0 without leaving a
+    // FIFO that Node can open, so the command's status is not enough.
+    return statSync(pipe).isFIFO();
   });
   return fifo;
 }

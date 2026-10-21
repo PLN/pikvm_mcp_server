@@ -948,4 +948,7 @@ No code from another pikvm_mcp_server fork was added for these methods.
   constants when that default export is included. CI runs the test
   job on Ubuntu with Node 22.14.0 and Node 24, and on Windows with
   Node 22.14.0. The allow-scripts job is unchanged.
+  A FIFO fixture counts only when the created path is a FIFO. On
+  Windows, mkfifo can exit 0 and leave no file Node can open, so those
+  assertions are skipped there.
   No code from another pikvm_mcp_server fork was copied.
