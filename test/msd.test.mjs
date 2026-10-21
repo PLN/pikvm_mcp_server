@@ -17,6 +17,7 @@
 // Modified 2026-10 by PLN: bounded MSD test teardown and fetch (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: hash timeout releases the upload slot (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: hash timeout releases the upload slot before close (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: removal confirm stays hidden across an extra catalog GET (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: catalog budgets use a monotonic clock (GPL-3.0; see NOTICE).
 
 /**
@@ -2742,7 +2743,14 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
 
     await msdSubtest(t, 'an image absent at remove time, then visible, is confirmed gone', async (inner) => {
       watchCrashes(inner);
-      await withUpload({ images: [], catalogHidePolls: 3 }, 300, async ({ mock, base, sessionId }) => {
+      // The catalog budget is fractional monotonic time. setTimeout
+      // truncates a fractional remain and can fire about 1 ms early, so
+      // this 300 ms budget sometimes starts a fourth GET. Hiding three
+      // polls lets that GET see the image, and the job ends done. Hide
+      // until 350 ms after the first fresh catalog read: that extra GET
+      // is still absent, and removal confirm, which starts after the
+      // budget, sees the image.
+      await withUpload({ images: [], catalogHideMs: 350 }, 300, async ({ mock, base, sessionId }) => {
         const started = await startTransfer('upload', base, sessionId);
         const { jobId } = JSON.parse(started.content[0].text);
         const failed = await pollJob(base, sessionId, jobId, 8000);
