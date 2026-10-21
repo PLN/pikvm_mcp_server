@@ -15,6 +15,7 @@
 // Modified 2026-10 by PLN: eject expectImage is typed, and catalog cleanup keeps the MSD lock (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: hash reads stop at the MSD job ceiling (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: hash timeout releases the upload slot before close (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: hash reads use the idle timeout (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: catalog budgets use a monotonic clock (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a catalog read is not started with under 1 ms left (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: tests can see one catalog read and the upload slot (GPL-3.0; see NOTICE).
@@ -40,6 +41,7 @@ import path from 'node:path';
 import { Readable } from 'node:stream';
 import {
   KvmdError,
+  msdIdleTimeoutOf,
   msdJobTimeoutOf,
   type MsdDriveState,
   type MsdImageRecord,
@@ -198,6 +200,21 @@ export class MsdHashTimeoutError extends Error {
   }
 }
 
+/**
+ * One hash read returned no bytes for PIKVM_MSD_IDLE_TIMEOUT_MS.
+ * This is not the job wall clock. The upload POST is not sent.
+ * The slot is released without waiting for the file to close.
+ * The descriptor is closed once no hash read is in flight.
+ */
+export class MsdHashIdleTimeoutError extends Error {
+  readonly type = 'PIKVM_MSD_HASH_IDLE_TIMEOUT';
+
+  constructor(file: string, ms: number) {
+    super(`hash of ${JSON.stringify(file)} made no progress for ${ms}ms (PIKVM_MSD_IDLE_TIMEOUT_MS)`);
+    this.name = 'MsdHashIdleTimeoutError';
+  }
+}
+
 /** Cancelled while waiting for the catalog. The write is not sent again. */
 export class MsdCancelledError extends Error {
   readonly type = 'PIKVM_MSD_CANCELLED';
@@ -313,6 +330,7 @@ function errorFields(err: unknown): ErrorFields {
     || err instanceof MsdSizeMismatchError
     || err instanceof MsdCancelledError
     || err instanceof MsdHashTimeoutError
+    || err instanceof MsdHashIdleTimeoutError
     || err instanceof MsdRemovalUnconfirmedError
   ) {
     return {
@@ -757,8 +775,10 @@ interface HashRead {
  * holds a ref, and FileHandle.close then waits for that read. A hung
  * filesystem would keep the upload slot until the read returned.
  * Lookup is on the fs object so a test can replace fs.read.
- * After abort the late callback is ignored, so it cannot reject twice.
- * If the hash timeout deferred the close, that same callback closes the fd.
+ * After abort or the idle bound the late callback is ignored, so it
+ * cannot reject twice. If a hash timeout deferred the close, that
+ * same callback closes the fd. The idle timer covers this read only.
+ * It is cleared when the read settles and does not limit the next one.
  */
 function readSlice(
   fh: FileHandle,
@@ -768,6 +788,8 @@ function readSlice(
   signal: AbortSignal,
   timeoutMs: number,
   hashRead: HashRead,
+  idleMs: number,
+  file: string,
 ): Promise<number> {
   return new Promise((resolve, reject) => {
     if (signal.aborted) {
@@ -775,9 +797,16 @@ function readSlice(
       return;
     }
     let settled = false;
+    let idleTimer: ReturnType<typeof setTimeout> | undefined;
+    const clearIdle = () => {
+      if (idleTimer === undefined) return;
+      clearTimeout(idleTimer);
+      idleTimer = undefined;
+    };
     const finish = (settle: () => void) => {
       if (settled) return;
       settled = true;
+      clearIdle();
       signal.removeEventListener('abort', onAbort);
       settle();
     };
@@ -785,6 +814,10 @@ function readSlice(
       finish(() => reject(new MsdHashTimeoutError(timeoutMs)));
     };
     signal.addEventListener('abort', onAbort, { once: true });
+    // The idle cap is one hour, under the 2^31 ms timer limit.
+    idleTimer = setTimeout(() => {
+      finish(() => reject(new MsdHashIdleTimeoutError(file, idleMs)));
+    }, idleMs);
     hashRead.pending = true;
     try {
       fs.read(fh.fd, buf, 0, length, position, (err, bytesRead) => {
@@ -823,12 +856,16 @@ async function hashFd(
   signal: AbortSignal,
   timeoutMs: number,
   hashRead: HashRead,
+  idleMs: number,
+  file: string,
 ): Promise<string> {
   const hash = createHash('sha256');
   const buf = Buffer.alloc(HASH_CHUNK);
   let offset = 0;
   while (offset < size) {
     if (signal.aborted) throw new MsdHashTimeoutError(timeoutMs);
+    // A new read starts a new idle bound. Bytes from the previous
+    // read are what reset it. idleMs is not a sum across reads.
     const bytesRead = await readSlice(
       fh,
       buf,
@@ -837,6 +874,8 @@ async function hashFd(
       signal,
       timeoutMs,
       hashRead,
+      idleMs,
+      file,
     );
     if (signal.aborted) throw new MsdHashTimeoutError(timeoutMs);
     if (bytesRead === 0) break;
@@ -1252,10 +1291,19 @@ async function runUpload(
   try {
     if (request.beforeHash) await request.beforeHash();
     const hashBudgetMs = msdJobTimeoutOf(client);
+    const hashIdleMs = msdIdleTimeoutOf(client);
     const hashDeadline = startHashDeadline(hashBudgetMs);
     let prehash: string;
     try {
-      prehash = await hashFd(fh, size, hashDeadline.signal, hashBudgetMs, hashRead);
+      prehash = await hashFd(
+        fh,
+        size,
+        hashDeadline.signal,
+        hashBudgetMs,
+        hashRead,
+        hashIdleMs,
+        file,
+      );
     } finally {
       hashDeadline.done();
     }
@@ -1386,10 +1434,11 @@ async function runUpload(
 
   async function releaseSlot(): Promise<void> {
     if (slotFree) return;
-    if (failure instanceof MsdHashTimeoutError) {
+    if (failure instanceof MsdHashTimeoutError || failure instanceof MsdHashIdleTimeoutError) {
       // Close needs a threadpool thread, and the syscall itself can block.
       // Waiting here would keep the slot on a hung filesystem, or while
-      // hung reads already fill the pool. The slot is free first. A read
+      // hung reads already fill the pool. The slot is free first. The job
+      // ceiling and the per-read idle bound both use this path. A read
       // still in flight closes the fd from that read's callback; otherwise
       // close starts now and is still not awaited. beforeSlotRelease runs
       // only after a close that held the slot, so it does not run here.
@@ -1430,6 +1479,10 @@ async function runUpload(
  * On that hash timeout the upload slot is released without waiting for
  * the file close. The descriptor is closed from the in-flight read's
  * callback, or immediately when no read is in flight.
+ * Each hash read also stops if it returns no bytes for
+ * PIKVM_MSD_IDLE_TIMEOUT_MS. That bound resets when a read returns
+ * bytes and does not cap total hash time. On that idle timeout the
+ * slot is released the same way and the upload POST is not sent.
  * A sha256 mismatch fails the job and does not POST. A second upload
  * while one is running throws before it opens a file.
  */

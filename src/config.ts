@@ -15,6 +15,7 @@
 // Modified 2026-10 by PLN: a logged host is an origin (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: screenshot preview defaults (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: PIKVM_OCR_TIMEOUT_MS (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: hash reads use the idle timeout (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: host OCR settings (GPL-3.0; see NOTICE).
 // Env read adapted from dtrukr/pikvm_mcp_server src/config.ts @ d120243 (GPL-3.0).
 
@@ -176,7 +177,12 @@ export interface Config {
     requestTimeoutMs: number;
     /** Wall clock for one MSD upload, from PIKVM_MSD_JOB_TIMEOUT_MS. Default 6 hours, max 7 days. */
     msdJobTimeoutMs: number;
-    /** Idle gap for an MSD upload, from PIKVM_MSD_IDLE_TIMEOUT_MS. Default 60 seconds, max 1 hour. */
+    /**
+     * Idle gap for an MSD upload body or progress stream, and the
+     * per-read no-progress bound while hashing a local file, from
+     * PIKVM_MSD_IDLE_TIMEOUT_MS. Default 60 seconds, max 1 hour.
+     * A hash read resets it when bytes return. It is not a total hash cap.
+     */
     msdIdleTimeoutMs: number;
     /** One OCR snapshot, from PIKVM_OCR_TIMEOUT_MS. Default 30s. Not retried on timeout. */
     ocrTimeoutMs: number;

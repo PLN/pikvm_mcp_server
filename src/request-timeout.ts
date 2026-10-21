@@ -3,6 +3,7 @@
 // Modified 2026-10 by PLN: cap MSD job at 7 days and idle at 1 hour (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: MSD catalog readiness budget (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: short confirm when an image never appeared (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: hash reads use the idle timeout (GPL-3.0; see NOTICE).
 
 /** Default abort deadline for one ordinary kvmd call. */
 export const REQUEST_TIMEOUT_DEFAULT_MS = 5000;
@@ -39,7 +40,11 @@ export function parseRequestTimeoutMs(raw: string | undefined): number {
  */
 export const MSD_JOB_TIMEOUT_DEFAULT_MS = 6 * 60 * 60 * 1000;
 
-/** Idle gap while an MSD upload body or progress stream is moving. */
+/**
+ * Idle gap while an MSD upload body or progress stream is moving.
+ * Also the per-read no-progress bound while hashing a local file.
+ * Not a cap on total hash time.
+ */
 export const MSD_IDLE_TIMEOUT_DEFAULT_MS = 60 * 1000;
 
 /**

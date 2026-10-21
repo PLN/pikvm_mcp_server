@@ -22,6 +22,7 @@
 // Modified 2026-10 by PLN: a sub-ms catalog remainder does not start a GET (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a POSIX FIFO must exist, and teardown waits for the slot (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a Windows FIFO image is skipped (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: hash reads use the idle timeout (GPL-3.0; see NOTICE).
 
 /**
  * MSD tools against the mock. The HTTP harness matches test/http.test.mjs.
@@ -40,7 +41,7 @@ import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import { cancelMsdJob } from '../dist/msd.js';
+import { cancelMsdJob, msdUploadSlotsFree } from '../dist/msd.js';
 import { MSD_UNSEEN_CONFIRM_MS } from '../dist/request-timeout.js';
 import { PiKVMClient } from '../dist/pikvm/client.js';
 import { BusyLock } from '../dist/pikvm/lock.js';
@@ -906,8 +907,11 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
    * fs.close of them, is how an abort test sees the raw-fd stream come
    * back. The prototype is taken from a real handle and restored in
    * finally. Nothing here closes a descriptor it did not open.
+   * fsReadMs delays fs.read, which hashing uses. It defaults to ms.
+   * A caller that is testing the upload idle bound passes a shorter
+   * fs.read delay so hashing still returns bytes inside that bound.
    */
-  async function withStalledFsRead(ms, fn) {
+  async function withStalledFsRead(ms, fn, fsReadMs = ms) {
     const probe = await openHandle(process.execPath, 'r');
     const proto = Object.getPrototypeOf(probe);
     const origHandleRead = proto.read;
@@ -925,7 +929,7 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
     fs.read = function stalledRead(fd, buffer, offset, length, position, callback) {
       stalledUploadFds.add(fd);
       return origRead.call(fs, fd, buffer, offset, length, position, (err, bytesRead, buf) => {
-        setTimeout(() => callback(err, bytesRead, buf), ms);
+        setTimeout(() => callback(err, bytesRead, buf), fsReadMs);
       });
     };
     fs.close = function stalledClose(fd, cb) {
@@ -1540,6 +1544,146 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
         } finally {
           await restoreRead();
         }
+      });
+    });
+
+    await msdSubtest(t, 'a stalled hash read fails at the idle bound and uploads nothing', async () => {
+      await withDir(async (dir) => {
+        await writeFile(join(dir, 'disk.img'), body);
+        const idleMs = 100;
+        await withHungHashRead((hung) => whileWatchingProcess(async () => {
+          const flags = uploadMsd(dir);
+          flags.msdIdleTimeoutMs = idleMs;
+          flags.msdJobTimeoutMs = 30000;
+          await withSession({ images: [] }, flags, async ({ mock, base, sessionId }) => {
+            const began = performance.now();
+            const started = await callTool(base, sessionId, 'pikvm_msd_upload', {
+              file: 'disk.img',
+              confirmImage: 'disk.img',
+            });
+            assert.equal(started.isError, undefined, started.content[0].text);
+            const { jobId } = JSON.parse(started.content[0].text);
+            const failed = await pollJob(base, sessionId, jobId, 4000);
+            const elapsed = performance.now() - began;
+            assert.equal(failed.state, 'failed');
+            assert.equal(failed.error.type, 'PIKVM_MSD_HASH_IDLE_TIMEOUT');
+            assert.equal(
+              failed.error.message,
+              `hash of "disk.img" made no progress for ${idleMs}ms (PIKVM_MSD_IDLE_TIMEOUT_MS)`,
+            );
+            assert.ok(elapsed >= idleMs / 2, `hash failed before the idle bound (${elapsed}ms)`);
+            assert.ok(elapsed < 2000, `hash hung past the idle bound (${elapsed}ms)`);
+            assert.deepEqual(msdPosts(mock), []);
+            assert.ok(hung.fd >= 0, 'hash never called fs.read');
+            const openIdentity = await fdIdentity(hung.fd);
+            hung.callback(Object.assign(new Error('closed'), { code: 'EBADF' }));
+            await waitUntilFdReleased(hung.fd, openIdentity);
+            hung.callback(null, body.length);
+          });
+        }));
+      });
+    });
+
+    await msdSubtest(t, 'slow hash reads past the idle bound still upload', async () => {
+      await withDir(async (dir) => {
+        const slow = Buffer.from('0123456789');
+        const slowSum = digest(slow);
+        await writeFile(join(dir, 'disk.img'), slow);
+        const idleMs = 400;
+        const delayMs = 80;
+        const durations = [];
+        const origRead = fs.read;
+        let remaining = slow.length;
+        fs.read = function slowHashRead(fd, buffer, offset, length, position, callback) {
+          if (remaining <= 0) {
+            return origRead.call(fs, fd, buffer, offset, length, position, callback);
+          }
+          const started = performance.now();
+          remaining -= 1;
+          return origRead.call(fs, fd, buffer, offset, 1, position, (err, bytesRead, buf) => {
+            setTimeout(() => {
+              durations.push(performance.now() - started);
+              callback(err, bytesRead, buf);
+            }, delayMs);
+          });
+        };
+        const restoreRead = onTestTeardown(() => {
+          fs.read = origRead;
+        });
+        const flags = uploadMsd(dir);
+        flags.msdIdleTimeoutMs = idleMs;
+        flags.msdJobTimeoutMs = 30000;
+        try {
+          await whileWatchingProcess(() => withSession({
+            images: [],
+            free: 1000,
+          }, flags, async ({ mock, base, sessionId }) => {
+            const started = await callTool(base, sessionId, 'pikvm_msd_upload', {
+              file: 'disk.img',
+              confirmImage: 'disk.img',
+              sha256: slowSum,
+            });
+            assert.equal(started.isError, undefined, started.content[0].text);
+            const done = await pollJob(base, sessionId, JSON.parse(started.content[0].text).jobId, 8000);
+            assert.equal(done.state, 'done', done.error && `${done.error.type}: ${done.error.message}`);
+            assert.equal(done.sha256, slowSum);
+            assert.equal(mock.bytes.get('disk.img').toString(), slow.toString());
+            assert.equal(durations.length, slow.length, `reads=${durations.length}`);
+            const slowest = Math.max(...durations);
+            const total = durations.reduce((sum, ms) => sum + ms, 0);
+            assert.ok(slowest < idleMs, `slowest read ${slowest}ms of [${durations.join(', ')}]`);
+            assert.ok(total > idleMs, `hash read time ${total}ms did not pass the ${idleMs}ms idle bound`);
+          }));
+        } finally {
+          await restoreRead();
+        }
+      });
+    });
+
+    await msdSubtest(t, 'a hash idle timeout frees the slot before the stalled read settles', async () => {
+      await withDir(async (dir) => {
+        await writeFile(join(dir, 'disk.img'), body);
+        await writeFile(join(dir, 'next.img'), Buffer.from('wxyz'));
+        const idleMs = 100;
+        await withHungHashRead((hung) => whileWatchingProcess(async () => {
+          const flags = uploadMsd(dir);
+          flags.msdIdleTimeoutMs = idleMs;
+          flags.msdJobTimeoutMs = 30000;
+          await withSession({ images: [] }, flags, async ({ mock, base, sessionId }) => {
+            const started = await callTool(base, sessionId, 'pikvm_msd_upload', {
+              file: 'disk.img',
+              confirmImage: 'disk.img',
+            });
+            assert.equal(started.isError, undefined, started.content[0].text);
+            const { jobId } = JSON.parse(started.content[0].text);
+            const failed = await pollJob(base, sessionId, jobId, 4000);
+            assert.equal(failed.state, 'failed');
+            assert.equal(failed.error.type, 'PIKVM_MSD_HASH_IDLE_TIMEOUT');
+            assert.equal(msdUploadSlotsFree(), true);
+            assert.deepEqual(msdPosts(mock), []);
+            assert.ok(hung.fd >= 0, 'hash never called fs.read');
+            const openIdentity = await fdIdentity(hung.fd);
+            assert.notEqual(openIdentity, '');
+            const again = await callTool(base, sessionId, 'pikvm_msd_upload', {
+              file: 'next.img',
+              confirmImage: 'next.img',
+            });
+            assert.equal(again.isError, undefined, again.content[0].text);
+            assert.equal(again.content[0].text.includes('MsdUploadBusyError'), false);
+            assert.equal(await fdIdentity(hung.fd), openIdentity);
+            hung.callback(Object.assign(new Error('late read'), { code: 'EIO' }));
+            await waitUntilFdReleased(hung.fd, openIdentity);
+            hung.callback(null, body.length);
+            const still = JSON.parse((await callTool(base, sessionId, 'pikvm_msd_job', { jobId })).content[0].text);
+            assert.equal(still.error.type, 'PIKVM_MSD_HASH_IDLE_TIMEOUT');
+            assert.equal(mock.calls.some((call) => (
+              call.path === '/api/msd/write' && call.query.includes('disk.img')
+            )), false);
+            const done = await pollJob(base, sessionId, JSON.parse(again.content[0].text).jobId);
+            assert.equal(done.state, 'done');
+            assert.equal(mock.bytes.get('next.img').toString(), 'wxyz');
+          });
+        }));
       });
     });
 
@@ -2338,6 +2482,8 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
         const flags = uploadMsd(dir, { maxBytes: 1024 * 1024 });
         flags.msdIdleTimeoutMs = 400;
         flags.msdJobTimeoutMs = 20000;
+        // Hashing uses fs.read. Keep that delay under the idle bound so
+        // this subtest still reaches the stalled upload body.
         await withStalledFsRead(800, () => whileWatchingProcess(async () => {
           await withSession({ images: [], pauseWrite: true }, flags, async ({ base, sessionId }) => {
             const started = await callTool(base, sessionId, 'pikvm_msd_upload', {
@@ -2353,7 +2499,7 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
             await assertKvmdStillAnswers(base, sessionId);
             await finishStalledRead(800);
           });
-        }));
+        }), 0);
       });
     });
 
