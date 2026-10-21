@@ -16,6 +16,7 @@
 // Modified 2026-10 by PLN: hash reads stop at the MSD job ceiling (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: hash timeout releases the upload slot before close (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: catalog budgets use a monotonic clock (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: a catalog read is not started with under 1 ms left (GPL-3.0; see NOTICE).
 
 /**
  * Policy for MSD status, mount, eject, upload, and remove.
@@ -660,7 +661,9 @@ export interface UploadRequest {
   beforeUploadStream?: () => Promise<void>;
   /**
    * Awaited after the file is closed, while the slot is still held, and
-   * before the job becomes done or failed. Unset in production.
+   * before the job becomes done or failed. It does not run on the
+   * hash-timeout path: that path releases the slot before close.
+   * Unset in production.
    */
   beforeSlotRelease?: () => Promise<void>;
   /**
@@ -1010,9 +1013,11 @@ async function readMsdState(
 ): Promise<MsdState | 'deadline' | 'cancelled'> {
   if (cancel?.aborted) return 'cancelled';
   const left = deadlineAt - elapsedNow();
-  if (left <= 0) return 'deadline';
-  // AbortSignal.timeout rejects a fractional delay. Ceil keeps the
-  // read from ending before the budget; the overshoot is under 1 ms.
+  // AbortSignal.timeout rejects a fractional delay, and a remainder
+  // under 1 ms cannot be expressed. Ceil of that remainder would start
+  // a GET the budget does not cover. Ceil above 1 ms keeps the read
+  // from ending before the budget; that overshoot is under 1 ms.
+  if (left < 1) return 'deadline';
   const attempt = AbortSignal.timeout(Math.ceil(left));
   const signal = cancel ? AbortSignal.any([attempt, cancel]) : attempt;
   try {
