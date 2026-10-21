@@ -54,6 +54,7 @@ Modified 2026-10 by PLN: removal confirm stays hidden across an extra catalog GE
 Modified 2026-10 by PLN: a catalog read is not started with under 1 ms left (GPL-3.0; see below).
 Modified 2026-10 by PLN: Node 24 and Windows test locations, and the CI matrix (GPL-3.0; see below).
 Modified 2026-10 by PLN: hash reads use the idle timeout (GPL-3.0; see below).
+Modified 2026-10 by PLN: MSD progress windows (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -979,4 +980,29 @@ No code from another pikvm_mcp_server fork was added for these methods.
   exports that make the read and the slot visible do not acquire,
   release, or change a catalog read. CI pins Node 24.22.0 and
   windows-2025. The allow-scripts job is unchanged.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  Each local hash read is bounded by PIKVM_MSD_IDLE_TIMEOUT_MS. The
+  timer starts when the read is issued and is cleared when that read
+  returns. A read that does not return within the limit fails the job
+  with PIKVM_MSD_HASH_IDLE_TIMEOUT. Time queued on the libuv threadpool
+  counts. A read that returns 0 bytes ends the hash and does not trip
+  the bound. The bound resets for the next read and does not cap total
+  hash time. PIKVM_MSD_JOB_TIMEOUT_MS stays the last-resort cap for the
+  whole hash and is still cleared when hashing finishes, so the upload
+  POST gets its own cap of the same length.
+  The same idle value is the progress bound for the upload body, the
+  upload finalise wait after the body ends until response headers, the
+  write_remote wait for response headers (the connect timeout plus the
+  idle value, from when the request is sent), and each gap in the
+  write_remote NDJSON stream. The final progress line is a chunk of
+  that stream. A finalise timeout and a header-window timeout are
+  PIKVM_MSD_STATE_UNKNOWN, the code a body-phase idle abort already
+  uses, so the upload slot is released the same way and the image is
+  not removed. The job cap still stops a transfer that keeps making
+  progress. The catalog wait is unchanged and still uses
+  PIKVM_MSD_READY_TIMEOUT_MS. There is no new environment variable.
+  Per kvmd's shipped nginx config, /api/msd/write does not set proxy
+  timeouts, so nginx's 60s defaults still apply to that phase.
   No code from another pikvm_mcp_server fork was copied.

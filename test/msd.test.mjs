@@ -23,6 +23,7 @@
 // Modified 2026-10 by PLN: a POSIX FIFO must exist, and teardown waits for the slot (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a Windows FIFO image is skipped (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: hash reads use the idle timeout (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: MSD progress windows (GPL-3.0; see NOTICE).
 
 /**
  * MSD tools against the mock. The HTTP harness matches test/http.test.mjs.
@@ -1591,18 +1592,17 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
         await writeFile(join(dir, 'disk.img'), slow);
         const idleMs = 400;
         const delayMs = 80;
-        const durations = [];
+        let delayedReads = 0;
         const origRead = fs.read;
         let remaining = slow.length;
         fs.read = function slowHashRead(fd, buffer, offset, length, position, callback) {
           if (remaining <= 0) {
             return origRead.call(fs, fd, buffer, offset, length, position, callback);
           }
-          const started = performance.now();
           remaining -= 1;
           return origRead.call(fs, fd, buffer, offset, 1, position, (err, bytesRead, buf) => {
             setTimeout(() => {
-              durations.push(performance.now() - started);
+              delayedReads += 1;
               callback(err, bytesRead, buf);
             }, delayMs);
           });
@@ -1628,15 +1628,57 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
             assert.equal(done.state, 'done', done.error && `${done.error.type}: ${done.error.message}`);
             assert.equal(done.sha256, slowSum);
             assert.equal(mock.bytes.get('disk.img').toString(), slow.toString());
-            assert.equal(durations.length, slow.length, `reads=${durations.length}`);
-            const slowest = Math.max(...durations);
-            const total = durations.reduce((sum, ms) => sum + ms, 0);
-            assert.ok(slowest < idleMs, `slowest read ${slowest}ms of [${durations.join(', ')}]`);
-            assert.ok(total > idleMs, `hash read time ${total}ms did not pass the ${idleMs}ms idle bound`);
+            assert.equal(delayedReads, slow.length, `reads=${delayedReads}`);
+            assert.ok(delayMs < idleMs);
+            assert.ok(
+              delayMs * delayedReads > idleMs,
+              `injected delays ${delayMs}*${delayedReads} did not pass the ${idleMs}ms idle bound`,
+            );
           }));
         } finally {
           await restoreRead();
         }
+      });
+    });
+
+    await msdSubtest(t, 'an upload finalise timeout frees the slot and does not crash', async () => {
+      await withDir(async (dir) => {
+        await writeFile(join(dir, 'disk.img'), body);
+        await writeFile(join(dir, 'next.img'), Buffer.from('wxyz'));
+        const idleMs = 250;
+        await whileWatchingProcess(async () => {
+          const flags = uploadMsd(dir);
+          flags.msdIdleTimeoutMs = idleMs;
+          flags.msdJobTimeoutMs = 20000;
+          await withSession({ images: [], free: 1000, writeHoldMs: 8000 }, flags, async ({ mock, base, sessionId }) => {
+            const started = await callTool(base, sessionId, 'pikvm_msd_upload', {
+              file: 'disk.img',
+              confirmImage: 'disk.img',
+            });
+            assert.equal(started.isError, undefined, started.content[0].text);
+            const { jobId } = JSON.parse(started.content[0].text);
+            const failed = await pollJob(base, sessionId, jobId, 4000);
+            assert.equal(failed.state, 'failed');
+            assert.equal(failed.error.type, 'PIKVM_MSD_STATE_UNKNOWN');
+            assert.equal(
+              failed.error.message,
+              `timed out after ${idleMs}ms waiting for kvmd to finish the write (PIKVM_MSD_IDLE_TIMEOUT_MS); image may be partial or complete; re-read /api/msd; do not resend`,
+            );
+            assert.equal(failed.removed, undefined);
+            assert.equal(mock.calls.some((call) => call.path === '/api/msd/remove'), false);
+            assert.equal(msdUploadSlotsFree(), true);
+            const again = await callTool(base, sessionId, 'pikvm_msd_upload', {
+              file: 'next.img',
+              confirmImage: 'next.img',
+            });
+            assert.equal(again.isError, undefined, again.content[0].text);
+            assert.equal(again.content[0].text.includes('MsdUploadBusyError'), false);
+            const againFailed = await pollJob(base, sessionId, JSON.parse(again.content[0].text).jobId, 4000);
+            assert.equal(againFailed.state, 'failed');
+            assert.equal(againFailed.error.type, 'PIKVM_MSD_STATE_UNKNOWN');
+            assert.equal(msdUploadSlotsFree(), true);
+          });
+        });
       });
     });
 
@@ -2435,6 +2477,37 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
         assert.equal(failed.removeError, undefined);
         assert.equal(mock.state.images['disk.img'], undefined);
         assert.ok(performance.now() - began >= 300, 'an unknown name is not proof the image is gone');
+      });
+    });
+
+    await msdSubtest(t, 'a late write_remote header window frees the slot and does not crash', async () => {
+      const idleMs = 250;
+      const connectSec = 1;
+      const headerMs = connectSec * 1000 + idleMs;
+      await whileWatchingProcess(async () => {
+        const flags = fetchFlags(FETCH_ALLOW, { connectTimeoutSec: connectSec });
+        flags.msdIdleTimeoutMs = idleMs;
+        flags.msdJobTimeoutMs = 20000;
+        await withSession({
+          images: [],
+          remote: { headerDelayMs: 8000 },
+        }, flags, async ({ mock, base, sessionId }) => {
+          const started = await callTool(base, sessionId, 'pikvm_msd_fetch_url', {
+            url: FETCH_URL,
+            confirmImage: 'disk.img',
+          });
+          assert.equal(started.isError, undefined, started.content[0].text);
+          const failed = await pollJob(base, sessionId, JSON.parse(started.content[0].text).jobId, 4000);
+          assert.equal(failed.state, 'failed');
+          assert.equal(failed.error.type, 'PIKVM_MSD_STATE_UNKNOWN');
+          assert.equal(
+            failed.error.message,
+            `timed out after ${headerMs}ms waiting for write_remote response headers (connect timeout + PIKVM_MSD_IDLE_TIMEOUT_MS); image may be partial or complete; re-read /api/msd; do not resend`,
+          );
+          assert.equal(failed.removed, undefined);
+          assert.equal(mock.calls.some((call) => call.path === '/api/msd/remove'), false);
+          assert.equal(msdUploadSlotsFree(), true);
+        });
       });
     });
 

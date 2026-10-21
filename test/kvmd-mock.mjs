@@ -12,6 +12,7 @@
 // Modified 2026-10 by PLN: hold one streamer read so a capture can finish first (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: delay a fresh image in the MSD catalog (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a slow catalog read and a name that returns after remove (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: stall a write_remote stream after N lines (GPL-3.0; see NOTICE).
 
 /**
  * Minimal KVMD REST mock implementing exactly the routes src/pikvm/client.ts
@@ -31,7 +32,8 @@
  * image bytes. Options: `free`, `busyFor` (how many MSD mutations
  * answer MsdIsBusyError), `failMidWrite`, `failSetConnected`,
  * `legacyFreeShape`, `writeHoldMs`, `pauseWrite`, and `remote` (`lines`,
- * `chunks`, `gapMs`, `headerDelayMs`, `stallAfterHeadersMs`, `redirectTo`,
+ * `chunks`, `gapMs`, `headerDelayMs`, `stallAfterHeadersMs`,
+ * `stallAfterLines` with `stallMs`, `redirectTo`,
  * `storeIncomplete`). `redirectTo` answers 302 and does not follow it.
  * An error line does not leave an image: kvmd removes the incomplete
  * file itself. `storeIncomplete` keeps that file so a test can see our remove.
@@ -675,8 +677,12 @@ export async function startKvmdMock(options = {}) {
       }
       let remoteFailed = false;
       let remoteSize = 4;
+      let sentLines = 0;
       for (const line of lines) {
         if (remote.gapMs) await waitOrClose(req, remote.gapMs);
+        if (remote.stallAfterLines !== undefined && sentLines === remote.stallAfterLines) {
+          await waitOrClose(req, remote.stallMs ?? 60000);
+        }
         if (req.destroyed || res.writableEnded) return true;
         const text = String(line);
         try {
@@ -689,6 +695,7 @@ export async function startKvmdMock(options = {}) {
           // A non-JSON progress line is still forwarded.
         }
         res.write(text.endsWith('\n') ? text : `${text}\r\n`);
+        sentLines += 1;
       }
       if (!remoteFailed) {
         state.images[name] = imageMeta(name, remoteSize, true);

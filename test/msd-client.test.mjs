@@ -6,6 +6,7 @@
 // Modified 2026-10 by PLN: teardown still runs after a hung test body (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: test timers use a monotonic clock (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: teardown waits for the upload slot (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: MSD progress windows (GPL-3.0; see NOTICE).
 
 /**
  * Plain kvmd MSD client methods against the mock. No MCP tools.
@@ -64,6 +65,22 @@ function msdRequest(url, init, label = 'msd client request') {
 
 function bodyOf(text) {
   return Readable.from([Buffer.from(text)]);
+}
+
+function pacedBody(text, gapMs) {
+  return Readable.from((async function* () {
+    for (const part of text) {
+      await new Promise((resolve) => setTimeout(resolve, gapMs));
+      yield Buffer.from(part);
+    }
+  })());
+}
+
+function remoteLines(name, count) {
+  return Array.from({ length: count }, (_, i) => JSON.stringify({
+    ok: true,
+    result: { image: { name, size: count, written: i + 1 } },
+  }));
 }
 
 function count(mock, method, path) {
@@ -534,14 +551,19 @@ describe('MSD client', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
     });
   });
 
-  msdTest('an upload is not killed by the ordinary request timeout', async () => {
-    await withMock({ writeHoldMs: 700 }, async (_mock, client) => {
+  msdTest('an upload reply inside the finalise window is not killed by the ordinary request timeout', async () => {
+    // The hold is longer than PIKVM_REQUEST_TIMEOUT_MS and shorter than
+    // the finalise window (PIKVM_MSD_IDLE_TIMEOUT_MS). The ordinary
+    // deadline does not apply. The job cap is far longer than the hold.
+    const idleMs = 1000;
+    await withMock({ writeHoldMs: 400 }, async (_mock, client) => {
       const result = await client.msdWrite('slow.img', bodyOf('abcd'), 4);
       assert.equal(result.written, 4);
-    }, { requestTimeoutMs: 150, msdJobTimeoutMs: 8000, msdIdleTimeoutMs: 8000 });
+    }, { requestTimeoutMs: 150, msdJobTimeoutMs: 8000, msdIdleTimeoutMs: idleMs });
   });
 
-  msdTest('the job ceiling aborts a write that never returns headers', { timeout: 15000 }, async () => {
+  msdTest('the finalise window aborts a write that holds the response', { timeout: 15000 }, async () => {
+    const idleMs = 300;
     const started = performance.now();
     await withMock({ writeHoldMs: 8000 }, async (mock, client) => {
       await assert.rejects(
@@ -549,16 +571,32 @@ describe('MSD client', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
         (err) => {
           assert.ok(err instanceof KvmdError);
           assert.equal(err.type, 'PIKVM_MSD_STATE_UNKNOWN');
-          assert.equal(err.message, 'image may be partial or complete; re-read /api/msd; do not resend');
+          assert.equal(err.message, finaliseMessage(idleMs));
           assert.equal(err.endpoint, 'POST /api/msd/write');
           return true;
         },
       );
       await waitFor(() => mock.state.images['held.img']);
       assert.equal(mock.state.images['held.img'].complete, true);
-    }, { msdJobTimeoutMs: 500, msdIdleTimeoutMs: 20000 });
+    }, { msdJobTimeoutMs: 20000, msdIdleTimeoutMs: idleMs });
     const elapsed = performance.now() - started;
-    assert.ok(elapsed < 4000, `job ceiling waited too long: ${elapsed}ms`);
+    assert.ok(elapsed >= idleMs / 2, `finalise window fired early: ${elapsed}ms`);
+    assert.ok(elapsed < 4000, `finalise window waited too long: ${elapsed}ms`);
+  });
+
+  msdTest('a slow upload body past the idle bound still finishes inside the finalise window', { timeout: 15000 }, async () => {
+    const idleMs = 400;
+    const gapMs = 50;
+    const text = 'abcdefghijkl';
+    const started = performance.now();
+    await withMock({}, async (_mock, client) => {
+      const result = await client.msdWrite('slow.img', pacedBody(text, gapMs), text.length);
+      assert.equal(result.written, text.length);
+    }, { msdJobTimeoutMs: 20000, msdIdleTimeoutMs: idleMs });
+    const elapsed = performance.now() - started;
+    assert.ok(gapMs * text.length > idleMs);
+    assert.ok(elapsed >= idleMs, `upload finished inside the idle bound (${elapsed}ms)`);
+    assert.ok(elapsed < 8000, `slow upload hung (${elapsed}ms)`);
   });
 
   msdTest('the idle gap aborts a stalled upload and allows a slow progress stream', { timeout: 15000 }, async () => {
@@ -595,6 +633,119 @@ describe('MSD client', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
       }
       assert.deepEqual(progress, [1, 2, 3, 4, 5, 6, 7, 8]);
     }, { msdJobTimeoutMs: 20000, msdIdleTimeoutMs: 400 });
+  });
+
+  msdTest('the write_remote header window aborts when headers are late', { timeout: 15000 }, async () => {
+    const connectSec = 1;
+    const idleMs = 300;
+    const headerMs = connectSec * 1000 + idleMs;
+    const started = performance.now();
+    await withMock({
+      remote: { headerDelayMs: 8000, lines: remoteLines('late.iso', 1) },
+    }, async (_mock, client) => {
+      await assert.rejects(
+        () => client.msdWriteRemote('https://example.test/pics/late.iso', { timeout: connectSec })[Symbol.asyncIterator]().next(),
+        (err) => {
+          assert.ok(err instanceof KvmdError);
+          assert.equal(err.type, 'PIKVM_MSD_STATE_UNKNOWN');
+          assert.equal(err.message, headerMessage(headerMs));
+          assert.equal(err.endpoint, 'POST /api/msd/write_remote');
+          return true;
+        },
+      );
+    }, { msdJobTimeoutMs: 20000, msdIdleTimeoutMs: idleMs });
+    const elapsed = performance.now() - started;
+    assert.ok(elapsed >= headerMs / 2, `header window fired early: ${elapsed}ms`);
+    assert.ok(elapsed < 5000, `header window waited too long: ${elapsed}ms`);
+  });
+
+  msdTest('write_remote headers inside the window and a steady stream pass both windows', { timeout: 15000 }, async () => {
+    const connectSec = 0.2;
+    const idleMs = 250;
+    const headerMs = Math.round(connectSec * 1000) + idleMs;
+    const gapMs = 40;
+    const count = 20;
+    const started = performance.now();
+    await withMock({
+      remote: {
+        headerDelayMs: 50,
+        gapMs,
+        lines: remoteLines('drip.iso', count),
+      },
+    }, async (_mock, client) => {
+      const progress = [];
+      for await (const row of client.msdWriteRemote('https://example.test/pics/drip.iso', { timeout: connectSec })) {
+        progress.push(row.written);
+      }
+      assert.equal(progress.length, count);
+      assert.equal(progress[count - 1], count);
+    }, { msdJobTimeoutMs: 20000, msdIdleTimeoutMs: idleMs });
+    const elapsed = performance.now() - started;
+    assert.ok(gapMs < idleMs);
+    assert.ok(gapMs * count > headerMs);
+    assert.ok(gapMs * count > idleMs);
+    assert.ok(elapsed > idleMs, `stream finished inside the idle bound (${elapsed}ms)`);
+    assert.ok(elapsed > headerMs, `stream finished inside the header window (${elapsed}ms)`);
+  });
+
+  msdTest('a write_remote stream that stops mid-way trips the per-chunk idle bound', { timeout: 15000 }, async () => {
+    const idleMs = 300;
+    const started = performance.now();
+    await withMock({
+      remote: {
+        lines: remoteLines('stall.iso', 4),
+        stallAfterLines: 1,
+        stallMs: 8000,
+      },
+    }, async (_mock, client) => {
+      const progress = [];
+      await assert.rejects(
+        async () => {
+          for await (const row of client.msdWriteRemote('https://example.test/pics/stall.iso', { timeout: 1 })) {
+            progress.push(row.written);
+          }
+        },
+        (err) => {
+          assert.ok(err instanceof KvmdError);
+          assert.equal(err.type, 'PIKVM_MSD_STATE_UNKNOWN');
+          assert.equal(err.message, MSD_UNKNOWN);
+          assert.equal(err.endpoint, 'POST /api/msd/write_remote');
+          return true;
+        },
+      );
+      assert.deepEqual(progress, [1]);
+    }, { msdJobTimeoutMs: 20000, msdIdleTimeoutMs: idleMs });
+    const elapsed = performance.now() - started;
+    assert.ok(elapsed < 4000, `per-chunk idle waited for the job cap: ${elapsed}ms`);
+  });
+
+  msdTest('the job cap stops a write_remote trickle that keeps resetting idle', { timeout: 15000 }, async () => {
+    const jobMs = 400;
+    const idleMs = 3000;
+    const started = performance.now();
+    await withMock({
+      remote: {
+        gapMs: 40,
+        lines: remoteLines('trickle.iso', 40),
+      },
+    }, async (_mock, client) => {
+      await assert.rejects(
+        async () => {
+          for await (const _row of client.msdWriteRemote('https://example.test/pics/trickle.iso', { timeout: 1 })) {
+            // A short gap keeps the idle timer from firing.
+          }
+        },
+        (err) => {
+          assert.ok(err instanceof KvmdError);
+          assert.equal(err.type, 'PIKVM_MSD_STATE_UNKNOWN');
+          assert.equal(err.message, MSD_UNKNOWN);
+          assert.equal(err.endpoint, 'POST /api/msd/write_remote');
+          return true;
+        },
+      );
+    }, { msdJobTimeoutMs: jobMs, msdIdleTimeoutMs: idleMs });
+    const elapsed = performance.now() - started;
+    assert.ok(elapsed < 2500, `job cap waited for the idle bound: ${elapsed}ms`);
   });
 
   msdTest('undici headersTimeout waits for headers and does not cap a writing body', { timeout: 20000 }, async () => {
@@ -724,6 +875,14 @@ describe('MSD client', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
   });
 
   const MSD_UNKNOWN = 'image may be partial or complete; re-read /api/msd; do not resend';
+
+  function finaliseMessage(idleMs) {
+    return `timed out after ${idleMs}ms waiting for kvmd to finish the write (PIKVM_MSD_IDLE_TIMEOUT_MS); ${MSD_UNKNOWN}`;
+  }
+
+  function headerMessage(headerMs) {
+    return `timed out after ${headerMs}ms waiting for write_remote response headers (connect timeout + PIKVM_MSD_IDLE_TIMEOUT_MS); ${MSD_UNKNOWN}`;
+  }
 
   msdTest('99999999999 for both MSD deadlines is clamped and the upload still finishes', { timeout: 5000 }, async () => {
     await withMock({}, async (_mock, client) => {
