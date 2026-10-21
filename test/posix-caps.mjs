@@ -1,11 +1,13 @@
 // Modified 2026-10 by PLN: POSIX capability probes for fixtures (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a FIFO counts only when the path is a FIFO (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: the Windows FIFO skip reason (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: POSIX probes are asserted, not skipped (GPL-3.0; see NOTICE).
 
 /**
  * Cached probes for fixtures that need a symlink, a FIFO, or an exact
  * mode. Linux can do all three, so those assertions still run here.
- * A platform that cannot do one of them skips only that assertion.
+ * Windows skips a FIFO and an exact mode. On POSIX those probes are
+ * asserted, so a missing mkfifo or a mode that does not stick fails.
  */
 
 import { execFileSync } from 'node:child_process';

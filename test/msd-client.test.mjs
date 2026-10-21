@@ -5,6 +5,7 @@
 // Modified 2026-10 by PLN: bounded MSD test teardown and fetch (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: teardown still runs after a hung test body (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: test timers use a monotonic clock (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: teardown waits for the upload slot (GPL-3.0; see NOTICE).
 
 /**
  * Plain kvmd MSD client methods against the mock. No MCP tools.
@@ -29,6 +30,7 @@ import {
   msdTest,
   onTestTeardown,
   runBounded,
+  waitForMsdUploadSlots,
 } from './msd-bounds.mjs';
 
 function makeClient(mock, extra = {}) {
@@ -49,7 +51,10 @@ async function withMock(options, fn, clientExtra) {
   const client = makeClient(mock, clientExtra);
   await finishWith(
     () => fn(mock, client),
-    onTestTeardown(() => bounded('withMock close', mock.close())),
+    onTestTeardown(() => runBounded([
+      () => waitForMsdUploadSlots(),
+      () => bounded('withMock close', mock.close()),
+    ])),
   );
 }
 

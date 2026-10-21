@@ -20,6 +20,7 @@
 // Modified 2026-10 by PLN: removal confirm stays hidden across an extra catalog GET (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: catalog budgets use a monotonic clock (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a sub-ms catalog remainder does not start a GET (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: a POSIX FIFO must exist, and teardown waits for the slot (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a Windows FIFO image is skipped (GPL-3.0; see NOTICE).
 
 /**
@@ -59,6 +60,7 @@ import {
   msdTest,
   onTestTeardown,
   runBounded,
+  waitForMsdUploadSlots,
 } from './msd-bounds.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -169,6 +171,7 @@ async function withSession(mockOptions, flags, fn) {
       await fn({ mock, base, sessionId });
     },
     onTestTeardown(() => runBounded([
+      () => waitForMsdUploadSlots(),
       () => closed(httpServer, 'withSession http server close'),
       () => bounded('withSession mock close', mock.close()),
     ])),
@@ -1150,12 +1153,13 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
     });
 
     await msdSubtest(t, 'a FIFO image is not a regular file', {
-      skip: process.platform === 'win32'
-        ? WIN32_FIFO_SKIP
-        : (fifoAvailable() ? false : 'FIFO is not available on this platform'),
+      skip: process.platform === 'win32' ? WIN32_FIFO_SKIP : false,
     }, async () => {
+      assert.equal(fifoAvailable(), true, 'mkfifo is not available');
       await withDir(async (dir) => {
-        await execFileAsync('mkfifo', [join(dir, 'pipe.img')]);
+        const pipe = join(dir, 'pipe.img');
+        await execFileAsync('mkfifo', [pipe]);
+        assert.equal(fs.statSync(pipe).isFIFO(), true, 'mkfifo did not create a FIFO');
         await withSession({ images: [] }, uploadMsd(dir), async ({ mock, base, sessionId }) => {
           const result = await callTool(base, sessionId, 'pikvm_msd_upload', {
             file: 'pipe.img',

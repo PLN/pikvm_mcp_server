@@ -17,6 +17,7 @@
 // Modified 2026-10 by PLN: hash timeout releases the upload slot before close (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: catalog budgets use a monotonic clock (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a catalog read is not started with under 1 ms left (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: tests can see one catalog read and the upload slot (GPL-3.0; see NOTICE).
 
 /**
  * Policy for MSD status, mount, eject, upload, and remove.
@@ -546,6 +547,11 @@ function releaseUpload(device: string): void {
   uploadHeld.delete(device);
 }
 
+/** True when no device holds the upload slot. Tests wait for this. It does not acquire or release. */
+export function msdUploadSlotsFree(): boolean {
+  return uploadHeld.size === 0;
+}
+
 const UPLOAD_POLL_MS = 1500;
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const JOB_CAP = 64;
@@ -1006,7 +1012,7 @@ function elapsedNow(): number {
  * The request time counts against the deadline: a slow read is aborted
  * instead of being allowed to finish after the budget.
  */
-async function readMsdState(
+export async function readMsdState(
   client: PiKVMClient,
   deadlineAt: number,
   cancel?: AbortSignal,

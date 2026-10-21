@@ -6,6 +6,7 @@
 // Modified 2026-10 by PLN: credential skip boundaries and opened inode (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: decoy credential-root environment names (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: the Windows FIFO portion is skipped (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: POSIX fixtures fail closed, and Windows mode is quiet (GPL-3.0; see NOTICE).
 
 /**
  * resolveSecret order and file rules. Temp directories are removed.
@@ -14,7 +15,7 @@
 
 import assert from 'node:assert/strict';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
-import { chmodSync, mkdirSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -22,6 +23,8 @@ import { describe, test } from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { redactConfig, loadConfig } from '../dist/config.js';
 import { SECRET_MAX_BYTES, SYSTEMD_CREDENTIALS_ROOT, readSecretAtPath, resolveSecret } from '../dist/secrets.js';
+import { readPinnedCert, writeCertAtomic } from '../dist/tls.js';
+import { mintCert } from './tls-cert.mjs';
 import { PiKVMClient } from '../dist/pikvm/client.js';
 import { BusyLock } from '../dist/pikvm/lock.js';
 import { createMcpServer } from '../dist/server.js';
@@ -31,6 +34,15 @@ import { WIN32_FIFO_SKIP, exactModeAvailable, fifoAvailable, symlinkAvailable } 
 
 const REPO = join(fileURLToPath(import.meta.url), '..', '..');
 const SENTINEL = 'sentinel-9f3a2c7b-secret';
+
+function requireExactMode(t) {
+  if (process.platform === 'win32') {
+    t.skip('exact file modes are not available on this platform');
+    return false;
+  }
+  assert.equal(exactModeAvailable(), true);
+  return true;
+}
 
 function capture(fn) {
   const lines = [];
@@ -288,12 +300,12 @@ describe('resolveSecret', () => {
         );
       }
       await t.test('a FIFO is rejected', {
-        skip: process.platform === 'win32'
-          ? WIN32_FIFO_SKIP
-          : (fifoAvailable() ? false : 'FIFO is not available on this platform'),
+        skip: process.platform === 'win32' ? WIN32_FIFO_SKIP : false,
       }, () => {
+        assert.equal(fifoAvailable(), true, 'mkfifo is not available');
         const fifo = join(dir, 'fifo');
         execFileSync('mkfifo', [fifo]);
+        assert.equal(statSync(fifo).isFIFO(), true, 'mkfifo did not create a FIFO');
         assert.throws(
           () => resolveSecret({
             name: 'PIKVM_PASSWORD',
@@ -326,15 +338,13 @@ describe('resolveSecret', () => {
       t.skip(WIN32_FIFO_SKIP);
       return;
     }
-    if (!fifoAvailable()) {
-      t.skip('FIFO is not available on this platform');
-      return;
-    }
+    assert.equal(fifoAvailable(), true, 'mkfifo is not available');
     const dir = await tempDir();
     const fifo = join(dir, 'fifo');
     const script = join(dir, 'open-fifo.mjs');
     try {
       execFileSync('mkfifo', [fifo]);
+      assert.equal(statSync(fifo).isFIFO(), true, 'mkfifo did not create a FIFO');
       await writeFile(script, `
         import { resolveSecret } from ${JSON.stringify(pathToFileURL(join(REPO, 'dist/secrets.js')).href)};
         try {
@@ -367,10 +377,7 @@ describe('resolveSecret', () => {
   });
 
   test('mode 0644 warns and 0600 does not', async (t) => {
-    if (!exactModeAvailable()) {
-      t.skip('exact file modes are not available on this platform');
-      return;
-    }
+    if (!requireExactMode(t)) return;
     const dir = await tempDir();
     try {
       const loose = join(dir, 'loose');
@@ -404,6 +411,40 @@ describe('resolveSecret', () => {
     }
   });
 
+  test('windows default mode warns for neither a secret nor a certificate', async (t) => {
+    if (process.platform !== 'win32') {
+      t.skip('the Windows mode early-return is only on win32');
+      return;
+    }
+    const dir = await tempDir();
+    try {
+      const secret = join(dir, 'secret');
+      writeFileSync(secret, 'win-secret\n');
+      const warned = capture(() => resolveSecret({
+        name: 'PIKVM_PASSWORD',
+        credName: 'pikvm-password',
+        required: true,
+        env: { PIKVM_PASSWORD_FILE: secret },
+      }));
+      assert.equal(warned.value, 'win-secret');
+      assert.equal(warned.lines.some((line) => line.includes('mode')), false);
+
+      const pem = mintCert().cert;
+      const certFile = join(dir, 'leaf.pem');
+      writeFileSync(certFile, pem);
+      const read = capture(() => readPinnedCert(certFile));
+      assert.equal(read.value.pem.includes('BEGIN CERTIFICATE'), true);
+      assert.equal(read.lines.some((line) => line.includes('mode')), false);
+
+      const written = join(dir, 'written.pem');
+      const saved = capture(() => writeCertAtomic(written, pem));
+      assert.equal(saved.lines.some((line) => line.includes('mode')), false);
+      assert.equal(readPinnedCert(written).pem.includes('BEGIN CERTIFICATE'), true);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   function writeMode(file, text, mode) {
     try {
       unlinkSync(file);
@@ -431,10 +472,7 @@ describe('resolveSecret', () => {
   });
 
   test('mode 0440 under /run/credentials skips the group warning and still loads', async (t) => {
-    if (!exactModeAvailable()) {
-      t.skip('exact file modes are not available on this platform');
-      return;
-    }
+    if (!requireExactMode(t)) return;
     await withCredentialTree(async ({ credentialsRoot, credDir }) => {
       const file = join(credDir, 'pikvm-password');
       writeMode(file, 'from-cred\n', 0o440);
@@ -468,10 +506,7 @@ describe('resolveSecret', () => {
   });
 
   test('a symlink in the credentials directory still warns', async (t) => {
-    if (!exactModeAvailable()) {
-      t.skip('exact file modes are not available on this platform');
-      return;
-    }
+    if (!requireExactMode(t)) return;
     if (!symlinkAvailable()) {
       t.skip('symlinks are not available on this platform');
       return;
@@ -496,10 +531,7 @@ describe('resolveSecret', () => {
   });
 
   test('a symlink to a sibling in the credentials directory still warns', async (t) => {
-    if (!exactModeAvailable()) {
-      t.skip('exact file modes are not available on this platform');
-      return;
-    }
+    if (!requireExactMode(t)) return;
     if (!symlinkAvailable()) {
       t.skip('symlinks are not available on this platform');
       return;
@@ -524,10 +556,7 @@ describe('resolveSecret', () => {
   });
 
   test('a /run/credentialsX prefix does not skip the group warning', async (t) => {
-    if (!exactModeAvailable()) {
-      t.skip('exact file modes are not available on this platform');
-      return;
-    }
+    if (!requireExactMode(t)) return;
     await withCredentialTree(async ({ dir, credentialsRoot }) => {
       const lookalike = join(dir, 'run', 'credentialsX', 'pikvm-mcp.service');
       mkdirSync(lookalike, { recursive: true });
@@ -549,10 +578,7 @@ describe('resolveSecret', () => {
   });
 
   test('the credentials root ignores the environment', async (t) => {
-    if (!exactModeAvailable()) {
-      t.skip('exact file modes are not available on this platform');
-      return;
-    }
+    if (!requireExactMode(t)) return;
     await withCredentialTree(async ({ dir, credentialsRoot }) => {
       const decoyRoot = join(dir, 'arbitrary');
       const arbitrary = join(decoyRoot, 'pikvm-mcp.service');
@@ -604,10 +630,7 @@ describe('resolveSecret', () => {
   });
 
   test('an opened credential inode that is no longer the path still warns', async (t) => {
-    if (!exactModeAvailable()) {
-      t.skip('exact file modes are not available on this platform');
-      return;
-    }
+    if (!requireExactMode(t)) return;
     await withCredentialTree(async ({ dir, credentialsRoot, credDir }) => {
       const secret = join(credDir, 'pikvm-password');
       const decoy = join(dir, 'decoy');
@@ -639,10 +662,7 @@ describe('resolveSecret', () => {
   });
 
   test('mode 0440 outside the credentials directory still warns', async (t) => {
-    if (!exactModeAvailable()) {
-      t.skip('exact file modes are not available on this platform');
-      return;
-    }
+    if (!requireExactMode(t)) return;
     await withCredentialTree(async ({ dir, credentialsRoot, credDir }) => {
       const outside = join(dir, 'outside');
       writeMode(outside, 'outside-secret\n', 0o440);
@@ -687,10 +707,7 @@ describe('resolveSecret', () => {
   });
 
   test('a credentials directory outside /run/credentials still warns', async (t) => {
-    if (!exactModeAvailable()) {
-      t.skip('exact file modes are not available on this platform');
-      return;
-    }
+    if (!requireExactMode(t)) return;
     await withCredentialTree(async ({ dir, credentialsRoot }) => {
       const elsewhere = join(dir, 'elsewhere');
       mkdirSync(elsewhere);
@@ -711,10 +728,7 @@ describe('resolveSecret', () => {
   });
 
   test('other bits under /run/credentials still warn', async (t) => {
-    if (!exactModeAvailable()) {
-      t.skip('exact file modes are not available on this platform');
-      return;
-    }
+    if (!requireExactMode(t)) return;
     await withCredentialTree(async ({ credentialsRoot, credDir }) => {
       for (const mode of [0o444, 0o441]) {
         const file = join(credDir, 'pikvm-password');

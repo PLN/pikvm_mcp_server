@@ -3,6 +3,7 @@
 # Modified 2026-10 by PLN: npm 12 allowScripts install job (GPL-3.0; see NOTICE).
 # Modified 2026-10 by PLN: sharp loads after the strict install (GPL-3.0; see NOTICE).
 # Modified 2026-10 by PLN: test job covers Node 24 and Windows (GPL-3.0; see NOTICE).
+# Modified 2026-10 by PLN: Node 24.22.0 and windows-2025 are pinned (GPL-3.0; see NOTICE).
 # Test-job idea adapted from dvaerum/pikvm_mcp_server
 # .github/workflows/ci.yml @ 00cbfc0207c1be2b28b25679019e7fe9bd9d9654
 # (GPL-3.0, test job only).
@@ -27,8 +28,8 @@ jobs:
           - os: ubuntu-24.04
             node: 22.14.0
           - os: ubuntu-24.04
-            node: 24.x
-          - os: windows-latest
+            node: 24.22.0
+          - os: windows-2025
             node: 22.14.0
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10

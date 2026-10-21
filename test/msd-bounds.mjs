@@ -1,6 +1,7 @@
 // Modified 2026-10 by PLN: bounded MSD test teardown and fetch (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: caller locations, body timeouts, and teardown after a hang (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: stack frames keep a Windows drive letter (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: stack paths, node internals, and the upload slot (GPL-3.0; see NOTICE).
 
 /**
  * Ceilings for the MSD tests. Each subtest is finite and shorter than
@@ -18,6 +19,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import test from 'node:test';
 import vm from 'node:vm';
 import { fileURLToPath } from 'node:url';
+import { msdUploadSlotsFree } from '../dist/msd.js';
 
 export const MSD_SUBTEST_TIMEOUT_MS = 30_000;
 export const MSD_UPLOAD_SUITE_TIMEOUT_MS = 120_000;
@@ -208,27 +210,83 @@ function withTimeout(options) {
   return { ...options, timeout };
 }
 
-// A drive letter is `C:\` or `/C:/` after `file://`. `[^():]+` alone stops
-// at that colon and the helper frame is chosen instead of the caller.
-const STACK_FRAME = /\(?((?:file:\/\/)?(?:[A-Za-z]:[\\/]|\/[A-Za-z]:\/)?[^():]+):(\d+):(\d+)\)?$/;
-
-/** File, line, and column from one stack frame. Undefined when it has none. */
-export function stackFrameSite(frame) {
-  const match = String(frame).match(STACK_FRAME);
-  if (!match) return undefined;
-  let file = match[1];
-  if (file.startsWith('file://')) file = fileURLToPath(file);
-  return { file, line: Number(match[2]), column: Number(match[3]) };
+/**
+ * A UNC file URL is `file://server/share/...`. fileURLToPath rejects a
+ * host on Linux, so the share is built here. A drive URL still uses
+ * fileURLToPath, which keeps `C:` in the path.
+ */
+function pathFromFileUrl(spec) {
+  const url = new URL(spec);
+  const host = url.hostname;
+  if (host && host !== 'localhost') {
+    const parts = url.pathname.split('/').filter((part) => part.length > 0).map((part) => decodeURIComponent(part));
+    return `\\\\${decodeURIComponent(host)}\\${parts.join('\\')}`;
+  }
+  return fileURLToPath(url);
 }
 
-function callerSite() {
-  const frames = new Error().stack.split('\n').slice(1);
-  for (const frame of frames) {
+/**
+ * File, line, and column from one stack frame. Undefined when it has none.
+ * The location is the last `:line:col`. A function name sits before ` (`.
+ * A path may contain `:` or parentheses. A bare frame is `at /path:1:2`,
+ * and that prefix is not part of the path.
+ */
+export function stackFrameSite(frame) {
+  let text = String(frame).trim();
+  if (text.startsWith('at ')) text = text.slice(3);
+  else return undefined;
+  if (text.startsWith('async ')) text = text.slice(6);
+  const loc = text.match(/:(\d+):(\d+)\)?$/);
+  if (!loc || loc.index === undefined) return undefined;
+  let file = text.slice(0, loc.index);
+  if (text.endsWith(')') && file.includes(' (')) {
+    file = file.slice(file.indexOf(' (') + 2);
+  }
+  if (file.length === 0) return undefined;
+  if (file.startsWith('file://')) {
+    try {
+      file = pathFromFileUrl(file);
+    } catch {
+      return undefined;
+    }
+  }
+  return { file, line: Number(loc[1]), column: Number(loc[2]) };
+}
+
+/** First frame that is not this file and not a node: internal. */
+export function callerFromStack(stack) {
+  for (const frame of String(stack).split('\n')) {
     const site = stackFrameSite(frame);
     if (!site || site.file === here) continue;
+    if (site.file.startsWith('node:')) continue;
     return site;
   }
   return undefined;
+}
+
+function callerSite() {
+  return callerFromStack(new Error().stack || '');
+}
+
+/**
+ * Poll until no upload slot is held, or reject at the teardown bound.
+ * A stalled subtest then fails here instead of leaving the slot for the next one.
+ */
+export function waitForMsdUploadSlots(ms = MSD_TEARDOWN_TIMEOUT_MS) {
+  if (msdUploadSlotsFree()) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const started = performance.now();
+    const timer = setInterval(() => {
+      if (msdUploadSlotsFree()) {
+        clearInterval(timer);
+        resolve();
+      } else if (performance.now() - started >= ms) {
+        clearInterval(timer);
+        reject(new Error(`upload slot timed out after ${ms}ms`));
+      }
+    }, 10);
+    timer.unref?.();
+  });
 }
 
 function runRegistered(source, fields) {
@@ -247,7 +305,22 @@ export function msdTest(name, options, fn) {
     fn = options;
     options = undefined;
   }
-  const wrapped = (t) => currentTest.run(t, () => fn(t));
+  const wrapped = (t) => currentTest.run(t, () => {
+    const crashes = [];
+    const onException = (err) => { crashes.push(err); };
+    const onRejection = (reason) => { crashes.push(reason); };
+    // The monitor does not replace the process crash. The rejection
+    // listener lets the test fail on one instead of a later subtest.
+    process.on('uncaughtExceptionMonitor', onException);
+    process.on('unhandledRejection', onRejection);
+    t.after(() => {
+      process.off('uncaughtExceptionMonitor', onException);
+      process.off('unhandledRejection', onRejection);
+      if (crashes.length === 0) return;
+      throw new Error(crashes.map(errorText).join('\n\n'));
+    });
+    return fn(t);
+  });
   return runRegistered('test(name, options, fn)', {
     name,
     options: withTimeout(options),

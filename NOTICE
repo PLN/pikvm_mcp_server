@@ -1,3 +1,4 @@
+Modified 2026-10 by PLN: test guards, the upload-slot wait, and pinned CI images (GPL-3.0; see below).
 Modified 2026-10 by PLN: added this NOTICE (GPL-3.0; see below).
 Modified 2026-10 by PLN: MSD tools, ARM_MSD, and source-error flag (GPL-3.0; see below).
 Modified 2026-10 by PLN: mount expectImage, preflight, and MSD mutex (GPL-3.0; see below).
@@ -959,6 +960,22 @@ No code from another pikvm_mcp_server fork was added for these methods.
   name as not in the upload directory. A missing image name is still
   that error, before any kvmd call. A missing secret or certificate
   path is still cannot read (ENOENT). A directory is still not a
-  regular file. The FIFO portions of those tests skip on Windows, with
+  regular file.   The FIFO portions of those tests skip on Windows, with
   that mkfifo reason. Directory and symlink checks still run.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  POSIX tests assert that mkfifo exists and that the path is a FIFO.
+  Only Windows skips that fixture. Exact file modes are asserted on
+  POSIX and still skipped on Windows. A Windows test reads a secret
+  and a certificate at the default mode and expects no mode warning.
+  A catalog read with 0.5 ms left returns deadline and does not call
+  getMsdState. Stack frames keep a bare path, a colon, parentheses,
+  and a UNC share, and a node: frame is not the caller. MSD teardown
+  waits up to the 10 s close bound for the upload slot, then fails
+  that subtest if it is still held, and the test fails if an
+  uncaughtException or unhandledRejection was emitted. The two
+  exports that make the read and the slot visible do not acquire,
+  release, or change a catalog read. CI pins Node 24.22.0 and
+  windows-2025. The allow-scripts job is unchanged.
   No code from another pikvm_mcp_server fork was copied.

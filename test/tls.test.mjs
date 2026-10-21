@@ -5,6 +5,7 @@
 // Modified 2026-10 by PLN: a leading-zero serial stays a minimal INTEGER (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: file-URL import, and POSIX fixture skips (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: the Windows FIFO certificate is skipped (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: a POSIX FIFO must exist, and the mode is asserted (GPL-3.0; see NOTICE).
 
 /**
  * Self-signed server minted in this process. No committed key.
@@ -431,12 +432,12 @@ describe('TLS config', () => {
       }
 
       await t.test('a FIFO certificate is rejected', {
-        skip: process.platform === 'win32'
-          ? WIN32_FIFO_SKIP
-          : (fifoAvailable() ? false : 'FIFO is not available on this platform'),
+        skip: process.platform === 'win32' ? WIN32_FIFO_SKIP : false,
       }, () => {
+        assert.equal(fifoAvailable(), true, 'mkfifo is not available');
         const fifo = join(dir, 'fifo');
         execFileSync('mkfifo', [fifo]);
+        assert.equal(statSync(fifo).isFIFO(), true, 'mkfifo did not create a FIFO');
         const started = Date.now();
         assert.throws(() => readPinnedCert(fifo), /not a regular file/);
         assert.ok(Date.now() - started < 1000);
@@ -581,7 +582,10 @@ describe('pin CLI', { concurrency: false }, () => {
       const written = readPinnedCert(dest);
       assert.equal(written.spkiSha256, right.spkiSha256);
       assert.equal(new crypto.X509Certificate(written.pem).raw.equals(right.raw), true);
-      if (exactModeAvailable()) {
+      if (process.platform === 'win32') {
+        // chmod does not report the requested mode. The win32 test covers the early return.
+      } else {
+        assert.equal(exactModeAvailable(), true);
         assert.equal(statSync(dest).mode & 0o777, 0o644);
       }
       assert.equal(readdirSync(dir).some((name) => name.includes('.tmp')), false);
