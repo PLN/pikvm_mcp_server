@@ -14,6 +14,7 @@
 // Modified 2026-10 by PLN: the upload slot is free before a job looks finished (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: eject expectImage is typed, and catalog cleanup keeps the MSD lock (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: hash reads stop at the MSD job ceiling (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: hash timeout releases the upload slot before close (GPL-3.0; see NOTICE).
 
 /**
  * Policy for MSD status, mount, eject, upload, and remove.
@@ -181,7 +182,9 @@ export class MsdSizeMismatchError extends Error {
 
 /**
  * Hashing did not finish before PIKVM_MSD_JOB_TIMEOUT_MS.
- * The upload POST is not sent. The file is closed and the slot is free.
+ * The upload POST is not sent. The slot is released without waiting
+ * for the file to close. The descriptor is closed once no hash read
+ * is in flight.
  */
 export class MsdHashTimeoutError extends Error {
   readonly type = 'PIKVM_MSD_HASH_TIMEOUT';
@@ -716,7 +719,9 @@ const HASH_CHUNK = 64 * 1024;
 /**
  * Wall clock for hashing only. Cleared when hashing returns.
  * Same length as the upload POST ceiling, and it does not start that ceiling.
- * setTimeout, not AbortSignal.timeout: a delay of 2^31 or more fires after 1 ms.
+ * setTimeout overflows the same way AbortSignal.timeout does: a delay of
+ * 2^31 ms or more fires after 1 ms. The timer is safe only because the
+ * job ceiling is clamped to 7 days, which is under that limit.
  */
 function startHashDeadline(ms: number): { signal: AbortSignal; done: () => void } {
   const ctrl = new AbortController();
@@ -731,12 +736,19 @@ function startHashDeadline(ms: number): { signal: AbortSignal; done: () => void 
   };
 }
 
+/** One in-flight hash read, and the close the timeout deferred onto it. */
+interface HashRead {
+  pending: boolean;
+  closeAfter: (() => void) | undefined;
+}
+
 /**
  * One positioned read. fs.read, not FileHandle.read: the handle read
  * holds a ref, and FileHandle.close then waits for that read. A hung
  * filesystem would keep the upload slot until the read returned.
  * Lookup is on the fs object so a test can replace fs.read.
  * After abort the late callback is ignored, so it cannot reject twice.
+ * If the hash timeout deferred the close, that same callback closes the fd.
  */
 function readSlice(
   fh: FileHandle,
@@ -745,6 +757,7 @@ function readSlice(
   position: number,
   signal: AbortSignal,
   timeoutMs: number,
+  hashRead: HashRead,
 ): Promise<number> {
   return new Promise((resolve, reject) => {
     if (signal.aborted) {
@@ -762,13 +775,36 @@ function readSlice(
       finish(() => reject(new MsdHashTimeoutError(timeoutMs)));
     };
     signal.addEventListener('abort', onAbort, { once: true });
-    fs.read(fh.fd, buf, 0, length, position, (err, bytesRead) => {
-      finish(() => {
-        if (err) reject(err);
-        else resolve(bytesRead);
+    hashRead.pending = true;
+    try {
+      fs.read(fh.fd, buf, 0, length, position, (err, bytesRead) => {
+        const closeAfter = hashRead.closeAfter;
+        hashRead.pending = false;
+        hashRead.closeAfter = undefined;
+        finish(() => {
+          if (err) reject(err);
+          else resolve(bytesRead);
+        });
+        if (closeAfter) closeAfter();
       });
-    });
+    } catch (err) {
+      hashRead.pending = false;
+      finish(() => reject(err));
+    }
   });
+}
+
+/**
+ * Hash-timeout close. A read still in flight closes from its own callback,
+ * so close does not run beside that read. Otherwise close starts now.
+ * The caller has already released the upload slot and does not wait.
+ */
+function closeWhenHashReadIdle(hashRead: HashRead, closeNow: () => void): void {
+  if (hashRead.pending) {
+    hashRead.closeAfter = closeNow;
+    return;
+  }
+  closeNow();
 }
 
 async function hashFd(
@@ -776,6 +812,7 @@ async function hashFd(
   size: number,
   signal: AbortSignal,
   timeoutMs: number,
+  hashRead: HashRead,
 ): Promise<string> {
   const hash = createHash('sha256');
   const buf = Buffer.alloc(HASH_CHUNK);
@@ -789,6 +826,7 @@ async function hashFd(
       offset,
       signal,
       timeoutMs,
+      hashRead,
     );
     if (signal.aborted) throw new MsdHashTimeoutError(timeoutMs);
     if (bytesRead === 0) break;
@@ -1184,13 +1222,15 @@ async function runUpload(
   let slotFree = false;
   let published = false;
   let cleaned = false;
+  const hashRead: HashRead = { pending: false, closeAfter: undefined };
+  let hashCloseStarted = false;
   try {
     if (request.beforeHash) await request.beforeHash();
     const hashBudgetMs = msdJobTimeoutOf(client);
     const hashDeadline = startHashDeadline(hashBudgetMs);
     let prehash: string;
     try {
-      prehash = await hashFd(fh, size, hashDeadline.signal, hashBudgetMs);
+      prehash = await hashFd(fh, size, hashDeadline.signal, hashBudgetMs, hashRead);
     } finally {
       hashDeadline.done();
     }
@@ -1299,8 +1339,40 @@ async function runUpload(
     });
   }
 
+  function logHashCloseFailure(err: unknown): void {
+    const raw = err instanceof Error && err.message ? err.message : 'close failed';
+    logMsd('msd_upload', device, file, false, redactUrl(raw), { close: true });
+  }
+
+  function beginHashClose(): void {
+    if (hashCloseStarted) return;
+    hashCloseStarted = true;
+    let closing: Promise<void>;
+    try {
+      closing = Promise.resolve(closeUpload(stream, fh, request.closeFile));
+    } catch (err) {
+      logHashCloseFailure(err);
+      return;
+    }
+    void closing.then(undefined, (err: unknown) => {
+      logHashCloseFailure(err);
+    });
+  }
+
   async function releaseSlot(): Promise<void> {
     if (slotFree) return;
+    if (failure instanceof MsdHashTimeoutError) {
+      // Close needs a threadpool thread, and the syscall itself can block.
+      // Waiting here would keep the slot on a hung filesystem, or while
+      // hung reads already fill the pool. The slot is free first. A read
+      // still in flight closes the fd from that read's callback; otherwise
+      // close starts now and is still not awaited. beforeSlotRelease runs
+      // only after a close that held the slot, so it does not run here.
+      releaseUpload(device);
+      slotFree = true;
+      closeWhenHashReadIdle(hashRead, beginHashClose);
+      return;
+    }
     try {
       await closeUpload(stream, fh, request.closeFile);
       if (request.beforeSlotRelease) await request.beforeSlotRelease();
@@ -1330,6 +1402,9 @@ async function runUpload(
  * run in the job (state hashing, then running, then awaiting_catalog).
  * Hashing stops at PIKVM_MSD_JOB_TIMEOUT_MS. That timer is not the
  * upload POST ceiling: the POST starts its own when hashing has finished.
+ * On that hash timeout the upload slot is released without waiting for
+ * the file close. The descriptor is closed from the in-flight read's
+ * callback, or immediately when no read is in flight.
  * A sha256 mismatch fails the job and does not POST. A second upload
  * while one is running throws before it opens a file.
  */

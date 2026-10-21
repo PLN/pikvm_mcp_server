@@ -47,6 +47,7 @@ Modified 2026-10 by PLN: the slot-free upload test releases the second job (GPL-
 Modified 2026-10 by PLN: bounded MSD test teardown and fetch (GPL-3.0; see below).
 Modified 2026-10 by PLN: hash reads stop at the MSD job ceiling (GPL-3.0; see below).
 Modified 2026-10 by PLN: caller locations, labeled body timeouts, and teardown after a hung test (GPL-3.0; see below).
+Modified 2026-10 by PLN: hash timeout releases the upload slot before close (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -847,7 +848,7 @@ No code from another pikvm_mcp_server fork was added for these methods.
   fails on its own, so the rest of the file still runs. Server close,
   session close, and fixture removal reject when they exceed 10 seconds,
   and the error names the operation. The timer is cleared when the work
-  finishes. Test fetches abort through AbortSignal.timeout.   The hardware
+  finishes. Test fetches abort through AbortSignal.timeout. The hardware
   MSD cycle is not given the 30 second ceiling: its job budget is already
   120 seconds, and an optional URL fetch can run longer. Its tool calls
   abort after 60 seconds, and its session close and fixture removal use
@@ -883,4 +884,16 @@ No code from another pikvm_mcp_server fork was added for these methods.
   at that line. AbortSignal.timeout stays armed after fetch returns.
   A stall in the response body is reported with the operation name
   instead of a raw TimeoutError.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  On PIKVM_MSD_HASH_TIMEOUT the upload slot is released without waiting
+  for the file close. The descriptor is not closed while a hash read is
+  in flight. That read's callback closes it, once, whether the read
+  succeeds or fails. When no read is in flight, close starts immediately
+  and the slot still does not wait. A close error on this path is logged
+  with the msd_upload event, close true, and the close message. It does
+  not replace the job error and it is not an unhandled rejection. The
+  non-timeout close path is unchanged. There is no per-read idle bound
+  and no new environment variable.
   No code from another pikvm_mcp_server fork was copied.
