@@ -952,3 +952,13 @@ No code from another pikvm_mcp_server fork was added for these methods.
   Windows, mkfifo can exit 0 and leave no file Node can open, so those
   assertions are skipped there.
   No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  The Windows upload failure was the FIFO image case. mkfifo exited 0
+  and left no file, lstat failed, and the upload reported that missing
+  name as not in the upload directory. A missing image name is still
+  that error, before any kvmd call. A missing secret or certificate
+  path is still cannot read (ENOENT). A directory is still not a
+  regular file. The FIFO portions of those tests skip on Windows, with
+  that mkfifo reason. Directory and symlink checks still run.
+  No code from another pikvm_mcp_server fork was copied.

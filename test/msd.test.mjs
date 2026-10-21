@@ -20,6 +20,7 @@
 // Modified 2026-10 by PLN: removal confirm stays hidden across an extra catalog GET (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: catalog budgets use a monotonic clock (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a sub-ms catalog remainder does not start a GET (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: a Windows FIFO image is skipped (GPL-3.0; see NOTICE).
 
 /**
  * MSD tools against the mock. The HTTP harness matches test/http.test.mjs.
@@ -46,7 +47,7 @@ import { createMcpServer, ARM_GATED_TOOLS, MSD_READ_ONLY_TOOLS, msdToolRequiresA
 import { parseUrlAllowlist } from '../dist/url-policy.js';
 import { startHttpServer } from '../dist/http.js';
 import { startKvmdMock } from './kvmd-mock.mjs';
-import { fifoAvailable, symlinkAvailable } from './posix-caps.mjs';
+import { WIN32_FIFO_SKIP, fifoAvailable, symlinkAvailable } from './posix-caps.mjs';
 import {
   MSD_FILE_TIMEOUT_MS,
   MSD_UPLOAD_SUITE_TIMEOUT_MS,
@@ -1128,14 +1129,11 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
           ['directory', { file: 'dir.img', confirmImage: 'dir.img' }, /directory/],
           ['oversize', { file: 'big.img', confirmImage: 'big.img' }, /PIKVM_MSD_MAX_BYTES/],
           ['sha256 format', { file: 'real.img', confirmImage: 'real.img', sha256: 'nope' }, /64 hex/],
+          ['missing', { file: 'gone.img', confirmImage: 'gone.img' }, /not in the upload directory/],
         ];
         if (symlinkAvailable()) {
           await symlink(join(dir, 'real.img'), join(dir, 'link.img'));
           cases.push(['symlink', { file: 'link.img', confirmImage: 'link.img' }, /symlink/]);
-        }
-        if (fifoAvailable()) {
-          await execFileAsync('mkfifo', [join(dir, 'pipe.img')]);
-          cases.push(['fifo', { file: 'pipe.img', confirmImage: 'pipe.img' }, /not a regular file/]);
         }
         for (const [label, args, pattern] of cases) {
           const flags = label === 'oversize'
@@ -1148,6 +1146,25 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
             assert.deepEqual(mock.calls, [], label);
           });
         }
+      });
+    });
+
+    await msdSubtest(t, 'a FIFO image is not a regular file', {
+      skip: process.platform === 'win32'
+        ? WIN32_FIFO_SKIP
+        : (fifoAvailable() ? false : 'FIFO is not available on this platform'),
+    }, async () => {
+      await withDir(async (dir) => {
+        await execFileAsync('mkfifo', [join(dir, 'pipe.img')]);
+        await withSession({ images: [] }, uploadMsd(dir), async ({ mock, base, sessionId }) => {
+          const result = await callTool(base, sessionId, 'pikvm_msd_upload', {
+            file: 'pipe.img',
+            confirmImage: 'pipe.img',
+          });
+          assert.equal(result.isError, true);
+          assert.match(result.content[0].text, /not a regular file/);
+          assert.deepEqual(mock.calls, []);
+        });
       });
     });
 

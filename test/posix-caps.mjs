@@ -1,5 +1,6 @@
 // Modified 2026-10 by PLN: POSIX capability probes for fixtures (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a FIFO counts only when the path is a FIFO (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: the Windows FIFO skip reason (GPL-3.0; see NOTICE).
 
 /**
  * Cached probes for fixtures that need a symlink, a FIFO, or an exact
@@ -23,6 +24,13 @@ import { join } from 'node:path';
 let symlink;
 let fifo;
 let exactMode;
+
+/**
+ * Git for Windows ships mkfifo. It can exit 0 and leave no file, so a
+ * later open or lstat is ENOENT. That is not a FIFO fixture.
+ */
+export const WIN32_FIFO_SKIP =
+  'Git for Windows mkfifo exits 0 and leaves no file Node can open';
 
 function probe(name, fn) {
   const dir = mkdtempSync(join(tmpdir(), `pikvm-${name}-`));
