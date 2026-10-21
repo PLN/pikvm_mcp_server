@@ -49,6 +49,7 @@ Modified 2026-10 by PLN: hash reads stop at the MSD job ceiling (GPL-3.0; see be
 Modified 2026-10 by PLN: caller locations, labeled body timeouts, and teardown after a hung test (GPL-3.0; see below).
 Modified 2026-10 by PLN: hash timeout releases the upload slot before close (GPL-3.0; see below).
 Modified 2026-10 by PLN: catalog budgets use a monotonic clock (GPL-3.0; see below).
+Modified 2026-10 by PLN: removal confirm stays hidden across an extra catalog GET (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -907,4 +908,14 @@ No code from another pikvm_mcp_server fork was added for these methods.
   the same monotonic clock, so a realtime step cannot abandon a poll
   while the upload slot is still held. There is no new environment
   variable.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  The MSD mock can omit a freshly written image until a monotonic
+  interval has passed since the first GET /api/msd that sees it fresh.
+  The removal-confirm test uses that interval instead of a poll count.
+  A fractional catalog budget can start one more GET than an integer
+  clock, because setTimeout truncates the remaining delay and can fire
+  about 1 ms early. Three hidden polls do not cover that GET, so the
+  job was reported done. The catalog and confirm deadlines are unchanged.
   No code from another pikvm_mcp_server fork was copied.
