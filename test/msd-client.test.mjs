@@ -4,6 +4,7 @@
 // Modified 2026-10 by PLN: a kvmd 302 is an unexpected redirect (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: bounded MSD test teardown and fetch (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: teardown still runs after a hung test body (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: test timers use a monotonic clock (GPL-3.0; see NOTICE).
 
 /**
  * Plain kvmd MSD client methods against the mock. No MCP tools.
@@ -65,9 +66,9 @@ function count(mock, method, path) {
 }
 
 async function waitFor(fn, ms = 1000) {
-  const start = Date.now();
+  const start = performance.now();
   while (!fn()) {
-    if (Date.now() - start > ms) return;
+    if (performance.now() - start > ms) return;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
 }
@@ -536,7 +537,7 @@ describe('MSD client', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
   });
 
   msdTest('the job ceiling aborts a write that never returns headers', { timeout: 15000 }, async () => {
-    const started = Date.now();
+    const started = performance.now();
     await withMock({ writeHoldMs: 8000 }, async (mock, client) => {
       await assert.rejects(
         () => client.msdWrite('held.img', bodyOf('abcd'), 4),
@@ -551,12 +552,12 @@ describe('MSD client', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
       await waitFor(() => mock.state.images['held.img']);
       assert.equal(mock.state.images['held.img'].complete, true);
     }, { msdJobTimeoutMs: 500, msdIdleTimeoutMs: 20000 });
-    const elapsed = Date.now() - started;
+    const elapsed = performance.now() - started;
     assert.ok(elapsed < 4000, `job ceiling waited too long: ${elapsed}ms`);
   });
 
   msdTest('the idle gap aborts a stalled upload and allows a slow progress stream', { timeout: 15000 }, async () => {
-    const started = Date.now();
+    const started = performance.now();
     await withMock({}, async (_mock, client) => {
       let pushed = false;
       const stalled = new Readable({
@@ -577,7 +578,7 @@ describe('MSD client', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
         },
       );
     }, { msdJobTimeoutMs: 20000, msdIdleTimeoutMs: 400 });
-    assert.ok(Date.now() - started < 3000, 'idle gap waited for the job ceiling');
+    assert.ok(performance.now() - started < 3000, 'idle gap waited for the job ceiling');
 
     const lines = [0, 1, 2, 3, 4, 5, 6, 7].map((n) => (
       JSON.stringify({ ok: true, result: { image: { name: 'drip.iso', size: 8, written: n + 1 } } })
@@ -601,7 +602,7 @@ describe('MSD client', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
       res.end('ok');
     });
     try {
-      const started = Date.now();
+      const started = performance.now();
       await assert.rejects(
         () => msdRequest(`${late.origin}/late`, {
           method: 'POST',
@@ -614,7 +615,7 @@ describe('MSD client', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
         }),
         (err) => {
           assert.equal(err.code, 'UND_ERR_HEADERS_TIMEOUT');
-          assert.ok(Date.now() - started < 5000);
+          assert.ok(performance.now() - started < 5000);
           return true;
         },
       );
@@ -669,7 +670,7 @@ describe('MSD client', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
       res.end('{"ok":true}\n');
     });
     try {
-      const started = Date.now();
+      const started = performance.now();
       await assert.rejects(
         async () => {
           const res = await msdRequest(`${stall.origin}/stall`, {
@@ -682,7 +683,7 @@ describe('MSD client', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
         },
         (err) => {
           assert.equal(err.code, 'UND_ERR_BODY_TIMEOUT');
-          assert.ok(Date.now() - started < 5000);
+          assert.ok(performance.now() - started < 5000);
           return true;
         },
       );

@@ -48,6 +48,7 @@ Modified 2026-10 by PLN: bounded MSD test teardown and fetch (GPL-3.0; see below
 Modified 2026-10 by PLN: hash reads stop at the MSD job ceiling (GPL-3.0; see below).
 Modified 2026-10 by PLN: caller locations, labeled body timeouts, and teardown after a hung test (GPL-3.0; see below).
 Modified 2026-10 by PLN: hash timeout releases the upload slot before close (GPL-3.0; see below).
+Modified 2026-10 by PLN: catalog budgets use a monotonic clock (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -896,4 +897,14 @@ No code from another pikvm_mcp_server fork was added for these methods.
   not replace the job error and it is not an unhandled rejection. The
   non-timeout close path is unchanged. There is no per-read idle bound
   and no new environment variable.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  Catalog readiness and removal confirmation measure elapsed time with
+  a monotonic clock. A forward step of the realtime clock no longer
+  ends those budgets early, and a backward step no longer extends
+  them. Job finishedAt is still Date.now(). The MSD test waits use
+  the same monotonic clock, so a realtime step cannot abandon a poll
+  while the upload slot is still held. There is no new environment
+  variable.
   No code from another pikvm_mcp_server fork was copied.
