@@ -19,6 +19,7 @@
 // Modified 2026-10 by PLN: hash timeout releases the upload slot before close (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: removal confirm stays hidden across an extra catalog GET (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: catalog budgets use a monotonic clock (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: a sub-ms catalog remainder does not start a GET (GPL-3.0; see NOTICE).
 
 /**
  * MSD tools against the mock. The HTTP harness matches test/http.test.mjs.
@@ -2622,8 +2623,8 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
             assert.equal(failed.removed, true, failed.removeError?.message);
             assert.equal(transferPosts(mock, kind).length, 1, kind);
             assert.ok(
-              elapsed > budget + MSD_UNSEEN_CONFIRM_MS,
-              `${kind} confirmed on the short budget (${elapsed} ms)`,
+              elapsed > 2 * budget - 250,
+              `${kind} did not spend the readiness budget and the confirm budget (${elapsed} ms)`,
             );
             assert.ok(elapsed < budget * 2 + 1500, `${kind} ran past the confirm budget (${elapsed} ms)`);
             const again = await startTransfer(kind, base, sessionId);
@@ -2743,14 +2744,10 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
 
     await msdSubtest(t, 'an image absent at remove time, then visible, is confirmed gone', async (inner) => {
       watchCrashes(inner);
-      // The catalog budget is fractional monotonic time. setTimeout
-      // truncates a fractional remain and can fire about 1 ms early, so
-      // this 300 ms budget sometimes starts a fourth GET. Hiding three
-      // polls lets that GET see the image, and the job ends done. Hide
-      // until 350 ms after the first fresh catalog read: that extra GET
-      // is still absent, and removal confirm, which starts after the
-      // budget, sees the image.
-      await withUpload({ images: [], catalogHideMs: 350 }, 300, async ({ mock, base, sessionId }) => {
+      // Three hidden polls cover this 300 ms budget. A remainder under
+      // 1 ms does not start another GET, so the image stays absent until
+      // removal confirm.
+      await withUpload({ images: [], catalogHidePolls: 3 }, 300, async ({ mock, base, sessionId }) => {
         const started = await startTransfer('upload', base, sessionId);
         const { jobId } = JSON.parse(started.content[0].text);
         const failed = await pollJob(base, sessionId, jobId, 8000);
@@ -2761,6 +2758,37 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
         assert.equal(mock.state.images['disk.img'], undefined);
         assert.equal(transferPosts(mock, 'upload').length, 1);
         assert.ok(mock.calls.some((call) => call.path === '/api/msd/remove'));
+      });
+    });
+
+    await msdSubtest(t, 'an image hidden through readiness, then present during confirm, uses the full confirm budget', async (inner) => {
+      watchCrashes(inner);
+      const budget = 2000;
+      // The row stays hidden until after the readiness budget, so cleanup
+      // starts on the 750 ms unseen cap. It is then visible, and comes
+      // back after each remove, for longer than that cap. Two
+      // reappearances are still present at 750 ms and are exhausted
+      // before the full confirm budget ends.
+      await withUpload({
+        images: [],
+        catalogHideMs: budget + 80,
+        catalogReappearPolls: 2,
+      }, budget, async ({ mock, base, sessionId }) => {
+        const started = await startTransfer('upload', base, sessionId);
+        const { jobId } = JSON.parse(started.content[0].text);
+        const began = performance.now();
+        const failed = await pollJob(base, sessionId, jobId, 8000);
+        const elapsed = performance.now() - began;
+        assert.equal(failed.state, 'failed', failed.error?.type);
+        assert.equal(failed.error.type, 'PIKVM_MSD_CATALOG_TIMEOUT');
+        assert.equal(failed.removed, true, failed.removeError?.message);
+        assert.equal(mock.state.images['disk.img'], undefined);
+        assert.equal(transferPosts(mock, 'upload').length, 1);
+        assert.ok(
+          elapsed > budget + MSD_UNSEEN_CONFIRM_MS + 250,
+          `confirmed on the unseen cap (${elapsed} ms)`,
+        );
+        assert.ok(elapsed < budget * 2 + 1500, `ran past the confirm budget (${elapsed} ms)`);
       });
     });
 
