@@ -15,6 +15,7 @@
 // Modified 2026-10 by PLN: eject expectImage is typed, and catalog cleanup keeps the MSD lock (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: hash reads stop at the MSD job ceiling (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: hash timeout releases the upload slot before close (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: catalog budgets use a monotonic clock (GPL-3.0; see NOTICE).
 
 /**
  * Policy for MSD status, mount, eject, upload, and remove.
@@ -988,7 +989,17 @@ function catalogSeen(err: unknown): boolean {
 }
 
 /**
+ * Milliseconds from a monotonic clock. Catalog and removal-confirm
+ * budgets use this so a step of the realtime clock does not shorten
+ * or extend them. Job finishedAt stays on Date.now().
+ */
+function elapsedNow(): number {
+  return performance.now();
+}
+
+/**
  * One GET /api/msd that cannot outlive `deadlineAt` or `cancel`.
+ * `deadlineAt` is elapsedNow() plus the remaining budget.
  * The request time counts against the deadline: a slow read is aborted
  * instead of being allowed to finish after the budget.
  */
@@ -998,15 +1009,17 @@ async function readMsdState(
   cancel?: AbortSignal,
 ): Promise<MsdState | 'deadline' | 'cancelled'> {
   if (cancel?.aborted) return 'cancelled';
-  const left = deadlineAt - Date.now();
+  const left = deadlineAt - elapsedNow();
   if (left <= 0) return 'deadline';
-  const attempt = AbortSignal.timeout(left);
+  // AbortSignal.timeout rejects a fractional delay. Ceil keeps the
+  // read from ending before the budget; the overshoot is under 1 ms.
+  const attempt = AbortSignal.timeout(Math.ceil(left));
   const signal = cancel ? AbortSignal.any([attempt, cancel]) : attempt;
   try {
     return await client.getMsdState(signal);
   } catch (err) {
     if (cancel?.aborted) return 'cancelled';
-    if (attempt.aborted || Date.now() >= deadlineAt) return 'deadline';
+    if (attempt.aborted || elapsedNow() >= deadlineAt) return 'deadline';
     throw err;
   }
 }
@@ -1015,7 +1028,8 @@ async function readMsdState(
  * GET /api/msd until the image is ready, or the budget ends.
  * Does not POST the upload or write_remote again. Holds no lock;
  * the caller holds the MSD mutex for the whole wait. The budget is
- * wall time from the start, including each catalog read.
+ * elapsed time from the start, including each catalog read. It is
+ * monotonic, so a realtime step does not move it.
  */
 async function waitForCatalog(
   client: PiKVMClient,
@@ -1024,7 +1038,7 @@ async function waitForCatalog(
   timeoutMs: number,
   signal: AbortSignal,
 ): Promise<void> {
-  const deadlineAt = Date.now() + timeoutMs;
+  const deadlineAt = elapsedNow() + timeoutMs;
   let delayMs = CATALOG_POLL_MIN_MS;
   let last: MsdImageRecord | undefined;
   let seen = false;
@@ -1034,7 +1048,7 @@ async function waitForCatalog(
       const read = await readMsdState(client, deadlineAt, signal);
       if (read === 'cancelled') throw new MsdCancelledError(image);
       if (read === 'deadline') throw catalogFailure(image, last, expected);
-      if (Date.now() >= deadlineAt) {
+      if (elapsedNow() >= deadlineAt) {
         last = read.images[image];
         if (last) seen = true;
         const late = catalogVerdict(last, expected);
@@ -1048,7 +1062,7 @@ async function waitForCatalog(
       if (verdict === 'size' && last !== undefined && last.complete === true && expected !== undefined) {
         throw new MsdSizeMismatchError(image, last.size, expected);
       }
-      const remain = deadlineAt - Date.now();
+      const remain = deadlineAt - elapsedNow();
       if (remain <= 0) throw catalogFailure(image, last, expected);
       await catalogDelay(Math.min(delayMs, remain), image, signal);
       delayMs = Math.min(CATALOG_POLL_MAX_MS, delayMs * 2);
@@ -1099,7 +1113,7 @@ async function confirmImageAbsentLocked(
   timeoutMs: number,
   unseenMs?: number,
 ): Promise<{ removed: boolean; removeError?: ErrorFields }> {
-  const started = Date.now();
+  const started = elapsedNow();
   let delayMs = CATALOG_POLL_MIN_MS;
   let removedOnce = false;
   let seen = false;
@@ -1130,19 +1144,19 @@ async function confirmImageAbsentLocked(
   try {
     for (;;) {
       const deadlineAt = started + budgetMs();
-      if (deadlineAt - Date.now() <= 0) break;
+      if (deadlineAt - elapsedNow() <= 0) break;
       const read = await readMsdState(client, deadlineAt);
       if (read === 'deadline' || read === 'cancelled') break;
       const step = await applyRow(read);
       if (step === 'absent' && removedOnce) return { removed: true };
-      const remain = started + budgetMs() - Date.now();
+      const remain = started + budgetMs() - elapsedNow();
       if (remain <= 0) break;
       await catalogDelay(Math.min(delayMs, remain), image, signal);
       delayMs = Math.min(CATALOG_POLL_MAX_MS, delayMs * 2);
     }
     if (lastAbsent) return { removed: true };
     if (removedOnce) {
-      const follow = await readMsdState(client, Date.now() + CATALOG_POLL_MIN_MS);
+      const follow = await readMsdState(client, elapsedNow() + CATALOG_POLL_MIN_MS);
       if (follow !== 'deadline' && follow !== 'cancelled' && !follow.images[image]) {
         return { removed: true };
       }
