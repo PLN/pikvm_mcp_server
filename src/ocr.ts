@@ -1,4 +1,5 @@
 // Modified 2026-10 by PLN: host OCR with the system tesseract binary (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: the OCR remaining budget is monotonic (GPL-3.0; see NOTICE).
 
 /**
  * Host OCR. The recognizer is the tesseract binary on PATH, or
@@ -809,6 +810,7 @@ export interface ExecuteOcrInput {
 /** One OCR call. Host never falls through to kvmd. The image stays in memory. */
 export async function executeOcr(input: ExecuteOcrInput): Promise<OcrResult> {
   const started = Date.now();
+  const budgetAt = performance.now();
   const engine = selectEngine(input.runtime, input.override, input.engineArg, input.deviceName);
   let pixels = 0;
   let snapshotMs = 0;
@@ -879,13 +881,15 @@ export async function executeOcr(input: ExecuteOcrInput): Promise<OcrResult> {
         'host',
       );
     }
-    const remaining = () => input.runtime.timeoutMs - (Date.now() - started);
+    const remaining = () => input.runtime.timeoutMs - (performance.now() - budgetAt);
     if (remaining() <= 0) {
       log('PIKVM_OCR_TIMEOUT');
       throw new OcrError('PIKVM_OCR_TIMEOUT', 'OCR timed out', 'host');
     }
     const snapStart = Date.now();
-    const jpeg = await input.fetchSnapshot(Math.max(1, remaining()));
+    // AbortSignal.timeout rejects a fractional delay. Ceil keeps the
+    // snapshot from ending before the budget; the overshoot is under 1 ms.
+    const jpeg = await input.fetchSnapshot(Math.max(1, Math.ceil(remaining())));
     const crop = sourceBox
       ? {
         left: sourceBox.left,
@@ -902,13 +906,13 @@ export async function executeOcr(input: ExecuteOcrInput): Promise<OcrResult> {
       log('PIKVM_OCR_TIMEOUT');
       throw new OcrError('PIKVM_OCR_TIMEOUT', 'OCR timed out', 'host');
     }
-    const release = await input.runtime.semaphore.acquire(remaining());
+    const release = await input.runtime.semaphore.acquire(Math.max(0, Math.ceil(remaining())));
     const ocrStart = Date.now();
     try {
       const recognized = await input.runtime.recognize(png, {
         langs: (selected.langs ?? input.runtime.langs).join('+'),
         psm: OCR_DEFAULT_PSM,
-        signal: deadlineSignal(remaining()),
+        signal: deadlineSignal(Math.max(1, Math.ceil(remaining()))),
       });
       let droppedLowConf = 0;
       const kept: OcrEngineWord[] = [];

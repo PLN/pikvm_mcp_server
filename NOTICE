@@ -47,6 +47,11 @@ Modified 2026-10 by PLN: the slot-free upload test releases the second job (GPL-
 Modified 2026-10 by PLN: bounded MSD test teardown and fetch (GPL-3.0; see below).
 Modified 2026-10 by PLN: hash reads stop at the MSD job ceiling (GPL-3.0; see below).
 Modified 2026-10 by PLN: caller locations, labeled body timeouts, and teardown after a hung test (GPL-3.0; see below).
+Modified 2026-10 by PLN: hash timeout releases the upload slot before close (GPL-3.0; see below).
+Modified 2026-10 by PLN: catalog budgets use a monotonic clock (GPL-3.0; see below).
+Modified 2026-10 by PLN: removal confirm stays hidden across an extra catalog GET (GPL-3.0; see below).
+Modified 2026-10 by PLN: a catalog read is not started with under 1 ms left (GPL-3.0; see below).
+Modified 2026-10 by PLN: Node 24 and Windows test locations, and the CI matrix (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -847,7 +852,7 @@ No code from another pikvm_mcp_server fork was added for these methods.
   fails on its own, so the rest of the file still runs. Server close,
   session close, and fixture removal reject when they exceed 10 seconds,
   and the error names the operation. The timer is cleared when the work
-  finishes. Test fetches abort through AbortSignal.timeout.   The hardware
+  finishes. Test fetches abort through AbortSignal.timeout. The hardware
   MSD cycle is not given the 30 second ceiling: its job budget is already
   120 seconds, and an optional URL fetch can run longer. Its tool calls
   abort after 60 seconds, and its session close and fixture removal use
@@ -883,4 +888,77 @@ No code from another pikvm_mcp_server fork was added for these methods.
   at that line. AbortSignal.timeout stays armed after fetch returns.
   A stall in the response body is reported with the operation name
   instead of a raw TimeoutError.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  On PIKVM_MSD_HASH_TIMEOUT the upload slot is released without waiting
+  for the file close. The descriptor is not closed while a hash read is
+  in flight. That read's callback closes it, once, whether the read
+  succeeds or fails. When no read is in flight, close starts immediately
+  and the slot still does not wait. A close error on this path is logged
+  with the msd_upload event, close true, and the close message. It does
+  not replace the job error and it is not an unhandled rejection. The
+  non-timeout close path is unchanged. There is no per-read idle bound
+  and no new environment variable.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  Catalog readiness and removal confirmation measure elapsed time with
+  a monotonic clock. A forward step of the realtime clock no longer
+  ends those budgets early, and a backward step no longer extends
+  them. Job finishedAt is still Date.now(). The MSD test waits use
+  the same monotonic clock, so a realtime step cannot abandon a poll
+  while the upload slot is still held. There is no new environment
+  variable.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  The MSD mock can omit a freshly written image until a monotonic
+  interval has passed since the first GET /api/msd that sees it fresh.
+  The removal-confirm test uses that interval instead of a poll count.
+  A fractional catalog budget can start one more GET than an integer
+  clock, because setTimeout truncates the remaining delay and can fire
+  about 1 ms early. Three hidden polls do not cover that GET, so the
+  job was reported done. The catalog and confirm deadlines are unchanged.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  A catalog or removal-confirm GET /api/msd is not started when less
+  than 1 ms of that budget remains. AbortSignal.timeout still receives
+  an integer delay when at least 1 ms remains. The removal-confirm test
+  hides the fresh image for three polls again. The mock can still hide
+  a fresh image for a monotonic interval; the test that switches to the
+  full confirm budget uses that interval so the image stays hidden
+  through readiness and is visible for longer than the 750 ms unseen
+  cap.   Host OCR's remaining budget uses the monotonic clock. The snapshot
+  abort delay is an integer, because AbortSignal.timeout rejects a
+  fraction. Snapshot, recognition, and total durations stay on the
+  wall clock, as do the job TTL, the HTTP idle sweep, and certificate
+  expiry.
+  beforeSlotRelease does not run on the hash-timeout path.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  The MSD caller-location child uses the TAP reporter. Node 24's
+  default reporter does not print the location rows that test parses.
+  The generated import is a file URL, so a Windows path is a valid
+  ESM specifier. Stack frames keep a Windows drive letter, including
+  file:///C:/ URLs. The credential inode probe omits the node:fs
+  default export from the module mock. Node 24 refuses to redefine
+  constants when that default export is included. CI runs the test
+  job on Ubuntu with Node 22.14.0 and Node 24, and on Windows with
+  Node 22.14.0. The allow-scripts job is unchanged.
+  A FIFO fixture counts only when the created path is a FIFO. On
+  Windows, mkfifo can exit 0 and leave no file Node can open, so those
+  assertions are skipped there.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  The Windows upload failure was the FIFO image case. mkfifo exited 0
+  and left no file, lstat failed, and the upload reported that missing
+  name as not in the upload directory. A missing image name is still
+  that error, before any kvmd call. A missing secret or certificate
+  path is still cannot read (ENOENT). A directory is still not a
+  regular file. The FIFO portions of those tests skip on Windows, with
+  that mkfifo reason. Directory and symlink checks still run.
   No code from another pikvm_mcp_server fork was copied.

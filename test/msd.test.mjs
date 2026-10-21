@@ -16,6 +16,11 @@
 // Modified 2026-10 by PLN: the slot-free upload test releases the second job (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: bounded MSD test teardown and fetch (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: hash timeout releases the upload slot (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: hash timeout releases the upload slot before close (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: removal confirm stays hidden across an extra catalog GET (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: catalog budgets use a monotonic clock (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: a sub-ms catalog remainder does not start a GET (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: a Windows FIFO image is skipped (GPL-3.0; see NOTICE).
 
 /**
  * MSD tools against the mock. The HTTP harness matches test/http.test.mjs.
@@ -42,7 +47,7 @@ import { createMcpServer, ARM_GATED_TOOLS, MSD_READ_ONLY_TOOLS, msdToolRequiresA
 import { parseUrlAllowlist } from '../dist/url-policy.js';
 import { startHttpServer } from '../dist/http.js';
 import { startKvmdMock } from './kvmd-mock.mjs';
-import { fifoAvailable, symlinkAvailable } from './posix-caps.mjs';
+import { WIN32_FIFO_SKIP, fifoAvailable, symlinkAvailable } from './posix-caps.mjs';
 import {
   MSD_FILE_TIMEOUT_MS,
   MSD_UPLOAD_SUITE_TIMEOUT_MS,
@@ -136,10 +141,10 @@ function msdPosts(mock) {
 }
 
 async function waitFor(fn, ms = 2000) {
-  const start = Date.now();
+  const start = performance.now();
   for (;;) {
     if (await fn()) return true;
-    if (Date.now() - start > ms) return false;
+    if (performance.now() - start > ms) return false;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
 }
@@ -734,10 +739,10 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
     });
     child.on('exit', () => { closed = true; if (wakeup) { wakeup(); wakeup = null; } });
     async function waitForResponse(id) {
-      const deadline = Date.now() + 12000;
+      const deadline = performance.now() + 12000;
       while (!responses.has(id)) {
         if (closed) throw new Error(`child exited early. stderr: ${stderr}`);
-        if (Date.now() > deadline) throw new Error(`timed out waiting for id=${id}. stderr: ${stderr}`);
+        if (performance.now() > deadline) throw new Error(`timed out waiting for id=${id}. stderr: ${stderr}`);
         await new Promise((resolve) => { wakeup = resolve; setTimeout(resolve, 200); });
       }
       return responses.get(id);
@@ -1017,13 +1022,46 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
     }
   }
 
-  function assertFdClosed(fd) {
+  function fdIdentity(fd) {
     return new Promise((resolve, reject) => {
-      fs.fstat(fd, (err) => {
-        if (err && err.code === 'EBADF') resolve();
-        else reject(err || new Error(`fd ${fd} is still open`));
+      fs.fstat(fd, (err, stat) => {
+        if (!err) resolve(`${stat.dev}:${stat.ino}`);
+        else if (err.code === 'EBADF') resolve('');
+        else reject(err);
       });
     });
+  }
+
+  /**
+   * The number can be reused by a later socket or file. Closed means this
+   * descriptor no longer names the same file.
+   */
+  async function waitUntilFdReleased(fd, identity) {
+    const start = performance.now();
+    for (;;) {
+      const now = await fdIdentity(fd);
+      if (now !== identity) return;
+      if (performance.now() - start > 1000) {
+        throw new Error(`fd ${fd} still names ${identity}`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+
+  function activeTimeouts() {
+    return process.getActiveResourcesInfo().filter((name) => name === 'Timeout').length;
+  }
+
+  /** Two matching samples, so a timer that is about to fire is not the baseline. */
+  async function settledTimeouts() {
+    let last = -1;
+    let now = activeTimeouts();
+    for (let i = 0; i < 10 && now !== last; i += 1) {
+      last = now;
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      now = activeTimeouts();
+    }
+    return now;
   }
 
   msdTest('expectImage is checked when the drive is disconnected', async () => {
@@ -1091,14 +1129,11 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
           ['directory', { file: 'dir.img', confirmImage: 'dir.img' }, /directory/],
           ['oversize', { file: 'big.img', confirmImage: 'big.img' }, /PIKVM_MSD_MAX_BYTES/],
           ['sha256 format', { file: 'real.img', confirmImage: 'real.img', sha256: 'nope' }, /64 hex/],
+          ['missing', { file: 'gone.img', confirmImage: 'gone.img' }, /not in the upload directory/],
         ];
         if (symlinkAvailable()) {
           await symlink(join(dir, 'real.img'), join(dir, 'link.img'));
           cases.push(['symlink', { file: 'link.img', confirmImage: 'link.img' }, /symlink/]);
-        }
-        if (fifoAvailable()) {
-          await execFileAsync('mkfifo', [join(dir, 'pipe.img')]);
-          cases.push(['fifo', { file: 'pipe.img', confirmImage: 'pipe.img' }, /not a regular file/]);
         }
         for (const [label, args, pattern] of cases) {
           const flags = label === 'oversize'
@@ -1111,6 +1146,25 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
             assert.deepEqual(mock.calls, [], label);
           });
         }
+      });
+    });
+
+    await msdSubtest(t, 'a FIFO image is not a regular file', {
+      skip: process.platform === 'win32'
+        ? WIN32_FIFO_SKIP
+        : (fifoAvailable() ? false : 'FIFO is not available on this platform'),
+    }, async () => {
+      await withDir(async (dir) => {
+        await execFileAsync('mkfifo', [join(dir, 'pipe.img')]);
+        await withSession({ images: [] }, uploadMsd(dir), async ({ mock, base, sessionId }) => {
+          const result = await callTool(base, sessionId, 'pikvm_msd_upload', {
+            file: 'pipe.img',
+            confirmImage: 'pipe.img',
+          });
+          assert.equal(result.isError, true);
+          assert.match(result.content[0].text, /not a regular file/);
+          assert.deepEqual(mock.calls, []);
+        });
       });
     });
 
@@ -1282,12 +1336,12 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
             const { jobId } = JSON.parse(started.content[0].text);
             assert.equal(await waitFor(() => typeof release === 'function'), true);
             const other = await openSession(base);
-            const began = Date.now();
+            const began = performance.now();
             const refused = await callTool(base, other, 'pikvm_msd_upload', {
               file: 'disk.img',
               confirmImage: 'disk.img',
             });
-            assert.ok(Date.now() - began < 700, 'second upload waited on the first');
+            assert.ok(performance.now() - began < 700, 'second upload waited on the first');
             assert.equal(refused.isError, true);
             assert.match(refused.content[0].text, /MsdUploadBusyError/);
             assert.match(refused.content[0].text, /upload already running/);
@@ -1311,7 +1365,7 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
           const flags = uploadMsd(dir);
           flags.msdJobTimeoutMs = 500;
           await withSession({ images: [] }, flags, async ({ mock, base, sessionId }) => {
-            const began = Date.now();
+            const began = performance.now();
             const started = await callTool(base, sessionId, 'pikvm_msd_upload', {
               file: 'disk.img',
               confirmImage: 'disk.img',
@@ -1319,15 +1373,17 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
             assert.equal(started.isError, undefined, started.content[0].text);
             const { jobId } = JSON.parse(started.content[0].text);
             const failed = await pollJob(base, sessionId, jobId, 4000);
-            const elapsed = Date.now() - began;
+            const elapsed = performance.now() - began;
             assert.equal(failed.state, 'failed');
             assert.equal(failed.error.type, 'PIKVM_MSD_HASH_TIMEOUT');
             assert.match(failed.error.message, /hash timeout/);
             assert.ok(elapsed >= 400, `hash failed before the ceiling (${elapsed}ms)`);
             assert.ok(elapsed < 4000, `hash hung past the bound (${elapsed}ms)`);
             assert.ok(hung.fd >= 0, 'hash never called fs.read');
-            await assertFdClosed(hung.fd);
+            const openIdentity = await fdIdentity(hung.fd);
+            assert.notEqual(openIdentity, '');
             hung.callback(Object.assign(new Error('closed'), { code: 'EBADF' }));
+            await waitUntilFdReleased(hung.fd, openIdentity);
             hung.callback(null, body.length);
             await new Promise((resolve) => setTimeout(resolve, 30));
             assert.equal(mock.calls.some((call) => call.path === '/api/msd/write'), false);
@@ -1342,6 +1398,165 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
             assert.equal(mock.bytes.get('next.img').toString(), 'wxyz');
           });
         }));
+      });
+    });
+
+    await msdSubtest(t, 'a hash timeout frees the slot while close is still pending', async () => {
+      await withDir(async (dir) => {
+        await writeFile(join(dir, 'disk.img'), body);
+        await writeFile(join(dir, 'next.img'), Buffer.from('wxyz'));
+        const logged = [];
+        const origErr = console.error;
+        console.error = (...args) => {
+          logged.push(args.map(String).join(' '));
+          origErr(...args);
+        };
+        const restoreLog = onTestTeardown(() => {
+          console.error = origErr;
+        });
+        try {
+          await withHungHashRead((hung) => whileWatchingProcess(async () => {
+            const releaseFd = onTestTeardown(() => new Promise((resolve, reject) => {
+              if (hung.fd < 0 || closeCalls > 0) {
+                resolve();
+                return;
+              }
+              fs.close(hung.fd, (err) => {
+                if (err && err.code !== 'EBADF') reject(err);
+                else resolve();
+              });
+            }));
+            let closeCalls = 0;
+            let rejectClose;
+            const flags = uploadMsd(dir, {
+              closeFile: (fh) => {
+                if (fh.fd !== hung.fd) return fh.close();
+                closeCalls += 1;
+                const pending = new Promise((resolve, reject) => {
+                  rejectClose = reject;
+                });
+                fh.close().then(() => undefined, (err) => {
+                  rejectClose(err);
+                });
+                return pending;
+              },
+            });
+            flags.msdJobTimeoutMs = 500;
+            await withSession({ images: [] }, flags, async ({ mock, base, sessionId }) => {
+              const started = await callTool(base, sessionId, 'pikvm_msd_upload', {
+                file: 'disk.img',
+                confirmImage: 'disk.img',
+              });
+              assert.equal(started.isError, undefined, started.content[0].text);
+              const { jobId } = JSON.parse(started.content[0].text);
+              const failed = await pollJob(base, sessionId, jobId, 4000);
+              assert.equal(failed.state, 'failed');
+              assert.equal(failed.error.type, 'PIKVM_MSD_HASH_TIMEOUT');
+              assert.equal(closeCalls, 0);
+              const openIdentity = await fdIdentity(hung.fd);
+              assert.notEqual(openIdentity, '');
+              const again = await callTool(base, sessionId, 'pikvm_msd_upload', {
+                file: 'next.img',
+                confirmImage: 'next.img',
+              });
+              assert.equal(again.isError, undefined, again.content[0].text);
+              assert.equal(again.content[0].text.includes('MsdUploadBusyError'), false);
+              assert.equal(closeCalls, 0);
+              hung.callback(Object.assign(new Error('late read'), { code: 'EIO' }));
+              assert.equal(closeCalls, 1);
+              hung.callback(null, body.length);
+              assert.equal(closeCalls, 1);
+              assert.equal(typeof rejectClose, 'function');
+              await waitUntilFdReleased(hung.fd, openIdentity);
+              rejectClose(new Error('hash close failed'));
+              await new Promise((resolve) => setImmediate(resolve));
+              assert.ok(
+                logged.some((line) => line.includes('"close":true') && line.includes('hash close failed')),
+                logged.filter((line) => line.includes('msd_upload')).join('\n'),
+              );
+              const still = JSON.parse((await callTool(base, sessionId, 'pikvm_msd_job', { jobId })).content[0].text);
+              assert.equal(still.error.type, 'PIKVM_MSD_HASH_TIMEOUT');
+              assert.equal(mock.calls.some((call) => (
+                call.path === '/api/msd/write' && call.query.includes('disk.img')
+              )), false);
+              const done = await pollJob(base, sessionId, JSON.parse(again.content[0].text).jobId);
+              assert.equal(done.state, 'done');
+              assert.equal(mock.bytes.get('next.img').toString(), 'wxyz');
+            });
+            await releaseFd();
+          }));
+        } finally {
+          await restoreLog();
+        }
+      });
+    });
+
+    await msdSubtest(t, 'a hash and a POST that each use most of the job ceiling still succeed', async () => {
+      await withDir(async (dir) => {
+        await writeFile(join(dir, 'disk.img'), body);
+        const ceiling = 500;
+        const hashDelayMs = 300;
+        const postDelayMs = 300;
+        const origRead = fs.read;
+        let delayed = false;
+        fs.read = function delayedHashRead(fd, buffer, offset, length, position, callback) {
+          if (!delayed) {
+            delayed = true;
+            return origRead.call(fs, fd, buffer, offset, length, position, (err, bytesRead, buf) => {
+              setTimeout(() => callback(err, bytesRead, buf), hashDelayMs);
+            });
+          }
+          return origRead.call(fs, fd, buffer, offset, length, position, callback);
+        };
+        const restoreRead = onTestTeardown(() => {
+          fs.read = origRead;
+        });
+        const flags = uploadMsd(dir);
+        flags.msdJobTimeoutMs = ceiling;
+        try {
+          await withSession({
+            images: [],
+            free: 1000,
+            writeHoldMs: postDelayMs,
+          }, flags, async ({ base, sessionId }) => {
+            const began = performance.now();
+            const started = await callTool(base, sessionId, 'pikvm_msd_upload', {
+              file: 'disk.img',
+              confirmImage: 'disk.img',
+              sha256: sum,
+            });
+            assert.equal(started.isError, undefined, started.content[0].text);
+            const done = await pollJob(base, sessionId, JSON.parse(started.content[0].text).jobId, 4000);
+            const elapsed = performance.now() - began;
+            assert.equal(done.state, 'done', done.error && done.error.message);
+            assert.equal(done.sha256, sum);
+            assert.ok(elapsed >= ceiling, `finished inside one ceiling (${elapsed}ms)`);
+            assert.ok(elapsed < 4000, `upload hung (${elapsed}ms)`);
+          });
+        } finally {
+          await restoreRead();
+        }
+      });
+    });
+
+    await msdSubtest(t, 'a finished hash leaves no hash timer armed', async () => {
+      await withDir(async (dir) => {
+        await writeFile(join(dir, 'disk.img'), body);
+        const flags = uploadMsd(dir);
+        flags.msdJobTimeoutMs = 30000;
+        await withSession({ images: [], free: 1000 }, flags, async ({ base, sessionId }) => {
+          const before = await settledTimeouts();
+          const started = await callTool(base, sessionId, 'pikvm_msd_upload', {
+            file: 'disk.img',
+            confirmImage: 'disk.img',
+            sha256: sum,
+          });
+          assert.equal(started.isError, undefined, started.content[0].text);
+          const done = await pollJob(base, sessionId, JSON.parse(started.content[0].text).jobId);
+          assert.equal(done.state, 'done');
+          const after = await settledTimeouts();
+          assert.equal(after, before);
+        });
       });
     });
 
@@ -1487,9 +1702,9 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
           });
           const { jobId } = JSON.parse(started.content[0].text);
           assert.equal(await waitFor(() => mock.state.busy === true), true);
-          const began = Date.now();
+          const began = performance.now();
           const shot = await callTool(base, sessionId, 'pikvm_screenshot', {});
-          assert.ok(Date.now() - began < 700, 'screenshot waited on the upload');
+          assert.ok(performance.now() - began < 700, 'screenshot waited on the upload');
           assert.equal(shot.isError, undefined, shot.content?.[0]?.text);
           assert.doesNotMatch(shot.content[0].text, /please wait/);
           const mid = JSON.parse((await callTool(base, sessionId, 'pikvm_msd_job', { jobId })).content[0].text);
@@ -1513,14 +1728,14 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
           });
           const { jobId } = JSON.parse(started.content[0].text);
           assert.equal(await waitFor(() => mock.state.busy === true), true);
-          const began = Date.now();
+          const began = performance.now();
           const mounted = await callTool(base, sessionId, 'pikvm_msd_mount', {
             image: 'other.img',
             mode: 'flash',
             confirmImage: 'other.img',
           });
           const ejected = await callTool(base, sessionId, 'pikvm_msd_eject', { expectImage: '' });
-          assert.ok(Date.now() - began < 700, 'mount or eject waited on the upload');
+          assert.ok(performance.now() - began < 700, 'mount or eject waited on the upload');
           assert.equal(mounted.isError, true);
           assert.match(mounted.content[0].text, /busy/);
           assert.equal(ejected.isError, true);
@@ -1803,7 +2018,7 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
             const { jobId } = JSON.parse(started.content[0].text);
             assert.equal(await waitFor(() => typeof release === 'function'), true);
             const other = await openSession(base);
-            const began = Date.now();
+            const began = performance.now();
             const second = await callTool(base, other, 'pikvm_msd_fetch_url', {
               url: FETCH_URL,
               confirmImage: 'disk.img',
@@ -1812,7 +2027,7 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
               file: 'disk.img',
               confirmImage: 'disk.img',
             });
-            assert.ok(Date.now() - began < 700, 'second transfer waited');
+            assert.ok(performance.now() - began < 700, 'second transfer waited');
             assert.match(second.content[0].text, /MsdUploadBusyError/);
             assert.match(second.content[0].text, /upload already running/);
             assert.match(upload.content[0].text, /upload already running/);
@@ -2064,14 +2279,14 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
           confirmImage: 'disk.img',
         });
         const { jobId } = JSON.parse(started.content[0].text);
-        const began = Date.now();
+        const began = performance.now();
         const failed = await pollJob(base, sessionId, jobId, 4000);
         assert.equal(failed.state, 'failed');
         assert.equal(failed.error.type, 'MsdOperationError');
         assert.equal(failed.removed, true);
         assert.equal(failed.removeError, undefined);
         assert.equal(mock.state.images['disk.img'], undefined);
-        assert.ok(Date.now() - began >= 300, 'an unknown name is not proof the image is gone');
+        assert.ok(performance.now() - began >= 300, 'an unknown name is not proof the image is gone');
       });
     });
 
@@ -2248,9 +2463,9 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
         await run({ images: [], catalogIncompletePolls: 2 }, 2000, async ({ mock, base, sessionId }) => {
           const started = await startTransfer(kind, base, sessionId);
           const { jobId } = JSON.parse(started.content[0].text);
-          const began = Date.now();
+          const began = performance.now();
           const done = await pollJob(base, sessionId, jobId, 8000);
-          const elapsed = Date.now() - began;
+          const elapsed = performance.now() - began;
           assert.equal(done.state, 'done', kind);
           assert.ok(elapsed >= 700, `${kind} did not keep polling an incomplete row (${elapsed} ms)`);
           assert.equal(transferPosts(mock, kind).length, 1, kind);
@@ -2330,9 +2545,9 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
         await run({ images: [], catalogSize: 9 }, budget, async ({ mock, base, sessionId }) => {
           const started = await startTransfer(kind, base, sessionId);
           const { jobId } = JSON.parse(started.content[0].text);
-          const began = Date.now();
+          const began = performance.now();
           const failed = await pollJob(base, sessionId, jobId, 8000);
-          const elapsed = Date.now() - began;
+          const elapsed = performance.now() - began;
           assert.equal(failed.state, 'failed', kind);
           assert.equal(failed.error.type, 'PIKVM_MSD_SIZE_MISMATCH', kind);
           assert.match(failed.error.message, /size is 9, expected 4/, kind);
@@ -2350,9 +2565,9 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
         await run({ images: [], catalogHidePolls: 1000 }, budget, async ({ mock, base, sessionId }) => {
           const started = await startTransfer(kind, base, sessionId);
           const { jobId } = JSON.parse(started.content[0].text);
-          const began = Date.now();
+          const began = performance.now();
           const failed = await pollJob(base, sessionId, jobId, 8000);
-          const elapsed = Date.now() - began;
+          const elapsed = performance.now() - began;
           assert.equal(failed.state, 'failed', kind);
           assert.equal(failed.error.type, 'PIKVM_MSD_CATALOG_TIMEOUT', kind);
           assert.equal(failed.removed, true, kind);
@@ -2376,9 +2591,9 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
         }, budget, async ({ mock, base, sessionId }) => {
           const started = await startTransfer(kind, base, sessionId);
           const { jobId } = JSON.parse(started.content[0].text);
-          const began = Date.now();
+          const began = performance.now();
           const failed = await pollJob(base, sessionId, jobId, 8000);
-          const elapsed = Date.now() - began;
+          const elapsed = performance.now() - began;
           assert.equal(failed.state, 'failed', kind);
           assert.equal(failed.error.type, 'PIKVM_MSD_IMAGE_INCOMPLETE', kind);
           assert.equal(failed.removed, true, failed.removeError?.message);
@@ -2390,6 +2605,55 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
           );
           assert.ok(elapsed < budget * 2 + 1500, `${kind} ran past the confirm budget (${elapsed} ms)`);
         });
+      });
+
+      await msdSubtest(t, `${kind}: a realtime step during confirm keeps the budget and frees the slot`, async (inner) => {
+        watchCrashes(inner);
+        const budget = 2000;
+        const realNow = Date.now;
+        let extra = 0;
+        const restoreNow = () => {
+          Date.now = realNow;
+        };
+        Date.now = () => realNow() + extra;
+        inner.after(restoreNow);
+        const run = kind === 'upload' ? withUpload : withFetch;
+        try {
+          await run({
+            images: [],
+            catalogIncompletePolls: 1000,
+            catalogReappearPolls: 3,
+          }, budget, async ({ mock, base, sessionId }) => {
+            const started = await startTransfer(kind, base, sessionId);
+            assert.equal(started.isError, undefined, started.content[0].text);
+            const { jobId } = JSON.parse(started.content[0].text);
+            const began = performance.now();
+            const stepTimer = setTimeout(() => {
+              extra = 10000;
+            }, 400);
+            inner.after(() => clearTimeout(stepTimer));
+            const failed = await pollJob(base, sessionId, jobId, 8000);
+            const elapsed = performance.now() - began;
+            assert.equal(extra, 10000, `${kind} clock step did not run`);
+            assert.equal(failed.state, 'failed', kind);
+            assert.equal(failed.error.type, 'PIKVM_MSD_IMAGE_INCOMPLETE', kind);
+            assert.equal(failed.removed, true, failed.removeError?.message);
+            assert.equal(transferPosts(mock, kind).length, 1, kind);
+            assert.ok(
+              elapsed > 2 * budget - 250,
+              `${kind} did not spend the readiness budget and the confirm budget (${elapsed} ms)`,
+            );
+            assert.ok(elapsed < budget * 2 + 1500, `${kind} ran past the confirm budget (${elapsed} ms)`);
+            const again = await startTransfer(kind, base, sessionId);
+            assert.equal(again.isError, undefined, `${kind} slot: ${again.content[0].text}`);
+            const againId = JSON.parse(again.content[0].text).jobId;
+            const finished = await pollJob(base, sessionId, againId, 8000);
+            assert.equal(finished.state, 'failed', kind);
+            assert.equal(finished.error.type, 'PIKVM_MSD_IMAGE_INCOMPLETE', kind);
+          });
+        } finally {
+          restoreNow();
+        }
       });
 
       await msdSubtest(t, `${kind}: a slow catalog read stops near the readiness deadline`, async (inner) => {
@@ -2404,9 +2668,9 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
         }, budget, async ({ mock, base, sessionId }) => {
           const started = await startTransfer(kind, base, sessionId);
           const { jobId } = JSON.parse(started.content[0].text);
-          const began = Date.now();
+          const began = performance.now();
           const failed = await pollJob(base, sessionId, jobId, 8000);
-          const elapsed = Date.now() - began;
+          const elapsed = performance.now() - began;
           assert.equal(failed.state, 'failed', kind);
           assert.equal(failed.error.type, 'PIKVM_MSD_CATALOG_TIMEOUT', kind);
           assert.equal(transferPosts(mock, kind).length, 1, kind);
@@ -2424,9 +2688,9 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
         await run({ images: [], catalogIncompletePolls: 2, catalogSize: 9 }, 4000, async ({ mock, base, sessionId }) => {
           const started = await startTransfer(kind, base, sessionId);
           const { jobId } = JSON.parse(started.content[0].text);
-          const began = Date.now();
+          const began = performance.now();
           const failed = await pollJob(base, sessionId, jobId, 8000);
-          const elapsed = Date.now() - began;
+          const elapsed = performance.now() - began;
           assert.equal(failed.state, 'failed', kind);
           assert.equal(failed.error.type, 'PIKVM_MSD_SIZE_MISMATCH', kind);
           assert.match(failed.error.message, /size is 9, expected 4/, kind);
@@ -2445,9 +2709,9 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
         await run({ images: [], catalogIncompletePolls: 1000, catalogSize: 9 }, budget, async ({ mock, base, sessionId }) => {
           const started = await startTransfer(kind, base, sessionId);
           const { jobId } = JSON.parse(started.content[0].text);
-          const began = Date.now();
+          const began = performance.now();
           const failed = await pollJob(base, sessionId, jobId, 8000);
-          const elapsed = Date.now() - began;
+          const elapsed = performance.now() - began;
           assert.equal(failed.state, 'failed', kind);
           assert.equal(failed.error.type, 'PIKVM_MSD_IMAGE_INCOMPLETE', kind);
           assert.ok(elapsed >= 400, `${kind} failed fast on an incomplete wrong size (${elapsed} ms)`);
@@ -2497,16 +2761,51 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
 
     await msdSubtest(t, 'an image absent at remove time, then visible, is confirmed gone', async (inner) => {
       watchCrashes(inner);
+      // Three hidden polls cover this 300 ms budget. A remainder under
+      // 1 ms does not start another GET, so the image stays absent until
+      // removal confirm.
       await withUpload({ images: [], catalogHidePolls: 3 }, 300, async ({ mock, base, sessionId }) => {
         const started = await startTransfer('upload', base, sessionId);
         const { jobId } = JSON.parse(started.content[0].text);
         const failed = await pollJob(base, sessionId, jobId, 8000);
-        assert.equal(failed.state, 'failed');
+        const catalogGets = mock.calls.filter((call) => call.method === 'GET' && call.path === '/api/msd').length;
+        assert.equal(failed.state, 'failed', `gets ${catalogGets} error ${failed.error?.type}`);
         assert.equal(failed.error.type, 'PIKVM_MSD_CATALOG_TIMEOUT');
         assert.equal(failed.removed, true, failed.removeError?.message);
         assert.equal(mock.state.images['disk.img'], undefined);
         assert.equal(transferPosts(mock, 'upload').length, 1);
         assert.ok(mock.calls.some((call) => call.path === '/api/msd/remove'));
+      });
+    });
+
+    await msdSubtest(t, 'an image hidden through readiness, then present during confirm, uses the full confirm budget', async (inner) => {
+      watchCrashes(inner);
+      const budget = 2000;
+      // The row stays hidden until after the readiness budget, so cleanup
+      // starts on the 750 ms unseen cap. It is then visible, and comes
+      // back after each remove, for longer than that cap. Two
+      // reappearances are still present at 750 ms and are exhausted
+      // before the full confirm budget ends.
+      await withUpload({
+        images: [],
+        catalogHideMs: budget + 80,
+        catalogReappearPolls: 2,
+      }, budget, async ({ mock, base, sessionId }) => {
+        const started = await startTransfer('upload', base, sessionId);
+        const { jobId } = JSON.parse(started.content[0].text);
+        const began = performance.now();
+        const failed = await pollJob(base, sessionId, jobId, 8000);
+        const elapsed = performance.now() - began;
+        assert.equal(failed.state, 'failed', failed.error?.type);
+        assert.equal(failed.error.type, 'PIKVM_MSD_CATALOG_TIMEOUT');
+        assert.equal(failed.removed, true, failed.removeError?.message);
+        assert.equal(mock.state.images['disk.img'], undefined);
+        assert.equal(transferPosts(mock, 'upload').length, 1);
+        assert.ok(
+          elapsed > budget + MSD_UNSEEN_CONFIRM_MS + 250,
+          `confirmed on the unseen cap (${elapsed} ms)`,
+        );
+        assert.ok(elapsed < budget * 2 + 1500, `ran past the confirm budget (${elapsed} ms)`);
       });
     });
 

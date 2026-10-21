@@ -1,3 +1,4 @@
+// Modified 2026-10 by PLN: hide a fresh image for a monotonic interval (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: configurable error, status, and delay routes (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: MSD state machine (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: incomplete images and kvmd error classes (GPL-3.0; see NOTICE).
@@ -43,7 +44,9 @@
  * image snapshots wait until `releaseSnapshots()`. `holdNextStreamer()`
  * makes the next GET /api/streamer wait until `releaseStreamer()`.
  * `catalogHidePolls` omits a freshly written image from that many
- * GET /api/msd responses. `catalogIncompletePolls` shows it with
+ * GET /api/msd responses. `catalogHideMs` omits it until that many
+ * milliseconds of monotonic time have passed since the first
+ * GET /api/msd that sees it fresh. `catalogIncompletePolls` shows it with
  * complete false for that many responses. `catalogSize` reports that
  * size instead of the stored one. Seeded images are not affected.
  * `catalogReappearPolls` puts a removed fresh image back for that many
@@ -60,6 +63,7 @@
  */
 
 import http from 'node:http';
+import { performance } from 'node:perf_hooks';
 import sharp from 'sharp';
 
 let jpegCache = null;
@@ -276,6 +280,10 @@ export async function startKvmdMock(options = {}) {
   let streamerHolds = 0;
   let imageSnapshots = 0;
   let catalogHideLeft = Number.isInteger(options.catalogHidePolls) ? options.catalogHidePolls : 0;
+  const catalogHideMs = Number.isInteger(options.catalogHideMs) && options.catalogHideMs > 0
+    ? options.catalogHideMs
+    : 0;
+  let catalogHideUntil = null;
   let catalogIncompleteLeft = Number.isInteger(options.catalogIncompletePolls)
     ? options.catalogIncompletePolls
     : 0;
@@ -320,6 +328,10 @@ export async function startKvmdMock(options = {}) {
       if (catalogFresh.has(name) && catalogHideLeft > 0) {
         catalogHideLeft -= 1;
         continue;
+      }
+      if (catalogFresh.has(name) && catalogHideMs > 0) {
+        if (catalogHideUntil === null) catalogHideUntil = performance.now() + catalogHideMs;
+        if (performance.now() < catalogHideUntil) continue;
       }
       let complete = meta.complete;
       let size = meta.size;

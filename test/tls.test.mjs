@@ -4,6 +4,7 @@
 // Modified 2026-10 by PLN: pin without a registry names only default (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a leading-zero serial stays a minimal INTEGER (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: file-URL import, and POSIX fixture skips (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: the Windows FIFO certificate is skipped (GPL-3.0; see NOTICE).
 
 /**
  * Self-signed server minted in this process. No committed key.
@@ -49,7 +50,7 @@ import {
 } from '../dist/tls.js';
 import { kvmdGet } from './hw/session.mjs';
 import { certificateSerial, mintCert, mintExpired, mintNode } from './tls-cert.mjs';
-import { exactModeAvailable, fifoAvailable, symlinkAvailable } from './posix-caps.mjs';
+import { WIN32_FIFO_SKIP, exactModeAvailable, fifoAvailable, symlinkAvailable } from './posix-caps.mjs';
 
 const REPO = join(fileURLToPath(import.meta.url), '..', '..');
 const right = mintCert();
@@ -370,7 +371,7 @@ describe('TLS config', () => {
     }
   });
 
-  test('pin requires a readable regular certificate and does not warn about mode', () => {
+  test('pin requires a readable regular certificate and does not warn about mode', async (t) => {
     const dir = mkdtempSync(join(tmpdir(), 'pikvm-tls-'));
     try {
       const missing = withEnv({
@@ -429,13 +430,17 @@ describe('TLS config', () => {
         oversize.restore();
       }
 
-      if (fifoAvailable()) {
+      await t.test('a FIFO certificate is rejected', {
+        skip: process.platform === 'win32'
+          ? WIN32_FIFO_SKIP
+          : (fifoAvailable() ? false : 'FIFO is not available on this platform'),
+      }, () => {
         const fifo = join(dir, 'fifo');
         execFileSync('mkfifo', [fifo]);
         const started = Date.now();
         assert.throws(() => readPinnedCert(fifo), /not a regular file/);
         assert.ok(Date.now() - started < 1000);
-      }
+      });
 
       const file = join(dir, 'leaf.pem');
       writeFileSync(file, right.cert, { mode: 0o644 });

@@ -5,6 +5,7 @@
 // Modified 2026-10 by PLN: systemd 0440 group-bit cases (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: credential skip boundaries and opened inode (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: decoy credential-root environment names (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: the Windows FIFO portion is skipped (GPL-3.0; see NOTICE).
 
 /**
  * resolveSecret order and file rules. Temp directories are removed.
@@ -26,7 +27,7 @@ import { BusyLock } from '../dist/pikvm/lock.js';
 import { createMcpServer } from '../dist/server.js';
 import { startHttpServer } from '../dist/http.js';
 import { startKvmdMock } from './kvmd-mock.mjs';
-import { exactModeAvailable, fifoAvailable, symlinkAvailable } from './posix-caps.mjs';
+import { WIN32_FIFO_SKIP, exactModeAvailable, fifoAvailable, symlinkAvailable } from './posix-caps.mjs';
 
 const REPO = join(fileURLToPath(import.meta.url), '..', '..');
 const SENTINEL = 'sentinel-9f3a2c7b-secret';
@@ -261,7 +262,7 @@ describe('resolveSecret', () => {
     }
   });
 
-  test('a directory or FIFO is rejected and a symlink to a file is ok', async () => {
+  test('a directory or FIFO is rejected and a symlink to a file is ok', async (t) => {
     const dir = await tempDir();
     try {
       const asDir = join(dir, 'not-a-file');
@@ -286,7 +287,11 @@ describe('resolveSecret', () => {
           /not a regular file/,
         );
       }
-      if (fifoAvailable()) {
+      await t.test('a FIFO is rejected', {
+        skip: process.platform === 'win32'
+          ? WIN32_FIFO_SKIP
+          : (fifoAvailable() ? false : 'FIFO is not available on this platform'),
+      }, () => {
         const fifo = join(dir, 'fifo');
         execFileSync('mkfifo', [fifo]);
         assert.throws(
@@ -298,7 +303,7 @@ describe('resolveSecret', () => {
           }),
           /not a regular file/,
         );
-      }
+      });
       if (symlinkAvailable()) {
         const real = join(dir, 'real');
         writeFileSync(real, 'by-symlink\n', { mode: 0o600 });
@@ -317,6 +322,10 @@ describe('resolveSecret', () => {
   });
 
   test('opening a FIFO does not block', async (t) => {
+    if (process.platform === 'win32') {
+      t.skip(WIN32_FIFO_SKIP);
+      return;
+    }
     if (!fifoAvailable()) {
       t.skip('FIFO is not available on this platform');
       return;

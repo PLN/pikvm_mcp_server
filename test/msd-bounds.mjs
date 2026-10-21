@@ -1,5 +1,6 @@
 // Modified 2026-10 by PLN: bounded MSD test teardown and fetch (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: caller locations, body timeouts, and teardown after a hang (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: stack frames keep a Windows drive letter (GPL-3.0; see NOTICE).
 
 /**
  * Ceilings for the MSD tests. Each subtest is finite and shorter than
@@ -207,15 +208,25 @@ function withTimeout(options) {
   return { ...options, timeout };
 }
 
+// A drive letter is `C:\` or `/C:/` after `file://`. `[^():]+` alone stops
+// at that colon and the helper frame is chosen instead of the caller.
+const STACK_FRAME = /\(?((?:file:\/\/)?(?:[A-Za-z]:[\\/]|\/[A-Za-z]:\/)?[^():]+):(\d+):(\d+)\)?$/;
+
+/** File, line, and column from one stack frame. Undefined when it has none. */
+export function stackFrameSite(frame) {
+  const match = String(frame).match(STACK_FRAME);
+  if (!match) return undefined;
+  let file = match[1];
+  if (file.startsWith('file://')) file = fileURLToPath(file);
+  return { file, line: Number(match[2]), column: Number(match[3]) };
+}
+
 function callerSite() {
   const frames = new Error().stack.split('\n').slice(1);
   for (const frame of frames) {
-    const match = frame.match(/\(?((?:file:\/\/)?[^():]+):(\d+):(\d+)\)?$/);
-    if (!match) continue;
-    let file = match[1];
-    if (file.startsWith('file://')) file = fileURLToPath(file);
-    if (file === here) continue;
-    return { file, line: Number(match[2]), column: Number(match[3]) };
+    const site = stackFrameSite(frame);
+    if (!site || site.file === here) continue;
+    return site;
   }
   return undefined;
 }
