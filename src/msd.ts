@@ -16,6 +16,9 @@
 // Modified 2026-10 by PLN: hash reads stop at the MSD job ceiling (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: hash timeout releases the upload slot before close (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: hash reads use the idle timeout (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: MSD progress windows (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: finalise window arms on request sent (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: upload finalise window is twice the idle timeout (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: catalog budgets use a monotonic clock (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a catalog read is not started with under 1 ms left (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: tests can see one catalog read and the upload slot (GPL-3.0; see NOTICE).
@@ -113,6 +116,8 @@ export interface ErrorFields {
   type: string;
   message: string;
   endpoint: string;
+  /** Set when a progress window produced PIKVM_MSD_STATE_UNKNOWN. */
+  phase?: 'finalise' | 'write_remote_headers';
 }
 
 /**
@@ -201,8 +206,10 @@ export class MsdHashTimeoutError extends Error {
 }
 
 /**
- * One hash read returned no bytes for PIKVM_MSD_IDLE_TIMEOUT_MS.
- * This is not the job wall clock. The upload POST is not sent.
+ * One hash read did not return within PIKVM_MSD_IDLE_TIMEOUT_MS.
+ * The limit includes time spent queued on the libuv threadpool.
+ * A read that returns 0 bytes ends the hash and does not trip this bound.
+ * This is not the job cap. The upload POST is not sent.
  * The slot is released without waiting for the file to close.
  * The descriptor is closed once no hash read is in flight.
  */
@@ -317,6 +324,7 @@ function errorFields(err: unknown): ErrorFields {
       type: err.type,
       message: redactUrl(err.message),
       endpoint: err.endpoint,
+      ...(err.phase ? { phase: err.phase } : {}),
     };
   }
   if (
@@ -1474,15 +1482,24 @@ async function runUpload(
 /**
  * Confine the path, then return a jobId. Hashing and the kvmd pre-check
  * run in the job (state hashing, then running, then awaiting_catalog).
- * Hashing stops at PIKVM_MSD_JOB_TIMEOUT_MS. That timer is not the
- * upload POST ceiling: the POST starts its own when hashing has finished.
- * On that hash timeout the upload slot is released without waiting for
- * the file close. The descriptor is closed from the in-flight read's
- * callback, or immediately when no read is in flight.
- * Each hash read also stops if it returns no bytes for
- * PIKVM_MSD_IDLE_TIMEOUT_MS. That bound resets when a read returns
- * bytes and does not cap total hash time. On that idle timeout the
- * slot is released the same way and the upload POST is not sent.
+ * PIKVM_MSD_JOB_TIMEOUT_MS is only a last-resort cap. Hashing stops at
+ * that cap. The timer is not the upload POST cap: the POST starts its
+ * own when hashing has finished. On that hash timeout the upload slot
+ * is released without waiting for the file close. The descriptor is
+ * closed from the in-flight read's callback, or immediately when no
+ * read is in flight.
+ * PIKVM_MSD_IDLE_TIMEOUT_MS bounds each hash read and the upload body.
+ * The upload finalise window is twice that value, from undici's
+ * onRequestSent until kvmd's response headers. The client cannot see
+ * when kvmd has read the bytes, only when they were handed to the
+ * socket, so the OS send buffer and the peer's receive window can still
+ * be draining. The 2× window allows for that drain. Stock kvmd nginx
+ * ends that phase after 60s. A hash read that does not return within
+ * the limit stops, threadpool queueing
+ * included. A read that returns 0 bytes ends the hash. The bound resets
+ * when a read returns and does not cap total hash time. On that idle
+ * timeout the slot is released the same way and the upload POST is not
+ * sent. The catalog wait uses PIKVM_MSD_READY_TIMEOUT_MS.
  * A sha256 mismatch fails the job and does not POST. A second upload
  * while one is running throws before it opens a file.
  */
@@ -1559,7 +1576,7 @@ export interface FetchRequest {
   extensions: readonly string[];
   allow: UrlAllowlist;
   allowPrivate: boolean;
-  /** kvmd downloader connect timeout in seconds. Not the job wall clock. */
+  /** kvmd downloader connect timeout in seconds. Not the job cap. */
   connectTimeoutSec: number;
   resolveUrl?: (hostname: string) => Promise<string[]>;
   /** Awaited in the job before DNS. Unset in production. */

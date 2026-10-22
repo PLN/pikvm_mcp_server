@@ -16,6 +16,9 @@
 // Modified 2026-10 by PLN: screenshot preview defaults (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: PIKVM_OCR_TIMEOUT_MS (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: hash reads use the idle timeout (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: MSD progress windows (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: finalise window arms on request sent (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: upload finalise window is twice the idle timeout (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: host OCR settings (GPL-3.0; see NOTICE).
 // Env read adapted from dtrukr/pikvm_mcp_server src/config.ts @ d120243 (GPL-3.0).
 
@@ -129,7 +132,7 @@ export interface MsdConfig {
   urlAllow: UrlAllowlist;
   /** Allows other private ranges. Never link-local, metadata, or Tailscale. */
   allowPrivate: boolean;
-  /** kvmd write_remote connect timeout in seconds. Not the job wall clock. */
+  /** kvmd write_remote connect timeout in seconds. Not the job cap. */
   connectTimeoutSec: number;
   /**
    * How long a successful write waits for that exact image to be
@@ -175,13 +178,24 @@ export interface Config {
     defaultKeymap: string;
     /** Abort deadline for one ordinary kvmd call, from PIKVM_REQUEST_TIMEOUT_MS. */
     requestTimeoutMs: number;
-    /** Wall clock for one MSD upload, from PIKVM_MSD_JOB_TIMEOUT_MS. Default 6 hours, max 7 days. */
+    /**
+     * Last-resort safety cap for one MSD upload or write_remote, from
+     * PIKVM_MSD_JOB_TIMEOUT_MS. Default 6 hours, max 7 days. 0 means the default.
+     * It is not the progress bound.
+     */
     msdJobTimeoutMs: number;
     /**
-     * Idle gap for an MSD upload body or progress stream, and the
-     * per-read no-progress bound while hashing a local file, from
-     * PIKVM_MSD_IDLE_TIMEOUT_MS. Default 60 seconds, max 1 hour.
-     * A hash read resets it when bytes return. It is not a total hash cap.
+     * Progress bound from PIKVM_MSD_IDLE_TIMEOUT_MS. Default 60 seconds,
+     * max 1 hour. Covers each hash read (a read that does not return,
+     * threadpool queueing included; a 0-byte read ends the hash), the
+     * upload body, write_remote headers (connect timeout plus this value),
+     * and the write_remote stream. Upload finalise, after the request is
+     * sent, is twice this value. The OS send buffer and the peer's receive
+     * window can still be draining after the bytes are handed to the socket,
+     * and the client cannot see when kvmd has read them. Stock kvmd nginx
+     * ends that phase after 60s. It does not cap a phase that keeps making
+     * progress. PIKVM_MSD_JOB_TIMEOUT_MS stays a last-resort safety cap.
+     * The catalog wait uses PIKVM_MSD_READY_TIMEOUT_MS.
      */
     msdIdleTimeoutMs: number;
     /** One OCR snapshot, from PIKVM_OCR_TIMEOUT_MS. Default 30s. Not retried on timeout. */

@@ -4,6 +4,9 @@
 // Modified 2026-10 by PLN: MSD catalog readiness budget (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: short confirm when an image never appeared (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: hash reads use the idle timeout (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: MSD progress windows (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: finalise window arms on request sent (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: upload finalise window is twice the idle timeout (GPL-3.0; see NOTICE).
 
 /** Default abort deadline for one ordinary kvmd call. */
 export const REQUEST_TIMEOUT_DEFAULT_MS = 5000;
@@ -41,9 +44,16 @@ export function parseRequestTimeoutMs(raw: string | undefined): number {
 export const MSD_JOB_TIMEOUT_DEFAULT_MS = 6 * 60 * 60 * 1000;
 
 /**
- * Idle gap while an MSD upload body or progress stream is moving.
- * Also the per-read no-progress bound while hashing a local file.
- * Not a cap on total hash time.
+ * Progress bound for each hash read, the upload body, and the
+ * write_remote stream. Upload finalise, armed when the request has been
+ * sent, is twice this value: the OS send buffer and the peer's receive
+ * window can still be draining after the bytes are handed to the socket,
+ * and the client cannot see when kvmd has read them. Stock kvmd nginx
+ * ends that phase after 60s. write_remote headers are the connect
+ * timeout plus this value. A hash read that does not return within the
+ * limit fails, threadpool queueing included. A 0-byte read ends the
+ * hash. Not a cap on a phase that keeps making progress. The catalog
+ * wait uses MSD_READY_TIMEOUT_DEFAULT_MS.
  */
 export const MSD_IDLE_TIMEOUT_DEFAULT_MS = 60 * 1000;
 
@@ -54,7 +64,7 @@ export const MSD_IDLE_TIMEOUT_DEFAULT_MS = 60 * 1000;
  */
 export const MSD_JOB_TIMEOUT_MAX_MS = 7 * 24 * 60 * 60 * 1000;
 
-/** One hour. Same timer limit as the job ceiling, on a shorter cap. */
+/** One hour. Same timer limit as the job cap, on a shorter cap. */
 export const MSD_IDLE_TIMEOUT_MAX_MS = 60 * 60 * 1000;
 
 /**

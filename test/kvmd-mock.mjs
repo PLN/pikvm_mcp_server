@@ -12,6 +12,8 @@
 // Modified 2026-10 by PLN: hold one streamer read so a capture can finish first (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: delay a fresh image in the MSD catalog (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a slow catalog read and a name that returns after remove (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: stall a write_remote stream after N lines (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: pace a write body (GPL-3.0; see NOTICE).
 
 /**
  * Minimal KVMD REST mock implementing exactly the routes src/pikvm/client.ts
@@ -30,8 +32,10 @@
  * the live drive. `uploads` records write bodies. `bytes` holds stored
  * image bytes. Options: `free`, `busyFor` (how many MSD mutations
  * answer MsdIsBusyError), `failMidWrite`, `failSetConnected`,
- * `legacyFreeShape`, `writeHoldMs`, `pauseWrite`, and `remote` (`lines`,
- * `chunks`, `gapMs`, `headerDelayMs`, `stallAfterHeadersMs`, `redirectTo`,
+ * `legacyFreeShape`, `writeHoldMs`, `pauseWrite`, `writePace`
+ * (`step`, `pauseMs`), and `remote` (`lines`,
+ * `chunks`, `gapMs`, `headerDelayMs`, `stallAfterHeadersMs`,
+ * `stallAfterLines` with `stallMs`, `redirectTo`,
  * `storeIncomplete`). `redirectTo` answers 302 and does not follow it.
  * An error line does not leave an image: kvmd removes the incomplete
  * file itself. `storeIncomplete` keeps that file so a test can see our remove.
@@ -147,6 +151,44 @@ async function sendRoute(req, res, route) {
   res.end(payload);
 }
 
+function readIncomingPaced(req, step, pauseMs, pace, onProgress) {
+  return new Promise((resolve) => {
+    const chunks = [];
+    let received = 0;
+    let since = 0;
+    let settled = false;
+    let hold = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolve(Buffer.concat(chunks));
+    };
+    const consider = () => {
+      if (settled || hold || since < step) return;
+      since -= step;
+      pace.pauses += 1;
+      hold = true;
+      req.pause();
+      setTimeout(() => {
+        hold = false;
+        if (req.destroyed || settled) return;
+        req.resume();
+        consider();
+      }, pauseMs);
+    };
+    req.on('data', (c) => {
+      chunks.push(c);
+      received += c.length;
+      since += c.length;
+      if (onProgress) onProgress(received);
+      consider();
+    });
+    req.on('end', finish);
+    req.on('error', finish);
+    req.on('close', finish);
+  });
+}
+
 function readIncoming(req, onProgress) {
   return new Promise((resolve) => {
     const chunks = [];
@@ -251,6 +293,7 @@ export async function startKvmdMock(options = {}) {
   let writeBusy = false;
   const bytes = new Map();
   const uploads = [];
+  const pace = { pauses: 0 };
   const state = {
     online: options.online !== false,
     busy: busyRemaining > 0,
@@ -582,9 +625,13 @@ export async function startKvmdMock(options = {}) {
       syncBusy();
       state.uploading = { name: image, size: declared, written: 0 };
       try {
-        const buf = await readIncoming(req, (n) => {
+        const onWritten = (n) => {
           if (state.uploading) state.uploading.written = n;
-        });
+        };
+        const paced = options.writePace;
+        const buf = paced
+          ? await readIncomingPaced(req, paced.step, paced.pauseMs, pace, onWritten)
+          : await readIncoming(req, onWritten);
         const full = buf.length === declared;
         uploads.push({
           image,
@@ -675,8 +722,12 @@ export async function startKvmdMock(options = {}) {
       }
       let remoteFailed = false;
       let remoteSize = 4;
+      let sentLines = 0;
       for (const line of lines) {
         if (remote.gapMs) await waitOrClose(req, remote.gapMs);
+        if (remote.stallAfterLines !== undefined && sentLines === remote.stallAfterLines) {
+          await waitOrClose(req, remote.stallMs ?? 60000);
+        }
         if (req.destroyed || res.writableEnded) return true;
         const text = String(line);
         try {
@@ -689,6 +740,7 @@ export async function startKvmdMock(options = {}) {
           // A non-JSON progress line is still forwarded.
         }
         res.write(text.endsWith('\n') ? text : `${text}\r\n`);
+        sentLines += 1;
       }
       if (!remoteFailed) {
         state.images[name] = imageMeta(name, remoteSize, true);
@@ -826,6 +878,7 @@ export async function startKvmdMock(options = {}) {
     state,
     bytes,
     uploads,
+    pace,
     url: `http://127.0.0.1:${port}`,
     close: () => new Promise((resolve) => {
       // A paused upload can leave the socket open after the client aborts.
