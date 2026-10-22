@@ -57,6 +57,7 @@ Modified 2026-10 by PLN: hash reads use the idle timeout (GPL-3.0; see below).
 Modified 2026-10 by PLN: MSD progress windows (GPL-3.0; see below).
 Modified 2026-10 by PLN: finalise window arms on request sent (GPL-3.0; see below).
 Modified 2026-10 by PLN: stock nginx does not pre-empt the finalise window (GPL-3.0; see below).
+Modified 2026-10 by PLN: a slow drain can end finalise with bytes in flight (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -1035,4 +1036,16 @@ No code from another pikvm_mcp_server fork was added for these methods.
   does not set those proxy timeouts. /api/msd/write_remote still sets
   proxy_read_timeout 7d. The idle default, the 2× finalise window, and
   the job cap are unchanged. There is no new environment variable.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  The client can only see bytes handed to the socket, not bytes that
+  kvmd has read. If the OS send buffer and the peer receive window take
+  longer than 2× PIKVM_MSD_IDLE_TIMEOUT_MS to drain, a very slow link
+  with a few MiB still buffered, the upload ends with
+  PIKVM_MSD_STATE_UNKNOWN, phase finalise, while bytes may still be in
+  flight. The image may be partial or complete, so re-read /api/msd and
+  do not resend. Raising PIKVM_MSD_IDLE_TIMEOUT_MS widens that window.
+  The idle default stays 60s, the finalise window stays twice that, and
+  the job cap stays 6 hours. There is no new environment variable.
   No code from another pikvm_mcp_server fork was copied.
