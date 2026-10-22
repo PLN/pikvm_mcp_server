@@ -58,6 +58,7 @@ Modified 2026-10 by PLN: MSD progress windows (GPL-3.0; see below).
 Modified 2026-10 by PLN: finalise window arms on request sent (GPL-3.0; see below).
 Modified 2026-10 by PLN: nginx 60s bounds kvmd's finish, not the drain (GPL-3.0; see below).
 Modified 2026-10 by PLN: the upload tool names the finalise drain limit (GPL-3.0; see below).
+Modified 2026-10 by PLN: onResponseStarted is counted through the interceptor (GPL-3.0; see below).
 Modified 2026-10 by PLN: a slow drain can end finalise with bytes in flight (GPL-3.0; see below).
 Modified 2026-10 by PLN: early headers leave the response idle timer in charge (GPL-3.0; see below).
 Modified 2026-10 by PLN: forward onResponseStarted (GPL-3.0; see below).
@@ -1075,6 +1076,13 @@ No code from another pikvm_mcp_server fork was added for these methods.
   The pikvm_msd_upload description adds one clause: if the buffered bytes
   take longer than 2× PIKVM_MSD_IDLE_TIMEOUT_MS to drain, the upload ends
   with PIKVM_MSD_STATE_UNKNOWN, phase finalise, while bytes may still be
-  in flight; re-read /api/msd and do not resend. No code logic, environment
+  in flight; re-read /api/msd and do not resend.   No code logic, environment
   variable, or default changed.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  The upload highWaterMark test counts onResponseStarted on a handler
+  wrapped outside the upload interceptor. The script calls the
+  interceptor's onResponseStarted once, and the count must be 1. A
+  forward that does not call the wrapped handler fails that test.
   No code from another pikvm_mcp_server fork was copied.
