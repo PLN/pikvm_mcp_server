@@ -14,6 +14,7 @@
 // Modified 2026-10 by PLN: a slow catalog read and a name that returns after remove (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: stall a write_remote stream after N lines (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: pace a write body (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: stream an upload response before the body is finished (GPL-3.0; see NOTICE).
 
 /**
  * Minimal KVMD REST mock implementing exactly the routes src/pikvm/client.ts
@@ -33,7 +34,8 @@
  * image bytes. Options: `free`, `busyFor` (how many MSD mutations
  * answer MsdIsBusyError), `failMidWrite`, `failSetConnected`,
  * `legacyFreeShape`, `writeHoldMs`, `pauseWrite`, `writePace`
- * (`step`, `pauseMs`), and `remote` (`lines`,
+ * (`step`, `pauseMs`), `writeEarlyStream` (`gapMs`, `gaps`, `leadMs`), and
+ * `remote` (`lines`,
  * `chunks`, `gapMs`, `headerDelayMs`, `stallAfterHeadersMs`,
  * `stallAfterLines` with `stallMs`, `redirectTo`,
  * `storeIncomplete`). `redirectTo` answers 302 and does not follow it.
@@ -186,6 +188,58 @@ function readIncomingPaced(req, step, pauseMs, pace, onProgress) {
     req.on('end', finish);
     req.on('error', finish);
     req.on('close', finish);
+  });
+}
+
+/**
+ * Headers and the first slice go out immediately, before `bodyReady`.
+ * After the request body has been read, `gaps` later slices follow, one
+ * `gapMs` apart. That tail is what a finalise window armed at
+ * onRequestSent would have to survive. Socket close stops the timer.
+ * The request's own close does not: Node emits it when the body has
+ * been consumed and the tail may still be streaming.
+ */
+function writeEarlyResponse(req, res, payload, gaps, gapMs, bodyReady) {
+  const bytes = Buffer.from(payload);
+  const piece = Math.max(1, Math.floor(bytes.length / (gaps + 1)));
+  return new Promise((resolve) => {
+    let offset = 0;
+    let waits = 0;
+    let settled = false;
+    let timer;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearInterval(timer);
+      req.socket?.off('close', finish);
+      resolve();
+    };
+    const writeMore = () => {
+      if (settled || res.destroyed || res.writableEnded || req.socket?.destroyed) {
+        finish();
+        return;
+      }
+      const last = waits >= gaps || offset >= bytes.length;
+      const end = last ? bytes.length : Math.min(bytes.length, offset + piece);
+      const next = bytes.subarray(offset, end);
+      offset = end;
+      if (last) {
+        res.end(next);
+        finish();
+        return;
+      }
+      res.write(next);
+      waits += 1;
+    };
+    res.writeHead(200, {
+      'Content-Type': 'application/json',
+      'Content-Length': bytes.length,
+    });
+    writeMore();
+    req.socket?.on('close', finish);
+    Promise.resolve(bodyReady).then(() => {
+      if (!settled) timer = setInterval(writeMore, gapMs);
+    });
   });
 }
 
@@ -628,6 +682,40 @@ export async function startKvmdMock(options = {}) {
         const onWritten = (n) => {
           if (state.uploading) state.uploading.written = n;
         };
+        const early = options.writeEarlyStream;
+        if (early) {
+          const gapMs = early.gapMs;
+          const gaps = early.gaps;
+          const leadMs = early.leadMs ?? 0;
+          const payload = JSON.stringify({
+            ok: true,
+            result: { image: { name: image, size: declared, written: declared } },
+          });
+          const bodyRead = (async () => {
+            if (leadMs > 0) await waitOrSocketClose(req, leadMs);
+            if (req.socket?.destroyed) return Buffer.alloc(0);
+            return readIncoming(req, onWritten);
+          })();
+          const streamed = writeEarlyResponse(req, res, payload, gaps, gapMs, bodyRead);
+          const buf = await bodyRead;
+          await streamed;
+          const full = buf.length === declared;
+          uploads.push({
+            image,
+            body: buf,
+            contentLength,
+            transferEncoding,
+            removeIncomplete,
+            complete: full,
+          });
+          if (full && !req.socket?.destroyed) {
+            state.images[image] = imageMeta(image, buf.length, true);
+            bytes.set(image, buf);
+            catalogFresh.add(image);
+            state.parts[''].free = Math.max(0, state.parts[''].free - buf.length);
+          }
+          return true;
+        }
         const paced = options.writePace;
         const buf = paced
           ? await readIncomingPaced(req, paced.step, paced.pauseMs, pace, onWritten)

@@ -58,6 +58,8 @@ Modified 2026-10 by PLN: MSD progress windows (GPL-3.0; see below).
 Modified 2026-10 by PLN: finalise window arms on request sent (GPL-3.0; see below).
 Modified 2026-10 by PLN: stock nginx does not pre-empt the finalise window (GPL-3.0; see below).
 Modified 2026-10 by PLN: a slow drain can end finalise with bytes in flight (GPL-3.0; see below).
+Modified 2026-10 by PLN: early headers leave the response idle timer in charge (GPL-3.0; see below).
+Modified 2026-10 by PLN: forward onResponseStarted (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -1048,4 +1050,17 @@ No code from another pikvm_mcp_server fork was added for these methods.
   do not resend. Raising PIKVM_MSD_IDLE_TIMEOUT_MS widens that window.
   The idle default stays 60s, the finalise window stays twice that, and
   the job cap stays 6 hours. There is no new environment variable.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  Response headers that arrive while the upload body is still being
+  sent are remembered. onRequestSent after that does not arm the
+  finalise window, so response chunks keep refreshing the idle timer.
+  A stream whose gaps stay under the idle timeout finishes, including
+  when it runs longer than twice that timeout. The upload progress
+  interceptor forwards onResponseStarted. Finalise is still armed from
+  onRequestSent, not from the local source ending, and Readable.from
+  still uses highWaterMark 1. The idle default stays 60s, the finalise
+  window stays twice that, and the job cap stays 6 hours. There is no
+  new environment variable.
   No code from another pikvm_mcp_server fork was copied.

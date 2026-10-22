@@ -9,6 +9,8 @@
 // Modified 2026-10 by PLN: MSD progress windows (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: finalise window arms on request sent (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: upload finalise window is twice the idle timeout (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: early upload headers keep the stream timer (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: finalise arms on request sent, and the upload highWaterMark is 1 (GPL-3.0; see NOTICE).
 
 /**
  * Plain kvmd MSD client methods against the mock. No MCP tools.
@@ -20,7 +22,7 @@ import { describe } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { Readable } from 'node:stream';
-import { Agent, request } from 'undici';
+import { Agent, Dispatcher, request } from 'undici';
 import { KvmdError, PiKVMClient, setDispatcherForTests } from '../dist/pikvm/client.js';
 import { startKvmdMock } from './kvmd-mock.mjs';
 import {
@@ -109,6 +111,58 @@ async function waitFor(fn, ms = 1000) {
   while (!fn()) {
     if (performance.now() - start > ms) return;
     await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+function rawJsonHeaders(payload) {
+  return [
+    Buffer.from('content-type'),
+    Buffer.from('application/json'),
+    Buffer.from('content-length'),
+    Buffer.from(String(payload.length)),
+  ];
+}
+
+function writeResultPayload(name, size) {
+  return Buffer.from(JSON.stringify({
+    ok: true,
+    result: { image: { name, size, written: size } },
+  }));
+}
+
+function finishScriptedWrite(handler, name, size) {
+  const payload = writeResultPayload(name, size);
+  handler.onRequestSent?.();
+  handler.onHeaders?.(200, rawJsonHeaders(payload), () => {}, 'OK');
+  handler.onData?.(payload);
+  handler.onComplete?.([]);
+}
+
+class ScriptedDispatcher extends Dispatcher {
+  constructor(run) {
+    super();
+    this.run = run;
+  }
+
+  dispatch(opts, handler) {
+    Promise.resolve()
+      .then(() => this.run(opts, handler))
+      .catch((err) => {
+        try {
+          handler.onError?.(err);
+        } catch {
+          // The request is already failing.
+        }
+      });
+    return true;
+  }
+
+  close() {
+    return Promise.resolve();
+  }
+
+  destroy() {
+    return Promise.resolve();
   }
 }
 
@@ -606,10 +660,10 @@ describe('MSD client', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
 
   msdTest('a slow multi-megabyte upload finishes inside the 2× finalise window', { timeout: 20000 }, async () => {
     // The peer reads one 512 KiB step, then waits. Eight waits are longer
-    // than one idle window and shorter than two. On a large send buffer
-    // onRequestSent is early, so that read is the drain after the body
-    // was handed to the socket. A 1× window would abort it. A small send
-    // buffer keeps the body timer re-arming and still finishes inside 2×.
+    // than one idle window and shorter than two. Finalise is armed when
+    // undici onRequestSent fires, after the body has been handed to the
+    // socket. Those waits are the drain that window covers. A 1× window
+    // would abort the upload.
     const size = 4 * 1024 * 1024;
     const step = 512 * 1024;
     const pauseMs = 120;
@@ -628,6 +682,158 @@ describe('MSD client', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
     assert.ok(paced < idleMs * 2, `paced reads ${paced}ms do not fit in the 2× window`);
     assert.ok(elapsed > idleMs, `upload finished inside one idle window (${elapsed}ms)`);
     assert.ok(elapsed < 8000, `upload hung (${elapsed}ms)`);
+  });
+
+  msdTest('early response headers leave the stream idle timer in charge', { timeout: 15000 }, async () => {
+    // Headers go out before the body has been read. The response then
+    // streams with gaps below the idle timeout, and the whole stream
+    // lasts longer than the 2× finalise window. A finalise window armed
+    // from onRequestSent after those headers would ignore the chunks.
+    const idleMs = 300;
+    const gapMs = 50;
+    const gaps = 16;
+    // A few MiB, so the socket write yields and undici can read the
+    // early headers before onRequestSent. The response tail starts
+    // after that handoff.
+    const size = 4 * 1024 * 1024;
+    const leadMs = 40;
+    assert.ok(gapMs < idleMs);
+    assert.ok(gaps * gapMs > idleMs * 2);
+    await withMock({ writeEarlyStream: { gapMs, gaps, leadMs } }, async (mock, client) => {
+      const result = await client.msdWrite('early.img', chunkedBody(size, 8 * 1024), size);
+      assert.equal(result.name, 'early.img');
+      assert.equal(result.written, size);
+      assert.equal(mock.uploads[0].body.length, size);
+    }, { msdJobTimeoutMs: 20000, msdIdleTimeoutMs: idleMs });
+  });
+
+  msdTest('finalise is armed on onRequestSent, not when the source ends', { timeout: 15000 }, async () => {
+    // The script reads the whole source, then keeps handing chunks to
+    // the socket for longer than 2× idle, and only then calls
+    // onRequestSent. Arming finalise at source end would ignore those
+    // handoffs and abort. Arming it on onRequestSent lets the upload
+    // finish as soon as that call is made.
+    const idleMs = 200;
+    const gapMs = 40;
+    const holdMs = idleMs * 2 + 250;
+    const size = 8;
+    const name = 'sent.img';
+    assert.ok(gapMs < idleMs);
+    assert.ok(holdMs > idleMs * 2);
+    await withMock({}, async (_mock, client) => {
+      const dispatcher = new ScriptedDispatcher(async (opts, handler) => {
+        let aborted = false;
+        let pulse;
+        handler.onConnect?.((err) => {
+          aborted = true;
+          clearInterval(pulse);
+          handler.onError?.(err);
+        }, null);
+        for await (const chunk of opts.body) {
+          if (aborted) return;
+          void chunk;
+        }
+        if (aborted) return;
+        const bump = () => {
+          if (!aborted) handler.onBodySent?.(Buffer.alloc(1));
+        };
+        bump();
+        pulse = setInterval(bump, gapMs);
+        await new Promise((resolve) => setTimeout(resolve, holdMs));
+        clearInterval(pulse);
+        if (aborted) return;
+        finishScriptedWrite(handler, name, size);
+      });
+      setDispatcherForTests(client, dispatcher);
+      try {
+        const result = await client.msdWrite(name, chunkedBody(size, 1), size);
+        assert.equal(result.name, name);
+        assert.equal(result.written, size);
+      } finally {
+        await dispatcher.close();
+      }
+    }, { msdJobTimeoutMs: 20000, msdIdleTimeoutMs: idleMs });
+  });
+
+  msdTest('the upload readable stays at highWaterMark 1', { timeout: 15000 }, async () => {
+    // Pausing the wrapper after one chunk shows how far Readable.from
+    // pulled the source. highWaterMark 1 stays within a few chunks.
+    // The object-mode default of 16 pulls a full window ahead.
+    const chunkSize = 64 * 1024;
+    const total = 24;
+    const state = { pulls: 0, onResponseStarted: 'missing' };
+    const source = new Readable({
+      highWaterMark: 1,
+      read() {
+        if (state.pulls >= total) {
+          this.push(null);
+          return;
+        }
+        state.pulls += 1;
+        this.push(Buffer.alloc(chunkSize, 1));
+      },
+    });
+    let release;
+    const paused = new Promise((resolve) => {
+      release = resolve;
+    });
+    let resumeFlow;
+    const resumed = new Promise((resolve) => {
+      resumeFlow = resolve;
+    });
+    await withMock({}, async (_mock, client) => {
+      const dispatcher = new ScriptedDispatcher(async (opts, handler) => {
+        state.onResponseStarted = typeof handler.onResponseStarted;
+        state.hwm = opts.body?.readableHighWaterMark;
+        state.objectMode = opts.body?.readableObjectMode;
+        if (typeof handler.onResponseStarted === 'function') handler.onResponseStarted();
+        let aborted = false;
+        handler.onConnect?.((err) => {
+          aborted = true;
+          handler.onError?.(err);
+        }, null);
+        const body = opts.body;
+        body.once('data', () => {
+          body.pause();
+          release();
+        });
+        body.resume();
+        await resumed;
+        if (aborted) return;
+        for await (const chunk of body) {
+          if (aborted) return;
+          void chunk;
+        }
+        if (aborted) return;
+        finishScriptedWrite(handler, 'hwm.img', total * chunkSize);
+      });
+      setDispatcherForTests(client, dispatcher);
+      const pending = client.msdWrite('hwm.img', source, total * chunkSize);
+      let assertError;
+      try {
+        await paused;
+        await new Promise((resolve) => setImmediate(resolve));
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(state.onResponseStarted, 'function');
+        assert.equal(state.objectMode, true);
+        assert.equal(state.hwm, 1);
+        assert.ok(state.pulls >= 1, 'source was not read');
+        assert.ok(state.pulls <= 8, `source ran ahead by ${state.pulls} chunks`);
+      } catch (err) {
+        assertError = err;
+      } finally {
+        resumeFlow();
+      }
+      try {
+        const result = await pending;
+        if (!assertError) {
+          assert.equal(result.written, total * chunkSize);
+        }
+      } finally {
+        await dispatcher.close();
+      }
+      if (assertError) throw assertError;
+    }, { msdJobTimeoutMs: 20000, msdIdleTimeoutMs: 10000 });
   });
 
   msdTest('the job cap stops a steadily trickled upload body', { timeout: 15000 }, async () => {
