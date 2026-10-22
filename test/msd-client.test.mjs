@@ -11,6 +11,7 @@
 // Modified 2026-10 by PLN: upload finalise window is twice the idle timeout (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: early upload headers keep the stream timer (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: finalise arms on request sent, and the upload highWaterMark is 1 (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: onResponseStarted is counted through the interceptor (GPL-3.0; see NOTICE).
 
 /**
  * Plain kvmd MSD client methods against the mock. No MCP tools.
@@ -761,7 +762,7 @@ describe('MSD client', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
     // The object-mode default of 16 pulls a full window ahead.
     const chunkSize = 64 * 1024;
     const total = 24;
-    const state = { pulls: 0, onResponseStarted: 'missing' };
+    const state = { pulls: 0, responseStarted: 0 };
     const source = new Readable({
       highWaterMark: 1,
       read() {
@@ -783,10 +784,12 @@ describe('MSD client', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
     });
     await withMock({}, async (_mock, client) => {
       const dispatcher = new ScriptedDispatcher(async (opts, handler) => {
-        state.onResponseStarted = typeof handler.onResponseStarted;
         state.hwm = opts.body?.readableHighWaterMark;
         state.objectMode = opts.body?.readableObjectMode;
-        if (typeof handler.onResponseStarted === 'function') handler.onResponseStarted();
+        // The handler here is the interceptor's wrapper. Calling
+        // onResponseStarted must reach the spy wrapped around the
+        // inner handler, once.
+        handler.onResponseStarted?.();
         let aborted = false;
         handler.onConnect?.((err) => {
           aborted = true;
@@ -807,6 +810,32 @@ describe('MSD client', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
         if (aborted) return;
         finishScriptedWrite(handler, 'hwm.img', total * chunkSize);
       });
+      // The client composes the upload interceptor around this dispatcher.
+      // The spy is outside that interceptor, so onResponseStarted is counted
+      // only when the interceptor forwards the call.
+      dispatcher.compose = function compose(...interceptors) {
+        const spy = (dispatch) => (opts, handler) => {
+          const next = handler;
+          const wrapped = {
+            onConnect: (abort, context) => next.onConnect?.(abort, context),
+            onError: (err) => next.onError?.(err),
+            onUpgrade: (statusCode, rawHeaders, socket) => next.onUpgrade?.(statusCode, rawHeaders, socket),
+            onResponseStarted: () => {
+              state.responseStarted += 1;
+              return next.onResponseStarted?.();
+            },
+            onHeaders: (statusCode, rawHeaders, resume, statusMessage) => (
+              next.onHeaders?.(statusCode, rawHeaders, resume, statusMessage)
+            ),
+            onData: (chunk) => next.onData?.(chunk),
+            onComplete: (trailers) => next.onComplete?.(trailers),
+            onBodySent: (chunk) => next.onBodySent?.(chunk),
+            onRequestSent: () => next.onRequestSent?.(),
+          };
+          return dispatch(opts, wrapped);
+        };
+        return Dispatcher.prototype.compose.call(this, ...interceptors, spy);
+      };
       setDispatcherForTests(client, dispatcher);
       const pending = client.msdWrite('hwm.img', source, total * chunkSize);
       let assertError;
@@ -814,7 +843,7 @@ describe('MSD client', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
         await paused;
         await new Promise((resolve) => setImmediate(resolve));
         await new Promise((resolve) => setImmediate(resolve));
-        assert.equal(state.onResponseStarted, 'function');
+        assert.equal(state.responseStarted, 1);
         assert.equal(state.objectMode, true);
         assert.equal(state.hwm, 1);
         assert.ok(state.pulls >= 1, 'source was not read');

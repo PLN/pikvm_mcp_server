@@ -7,7 +7,7 @@
 // Modified 2026-10 by PLN: MSD progress windows (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: finalise window arms on request sent (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: upload finalise window is twice the idle timeout (GPL-3.0; see NOTICE).
-// Modified 2026-10 by PLN: stock nginx does not pre-empt the finalise window (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: nginx 60s bounds kvmd's finish, not the drain (GPL-3.0; see NOTICE).
 
 /** Default abort deadline for one ordinary kvmd call. */
 export const REQUEST_TIMEOUT_DEFAULT_MS = 5000;
@@ -49,10 +49,11 @@ export const MSD_JOB_TIMEOUT_DEFAULT_MS = 6 * 60 * 60 * 1000;
  * write_remote stream. Upload finalise, armed when the request has been
  * sent, is twice this value: the OS send buffer and the peer's receive
  * window can still be draining after the bytes are handed to the socket,
- * and the client cannot see when kvmd has read them. Stock nginx does not
- * pre-empt that window: proxy_read_timeout starts only after nginx has
- * finished sending the request body upstream, and client_body_timeout is
- * a per-read gap on the client side. write_remote headers are the connect
+ * and the client cannot see when kvmd has read them. nginx's 60s
+ * proxy_read_timeout starts only after the whole body has gone upstream,
+ * so it bounds kvmd's own finish (a 504, reported as
+ * PIKVM_MSD_STATE_UNKNOWN), not the drain, which can use the full 120s.
+ * write_remote headers are the connect
  * timeout plus this value. A hash read that does not return within the
  * limit fails, threadpool queueing included. A 0-byte read ends the
  * hash. Not a cap on a phase that keeps making progress. The catalog
