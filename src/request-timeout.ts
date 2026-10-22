@@ -5,6 +5,7 @@
 // Modified 2026-10 by PLN: short confirm when an image never appeared (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: hash reads use the idle timeout (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: MSD progress windows (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: finalise window arms on request sent (GPL-3.0; see NOTICE).
 
 /** Default abort deadline for one ordinary kvmd call. */
 export const REQUEST_TIMEOUT_DEFAULT_MS = 5000;
@@ -42,8 +43,9 @@ export function parseRequestTimeoutMs(raw: string | undefined): number {
 export const MSD_JOB_TIMEOUT_DEFAULT_MS = 6 * 60 * 60 * 1000;
 
 /**
- * Progress bound for each hash read, the upload body, upload finalise,
- * write_remote headers (connect timeout plus this value), and the
+ * Progress bound for each hash read, the upload body, upload finalise
+ * (armed when the request has been sent), write_remote headers (connect
+ * timeout plus this value), and the
  * write_remote stream. A hash read that does not return within the
  * limit fails, threadpool queueing included. A 0-byte read ends the
  * hash. Not a cap on a phase that keeps making progress. The catalog

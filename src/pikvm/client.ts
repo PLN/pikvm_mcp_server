@@ -21,6 +21,8 @@
 // Modified 2026-10 by PLN: hash reads use the MSD job ceiling (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: hash reads use the idle timeout (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: MSD progress windows (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: finalise window arms on request sent (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: slow uploads leave the receive window room to drain (GPL-3.0; see NOTICE).
 // AbortSignal.timeout and PIKVM_UNREACHABLE / PIKVM_AUTH_FAILED no-retry codes
 // adapted from dtrukr/pikvm_mcp_server src/pikvm/client.ts @ d120243 (GPL-3.0).
 // Snapshot HTTP 503 retry-once adapted from dvaerum/pikvm_mcp_server
@@ -40,11 +42,23 @@
 // timer is stopped by this cap, not by the idle timer.
 // PIKVM_MSD_IDLE_TIMEOUT_MS (default 60 seconds, max 1 hour) is the
 // progress bound for every moving phase: each local hash read, the upload
-// body, the upload finalise wait after the body ends until response
-// headers, the write_remote wait for response headers (connect timeout in
-// ms plus this idle value, from when the request is sent), and each gap in
-// the write_remote NDJSON stream. The final progress line is one more
-// chunk of that stream, so the per-chunk idle bound already covers it.
+// body, the upload finalise wait, the write_remote wait for response
+// headers (connect timeout in ms plus this idle value, from when the
+// request is sent), and each gap in the write_remote NDJSON stream.
+// The upload body timer re-arms from undici handler onBodySent: a chunk
+// handed to the socket, not a chunk yielded by the local source.
+// The finalise window is that same idle timeout, armed from handler
+// onRequestSent, when undici has finished handing the body to the socket,
+// and cleared when response headers arrive. Readable.from uses
+// highWaterMark 1 so the source stays within one chunk of that handoff.
+// The upload socket sets a small SO_SNDBUF, so the kernel send queue
+// cannot hide a multi-megabyte body. A slow peer still
+// advertises a receive window of about a megabyte. After four consecutive
+// onBodySent gaps of 20ms or more, later large chunks are paced at twice
+// that gap so the window can empty, and the idle finalise window covers
+// what is left. A fast peer does not keep such a streak and is not delayed.
+// The final progress line is one more chunk of the write_remote stream, so the
+// per-chunk idle bound already covers it.
 // The catalog wait does not use this value. It uses
 // PIKVM_MSD_READY_TIMEOUT_MS. A hash read that does not return within the
 // idle limit, threadpool queueing included, fails with
@@ -53,17 +67,25 @@
 // a read returns and does not cap total hash time.
 // AbortSignal.timeout is not used: above 2^32-1 it throws
 // RangeError, and a delay of 2^31 or more makes the timer fire after 1 ms.
-// Checked on undici 7.24.1: headersTimeout does not abort a request body
-// that is still being written without socket backpressure. writer.end()
-// refreshes it, so after the body it is only the wait for response
-// headers. For an upload it is set to the idle timeout, the same length
-// as the finalise window. For write_remote, which has no body, it is the
-// header window (connect timeout plus idle). bodyTimeout starts after
-// response headers and resets on each response chunk, and stays the idle
-// timeout. headersTimeout and bodyTimeout use undici's fast timer (about
-// a 0.5s tick, including delays under 1s). The AbortSignal progress timer
-// is a native setTimeout of the same length, so it fires first and is the
-// error path. The job AbortSignal remains the hard ceiling.
+// Checked on undici 7.24.1: headersTimeout does not follow per-chunk send
+// progress. It refreshes when socket.write returns false, and again in
+// writer.end(), which is the same moment as onRequestSent and is still
+// before the kernel send buffer has drained. A headersTimeout equal to
+// the idle window therefore aborts a slow steady upload. An upload sets
+// it to PIKVM_MSD_JOB_TIMEOUT_MS. That is defence in depth beside the job
+// AbortSignal, not the finalise bound. The native onBodySent and
+// onRequestSent timers are the body and finalise bounds. write_remote has
+// no body, so its headersTimeout is the header window (connect timeout
+// plus idle). bodyTimeout starts after response headers, resets on each
+// response chunk, and stays the idle timeout.
+// headersTimeout and bodyTimeout are scheduled with setFastTimeout, so
+// they are FastTimers (about a 499ms tick) at every delay, including
+// delays of 1000ms or less. undici's timers.setTimeout uses a native
+// timer when the delay is 1000ms or less and a FastTimer above that; the
+// header and body timers do not use that helper. The progress timers are
+// native setTimeout. On an upload the headers timer is the job cap, so
+// the shorter native finalise timer is the one that fires. The job
+// AbortSignal remains the hard ceiling.
 // Per kvmd's shipped nginx config, location /api/msd/write does not set
 // proxy_read_timeout or proxy_send_timeout (loc-bigpost.conf only lifts
 // the body size and turns request buffering off), so nginx's 60s defaults
@@ -158,11 +180,13 @@ export interface PiKVMConfig {
    */
   msdJobTimeoutMs?: number;
   /**
-   * Progress bound for each hash read, the upload body, upload finalise,
-   * write_remote response headers (connect timeout plus this value), and
-   * the write_remote stream. Default 60 seconds. A hash read that does
-   * not return within the limit fails. A 0-byte read ends the hash.
-   * The catalog wait uses PIKVM_MSD_READY_TIMEOUT_MS, not this value.
+   * Progress bound for each hash read, the upload body (re-armed when a
+   * chunk is handed to the socket), upload finalise (armed when undici
+   * reports the request sent), write_remote response headers (connect
+   * timeout plus this value), and the write_remote stream. Default 60
+   * seconds. A hash read that does not return within the limit fails. A
+   * 0-byte read ends the hash. The catalog wait uses
+   * PIKVM_MSD_READY_TIMEOUT_MS, not this value.
    */
   msdIdleTimeoutMs?: number;
   /** One OCR snapshot. Default 30000. A timeout is not retried. */
@@ -306,6 +330,9 @@ export interface CalibrationResult {
  * `message` is kvmd's `error_msg` after secret redaction. `endpoint` is
  * the method and path with no query string.
  */
+/** Which progress window produced a PIKVM_MSD_STATE_UNKNOWN timeout. */
+export type MsdWindowPhase = 'finalise' | 'write_remote_headers';
+
 export class KvmdError extends Error {
   readonly status: number;
   readonly type: string;
@@ -317,13 +344,27 @@ export class KvmdError extends Error {
    */
   readonly preSend: boolean;
 
-  constructor(status: number, type: string, message: string, endpoint: string, preSend = false) {
+  /**
+   * Set on the upload finalise window and the write_remote header window.
+   * The `type` stays PIKVM_MSD_STATE_UNKNOWN.
+   */
+  readonly phase?: MsdWindowPhase;
+
+  constructor(
+    status: number,
+    type: string,
+    message: string,
+    endpoint: string,
+    preSend = false,
+    phase?: MsdWindowPhase,
+  ) {
     super(message);
     this.name = 'KvmdError';
     this.status = status;
     this.type = type;
     this.endpoint = endpoint;
     this.preSend = preSend;
+    if (phase !== undefined) this.phase = phase;
   }
 }
 
@@ -641,6 +682,8 @@ function msdFinaliseTimeout(idleMs: number, endpoint: string): KvmdError {
     'PIKVM_MSD_STATE_UNKNOWN',
     `timed out after ${idleMs}ms waiting for kvmd to finish the write (PIKVM_MSD_IDLE_TIMEOUT_MS); ${MSD_STATE_UNKNOWN_MESSAGE}`,
     endpoint,
+    false,
+    'finalise',
   );
 }
 
@@ -654,6 +697,8 @@ function msdHeaderWindowTimeout(headerMs: number, endpoint: string): KvmdError {
     'PIKVM_MSD_STATE_UNKNOWN',
     `timed out after ${headerMs}ms waiting for write_remote response headers (connect timeout + PIKVM_MSD_IDLE_TIMEOUT_MS); ${MSD_STATE_UNKNOWN_MESSAGE}`,
     endpoint,
+    false,
+    'write_remote_headers',
   );
 }
 
@@ -804,21 +849,72 @@ function readWriteImage(result: unknown): MsdWriteResult | null {
 }
 
 /**
- * Pulls `source` for undici. Each chunk refreshes the body progress timer.
- * When the source ends, the finalise window (the same idle timeout) is
- * armed until response headers arrive. A source error disarms it: that
- * failure is not a finalise timeout.
+ * Pulls `source` for undici. Does not arm timers: the body timer follows
+ * onBodySent, and the finalise window follows onRequestSent. A source
+ * error disarms the body timer so that failure is not an idle timeout.
+ * highWaterMark 1 keeps the source within one chunk of what undici has
+ * pulled. The default of 16 would buffer about 1 MiB at 64 KiB and let
+ * the source end while the body was still queued.
  */
 interface MsdWatch {
   sourceError: boolean;
 }
 
+/**
+ * Peer send gap, excluding time this generator waited on purpose.
+ * `paceGapMs` latches after four consecutive slow gaps and then stays.
+ * A fast upload can have a single slow gap; it does not latch.
+ */
+interface UploadSendPace {
+  lastSentAt: number;
+  sleptMs: number;
+  slowStreak: number;
+  paceGapMs: number;
+}
+
+function noteUploadBodySent(pace: UploadSendPace): void {
+  const now = performance.now();
+  if (pace.lastSentAt !== 0) {
+    const gap = now - pace.lastSentAt - pace.sleptMs;
+    if (gap >= 20 && gap <= 60_000) {
+      pace.slowStreak += 1;
+      if (pace.slowStreak >= 4) pace.paceGapMs = Math.min(500, Math.max(pace.paceGapMs, gap));
+    } else if (gap >= 0) {
+      pace.slowStreak = 0;
+    }
+  }
+  pace.lastSentAt = now;
+  pace.sleptMs = 0;
+}
+
+function chunkByteLength(chunk: unknown): number {
+  if (typeof chunk === 'string') return Buffer.byteLength(chunk);
+  if (Buffer.isBuffer(chunk) || chunk instanceof Uint8Array) return chunk.byteLength;
+  return 0;
+}
+
+/**
+ * Wait, if any, before yielding a large chunk. A fast peer stays under
+ * the 20ms gap and is not delayed. The wait is at most half the idle
+ * window so it cannot trip that window by itself.
+ */
+function uploadPaceDelayMs(pace: UploadSendPace, byteLength: number, idleMs: number): number {
+  if (byteLength < 16 * 1024 || pace.lastSentAt === 0) return 0;
+  if (pace.paceGapMs < 20) return 0;
+  const elapsed = performance.now() - pace.lastSentAt;
+  // Twice the latched gap, minus time already spent waiting for the
+  // socket, so a full receive window drains instead of staying full.
+  const want = pace.paceGapMs * 2 - elapsed;
+  if (want < 5) return 0;
+  return Math.min(want, 50, Math.max(0, idleMs / 2));
+}
+
 function trackUpload(
   source: Readable,
-  bump: () => void,
-  armFinalise: () => void,
   disarm: () => void,
   watch: MsdWatch,
+  pace: UploadSendPace,
+  idleMs: number,
 ): Readable {
   // Set the flag from the source only. The wrapper's own failure is how
   // undici 7.24.1 reports an abort or reset while kvmd is not reading, and
@@ -831,16 +927,73 @@ function trackUpload(
     let finished = false;
     try {
       for await (const chunk of source) {
-        bump();
+        const delay = uploadPaceDelayMs(pace, chunkByteLength(chunk), idleMs);
+        if (delay > 0) {
+          pace.sleptMs += delay;
+          await new Promise((resolve) => setTimeout(resolve, delay));
+        }
         yield chunk;
       }
       finished = true;
     } finally {
       source.off('error', onSourceError);
-      if (finished) armFinalise();
-      else disarm();
+      if (!finished) disarm();
     }
-  }());
+  }(), { highWaterMark: 1 });
+}
+
+/**
+ * undici 7.24.1 calls handler.onBodySent(chunk) from socket.write and
+ * handler.onRequestSent from writer.end(). Neither is on the public
+ * request() options. A compose interceptor sees the handler after
+ * WrapHandler and before UnwrapHandler, and a handler without
+ * onRequestStart is passed through, so these two methods reach the
+ * socket writer. The kernel send buffer can still drain after
+ * onRequestSent.
+ */
+interface UploadProgressHandler {
+  onConnect?: (abort: (err?: Error) => void, context: unknown) => void;
+  onError?: (err: Error) => void;
+  onUpgrade?: (statusCode: number, rawHeaders: Buffer[] | string[] | null, socket: unknown) => void;
+  onHeaders?: (
+    statusCode: number,
+    rawHeaders: Buffer[],
+    resume: () => void,
+    statusMessage: string,
+  ) => boolean | void;
+  onData?: (chunk: Buffer) => boolean | void;
+  onComplete?: (trailers: string[] | null) => void;
+  onBodySent?: (chunk: unknown) => void;
+  onRequestSent?: () => void;
+}
+
+function uploadProgressInterceptor(
+  progress: { onBodySent: () => void; onRequestSent: () => void },
+): Dispatcher.DispatcherComposeInterceptor {
+  return (dispatch) => (opts, handler) => {
+    // The published onConnect type takes one argument. The runtime passes
+    // the request context as the second, and WrapHandler forwards it.
+    const next = handler as UploadProgressHandler;
+    const wrapped: UploadProgressHandler = {
+      onConnect: (abort, context) => next.onConnect?.(abort, context),
+      onError: (err) => next.onError?.(err),
+      onUpgrade: (statusCode, rawHeaders, socket) => next.onUpgrade?.(statusCode, rawHeaders, socket),
+      onHeaders: (statusCode, rawHeaders, resume, statusMessage) => (
+        next.onHeaders?.(statusCode, rawHeaders, resume, statusMessage)
+      ),
+      onData: (chunk) => next.onData?.(chunk),
+      onComplete: (trailers) => next.onComplete?.(trailers),
+      onBodySent: (chunk) => {
+        progress.onBodySent();
+        return next.onBodySent?.(chunk);
+      },
+      onRequestSent: () => {
+        progress.onRequestSent();
+        return next.onRequestSent?.();
+      },
+    };
+    return dispatch(opts, wrapped as unknown as Dispatcher.DispatchHandler);
+  };
 }
 
 /** Which progress timer is armed. `off` means none. */
@@ -850,7 +1003,7 @@ interface MsdDeadline {
   signal: AbortSignal;
   /** Refresh the body or stream progress timer. Length is the idle timeout. */
   arm: () => void;
-  /** Body finished. Arm the finalise window until response headers. */
+  /** undici has handed the whole body to the socket. Arm finalise until headers. */
   armFinalise: () => void;
   /**
    * No request body. Arm the header window from now until response headers.
@@ -896,6 +1049,10 @@ function startMsdDeadline(jobMs: number, idleMs: number): MsdDeadline {
     }, ms);
   };
   const arm = () => {
+    // A body refresh must not replace the finalise or header window.
+    // onRequestSent follows the last onBodySent in the same turn when the
+    // last write did not block, and a late bump would cancel finalise.
+    if (phase === 'finalise' || phase === 'headers') return;
     // A refresh during the body stays on the body. After headers, or
     // once the body timer has been cleared, progress is the response stream.
     schedule(idleMs, phase === 'body' ? 'body' : 'stream');
@@ -992,10 +1149,11 @@ export function msdJobTimeoutOf(client: PiKVMClient): number {
  * Resolved PIKVM_MSD_IDLE_TIMEOUT_MS for this client.
  * Hashing uses it as the per-read bound. A read that does not return
  * within the limit fails, threadpool queueing included. A 0-byte read
- * ends the hash. The upload body, upload finalise, write_remote headers
- * (connect timeout plus this value), and the write_remote stream use the
- * same value. It does not cap a phase that keeps making progress, and it
- * does not bound the catalog wait.
+ * ends the hash. The upload body (onBodySent), upload finalise
+ * (onRequestSent), write_remote headers (connect timeout plus this
+ * value), and the write_remote stream use the same value. It does not
+ * cap a phase that keeps making progress, and it does not bound the
+ * catalog wait.
  */
 export function msdIdleTimeoutOf(client: PiKVMClient): number {
   return msdIdleTimeouts.get(client) ?? MSD_IDLE_TIMEOUT_DEFAULT_MS;
@@ -2068,10 +2226,15 @@ export class PiKVMClient {
   ): Promise<{ statusCode: number; result: unknown }> {
     let deadline: MsdDeadline | undefined;
     let responseBody: AsyncIterable<Uint8Array> | undefined;
+    let uploadAgent: Agent | undefined;
     const watch: MsdWatch = { sourceError: false };
     try {
       deadline = startMsdDeadline(this.config.msdJobTimeoutMs, this.config.msdIdleTimeoutMs);
-      const response = await this.msdDispatch(path, endpoint, body, size, deadline, watch);
+      if (body !== undefined && size !== undefined && !testDispatchers.has(this)) {
+        // Own agent so the small send buffer is not applied to ordinary calls.
+        uploadAgent = createKvmdAgent(this.config, { limitSendBuffer: true });
+      }
+      const response = await this.msdDispatch(path, endpoint, body, size, deadline, watch, undefined, uploadAgent);
       responseBody = response.body;
       deadline.arm();
       const text = await this.readUploadText(response.body, deadline);
@@ -2103,6 +2266,13 @@ export class PiKVMClient {
     } finally {
       deadline?.done();
       await this.dumpBody(responseBody);
+      if (uploadAgent) {
+        try {
+          await uploadAgent.close();
+        } catch {
+          // The socket is already closed.
+        }
+      }
     }
   }
 
@@ -2114,6 +2284,7 @@ export class PiKVMClient {
     deadline: MsdDeadline,
     watch: MsdWatch | undefined,
     headerWindowMs?: number,
+    uploadAgent?: Agent,
   ): Promise<{ statusCode: number; body: AsyncIterable<Uint8Array> & { destroy?: () => void; text?: () => Promise<string> } }> {
     const url = new URL(`/api${path}`, this.config.host);
     const headers: Record<string, string> = {
@@ -2121,21 +2292,31 @@ export class PiKVMClient {
       'X-KVMD-Passwd': this.config.password,
     };
     let upload: Readable | undefined;
-    // Upload: headersTimeout matches the finalise window. undici refreshes
-    // it when the body ends and does not apply it while the body is still
-    // being written without backpressure. write_remote has no body, so
-    // headersTimeout is the header window from send until headers.
+    // Upload headersTimeout is the job cap, not the idle window. undici
+    // refreshes it only when socket.write returns false and again in
+    // writer.end() (onRequestSent). That is defence in depth beside the
+    // job AbortSignal: onBodySent is the body bound and onRequestSent is
+    // the finalise bound. The upload socket's send buffer is kept small
+    // so those events track acknowledgements. The peer's receive window
+    // can still be draining after onRequestSent; pacing a slow peer and
+    // the idle finalise window cover it.
+    // write_remote has no body, so its headersTimeout is the header window
+    // from send until headers.
+    let dispatcher: Dispatcher = uploadAgent ?? testDispatchers.get(this) ?? this.dispatcher;
     let headersTimeout = this.config.msdIdleTimeoutMs;
     if (body !== undefined && size !== undefined) {
       headers['content-length'] = String(size);
       headers['content-type'] = 'application/octet-stream';
-      upload = trackUpload(
-        body,
-        deadline.arm,
-        deadline.armFinalise,
-        deadline.disarm,
-        watch ?? { sourceError: false },
-      );
+      const pace: UploadSendPace = { lastSentAt: 0, sleptMs: 0, slowStreak: 0, paceGapMs: 0 };
+      upload = trackUpload(body, deadline.disarm, watch ?? { sourceError: false }, pace, this.config.msdIdleTimeoutMs);
+      headersTimeout = this.config.msdJobTimeoutMs;
+      dispatcher = dispatcher.compose(uploadProgressInterceptor({
+        onBodySent: () => {
+          noteUploadBodySent(pace);
+          deadline.arm();
+        },
+        onRequestSent: () => deadline.armFinalise(),
+      }));
     } else {
       const windowMs = headerWindowMs ?? this.config.msdIdleTimeoutMs;
       deadline.armHeaderWindow(windowMs);
@@ -2148,7 +2329,7 @@ export class PiKVMClient {
         method: 'POST' as const,
         headers,
         body: upload,
-        dispatcher: testDispatchers.get(this) ?? this.dispatcher,
+        dispatcher,
         headersTimeout,
         bodyTimeout: this.config.msdIdleTimeoutMs,
         signal: deadline.signal,
@@ -2216,9 +2397,10 @@ export class PiKVMClient {
 
   /**
    * A progress-window timeout keeps PIKVM_MSD_STATE_UNKNOWN. The job cap
-   * and a body or stream idle abort keep the generic message. undici's
-   * headers timer can win the race; it is the same window while that
-   * phase is still armed.
+   * and a body or stream idle abort keep the generic message. An upload
+   * headersTimeout is the job cap, so it does not race the finalise
+   * window. A headers timeout that still arrives while finalise or the
+   * write_remote header window is armed maps to that window.
    */
   private msdWindowTimeout(err: unknown, endpoint: string, deadline: MsdDeadline): KvmdError | undefined {
     if (!isTimeoutError(err)) return undefined;

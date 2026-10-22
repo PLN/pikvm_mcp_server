@@ -17,6 +17,7 @@
 // Modified 2026-10 by PLN: hash timeout releases the upload slot before close (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: hash reads use the idle timeout (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: MSD progress windows (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: finalise window arms on request sent (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: catalog budgets use a monotonic clock (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a catalog read is not started with under 1 ms left (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: tests can see one catalog read and the upload slot (GPL-3.0; see NOTICE).
@@ -114,6 +115,8 @@ export interface ErrorFields {
   type: string;
   message: string;
   endpoint: string;
+  /** Set when a progress window produced PIKVM_MSD_STATE_UNKNOWN. */
+  phase?: 'finalise' | 'write_remote_headers';
 }
 
 /**
@@ -320,6 +323,7 @@ function errorFields(err: unknown): ErrorFields {
       type: err.type,
       message: redactUrl(err.message),
       endpoint: err.endpoint,
+      ...(err.phase ? { phase: err.phase } : {}),
     };
   }
   if (
@@ -1484,7 +1488,8 @@ async function runUpload(
  * closed from the in-flight read's callback, or immediately when no
  * read is in flight.
  * PIKVM_MSD_IDLE_TIMEOUT_MS bounds each hash read, the upload body, and
- * the finalise wait after the body until kvmd's response headers. A hash
+ * the finalise wait from undici's onRequestSent until kvmd's response
+ * headers. A hash
  * read that does not return within the limit stops, threadpool queueing
  * included. A read that returns 0 bytes ends the hash. The bound resets
  * when a read returns and does not cap total hash time. On that idle

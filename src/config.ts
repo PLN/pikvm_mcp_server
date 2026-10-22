@@ -17,6 +17,7 @@
 // Modified 2026-10 by PLN: PIKVM_OCR_TIMEOUT_MS (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: hash reads use the idle timeout (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: MSD progress windows (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: finalise window arms on request sent (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: host OCR settings (GPL-3.0; see NOTICE).
 // Env read adapted from dtrukr/pikvm_mcp_server src/config.ts @ d120243 (GPL-3.0).
 
@@ -186,8 +187,9 @@ export interface Config {
      * Progress bound from PIKVM_MSD_IDLE_TIMEOUT_MS. Default 60 seconds,
      * max 1 hour. Covers each hash read (a read that does not return,
      * threadpool queueing included; a 0-byte read ends the hash), the
-     * upload body, upload finalise, write_remote headers (connect timeout
-     * plus this value), and the write_remote stream. It does not cap a
+     * upload body, upload finalise (after the request is sent), write_remote
+     * headers (connect timeout plus this value), and the write_remote stream.
+     * It does not cap a
      * phase that keeps making progress. The catalog wait uses
      * PIKVM_MSD_READY_TIMEOUT_MS.
      */
