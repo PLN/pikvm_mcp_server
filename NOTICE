@@ -56,7 +56,8 @@ Modified 2026-10 by PLN: Node 24 and Windows test locations, and the CI matrix (
 Modified 2026-10 by PLN: hash reads use the idle timeout (GPL-3.0; see below).
 Modified 2026-10 by PLN: MSD progress windows (GPL-3.0; see below).
 Modified 2026-10 by PLN: finalise window arms on request sent (GPL-3.0; see below).
-Modified 2026-10 by PLN: stock nginx does not pre-empt the finalise window (GPL-3.0; see below).
+Modified 2026-10 by PLN: nginx 60s bounds kvmd's finish, not the drain (GPL-3.0; see below).
+Modified 2026-10 by PLN: the upload tool names the finalise drain limit (GPL-3.0; see below).
 Modified 2026-10 by PLN: a slow drain can end finalise with bytes in flight (GPL-3.0; see below).
 Modified 2026-10 by PLN: early headers leave the response idle timer in charge (GPL-3.0; see below).
 Modified 2026-10 by PLN: forward onResponseStarted (GPL-3.0; see below).
@@ -1031,11 +1032,12 @@ No code from another pikvm_mcp_server fork was added for these methods.
 
 2026-10, by PLN:
   The note that stock kvmd nginx ends the upload body or the upload
-  finalise phase after 60s was wrong. nginx's proxy_read_timeout starts
-  only after nginx has finished sending the request body upstream, and
-  client_body_timeout is a per-read gap on the client side, so stock
-  nginx does not pre-empt the 120s finalise window. /api/msd/write still
-  does not set those proxy timeouts. /api/msd/write_remote still sets
+  finalise phase after 60s was wrong. /api/msd/write still does not set
+  those proxy timeouts, so nginx's 60s defaults apply. nginx's 60s
+  proxy_read_timeout starts only after the whole body has gone upstream,
+  so it bounds kvmd's own finish (a 504, reported as
+  PIKVM_MSD_STATE_UNKNOWN), not the drain, which can use the full 120s.
+  /api/msd/write_remote still sets
   proxy_read_timeout 7d. The idle default, the 2× finalise window, and
   the job cap are unchanged. There is no new environment variable.
   No code from another pikvm_mcp_server fork was copied.
@@ -1063,4 +1065,16 @@ No code from another pikvm_mcp_server fork was added for these methods.
   still uses highWaterMark 1. The idle default stays 60s, the finalise
   window stays twice that, and the job cap stays 6 hours. There is no
   new environment variable.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  The nginx note is narrowed. nginx's 60s proxy_read_timeout starts only
+  after the whole body has gone upstream, so it bounds kvmd's own finish
+  (a 504, reported as PIKVM_MSD_STATE_UNKNOWN), not the drain, which can
+  use the full 120s. nginx's 60s defaults still apply to /api/msd/write.
+  The pikvm_msd_upload description adds one clause: if the buffered bytes
+  take longer than 2× PIKVM_MSD_IDLE_TIMEOUT_MS to drain, the upload ends
+  with PIKVM_MSD_STATE_UNKNOWN, phase finalise, while bytes may still be
+  in flight; re-read /api/msd and do not resend. No code logic, environment
+  variable, or default changed.
   No code from another pikvm_mcp_server fork was copied.

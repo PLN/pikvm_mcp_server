@@ -19,7 +19,7 @@
 // Modified 2026-10 by PLN: MSD progress windows (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: finalise window arms on request sent (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: upload finalise window is twice the idle timeout (GPL-3.0; see NOTICE).
-// Modified 2026-10 by PLN: stock nginx does not pre-empt the finalise window (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: nginx 60s bounds kvmd's finish, not the drain (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: host OCR settings (GPL-3.0; see NOTICE).
 // Env read adapted from dtrukr/pikvm_mcp_server src/config.ts @ d120243 (GPL-3.0).
 
@@ -193,10 +193,11 @@ export interface Config {
      * and the write_remote stream. Upload finalise, after the request is
      * sent, is twice this value. The OS send buffer and the peer's receive
      * window can still be draining after the bytes are handed to the socket,
-     * and the client cannot see when kvmd has read them. Stock nginx does
-     * not pre-empt that window: proxy_read_timeout starts only after nginx
-     * has finished sending the request body upstream, and
-     * client_body_timeout is a per-read gap on the client side. The idle
+     * and the client cannot see when kvmd has read them. nginx's 60s
+     * proxy_read_timeout starts only after the whole body has gone
+     * upstream, so it bounds kvmd's own finish (a 504, reported as
+     * PIKVM_MSD_STATE_UNKNOWN), not the drain, which can use the full
+     * 120s. The idle
      * timeout does not cap a phase that keeps making progress.
      * PIKVM_MSD_JOB_TIMEOUT_MS stays a last-resort safety cap.
      * The catalog wait uses PIKVM_MSD_READY_TIMEOUT_MS.

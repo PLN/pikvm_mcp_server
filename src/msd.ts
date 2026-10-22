@@ -19,7 +19,7 @@
 // Modified 2026-10 by PLN: MSD progress windows (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: finalise window arms on request sent (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: upload finalise window is twice the idle timeout (GPL-3.0; see NOTICE).
-// Modified 2026-10 by PLN: stock nginx does not pre-empt the finalise window (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: nginx 60s bounds kvmd's finish, not the drain (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: catalog budgets use a monotonic clock (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a catalog read is not started with under 1 ms left (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: tests can see one catalog read and the upload slot (GPL-3.0; see NOTICE).
@@ -1494,10 +1494,11 @@ async function runUpload(
  * onRequestSent until kvmd's response headers. The client cannot see
  * when kvmd has read the bytes, only when they were handed to the
  * socket, so the OS send buffer and the peer's receive window can still
- * be draining. The 2× window allows for that drain. Stock nginx does not
- * pre-empt that window: proxy_read_timeout starts only after nginx has
- * finished sending the request body upstream, and client_body_timeout is
- * a per-read gap on the client side. A hash read that does not return within
+ * be draining. The 2× window allows for that drain. nginx's 60s
+ * proxy_read_timeout starts only after the whole body has gone upstream,
+ * so it bounds kvmd's own finish (a 504, reported as
+ * PIKVM_MSD_STATE_UNKNOWN), not the drain, which can use the full 120s.
+ * A hash read that does not return within
  * the limit stops, threadpool queueing
  * included. A read that returns 0 bytes ends the hash. The bound resets
  * when a read returns and does not cap total hash time. On that idle

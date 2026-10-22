@@ -23,7 +23,7 @@
 // Modified 2026-10 by PLN: MSD progress windows (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: finalise window arms on request sent (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: upload finalise window is twice the idle timeout (GPL-3.0; see NOTICE).
-// Modified 2026-10 by PLN: stock nginx does not pre-empt the finalise window (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: nginx 60s bounds kvmd's finish, not the drain (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: early headers leave the response idle timer in charge (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: forward onResponseStarted (GPL-3.0; see NOTICE).
 // AbortSignal.timeout and PIKVM_UNREACHABLE / PIKVM_AUTH_FAILED no-retry codes
@@ -89,10 +89,10 @@
 // AbortSignal remains the hard ceiling.
 // Per kvmd's shipped nginx config, location /api/msd/write does not set
 // proxy_read_timeout or proxy_send_timeout (loc-bigpost.conf only lifts
-// the body size and turns request buffering off). nginx's proxy_read_timeout
-// starts only after nginx has finished sending the request body upstream,
-// and client_body_timeout is a per-read gap on the client side, so stock
-// nginx does not pre-empt the 120s finalise window.
+// the body size and turns request buffering off), so nginx's 60s defaults
+// apply. nginx's 60s proxy_read_timeout starts only after the whole body
+// has gone upstream, so it bounds kvmd's own finish (a 504, reported as
+// PIKVM_MSD_STATE_UNKNOWN), not the drain, which can use the full 120s.
 // /api/msd/write_remote sets proxy_read_timeout 7d.
 // A stream that ends short of Content-Length, or a chunk that runs past
 // it, is UND_ERR_REQ_CONTENT_LENGTH_MISMATCH and is reported as
@@ -189,10 +189,10 @@ export interface PiKVMConfig {
    * stream. Default 60 seconds. The finalise window is twice as long
    * because the OS send buffer and the peer's receive window can still
    * be draining after the body is handed to the socket. We cannot see
-   * when kvmd has read the bytes. Stock nginx does not pre-empt that
-   * window: proxy_read_timeout starts only after nginx has finished
-   * sending the request body upstream, and client_body_timeout is a
-   * per-read gap on the client side. A hash read that does not return
+   * when kvmd has read the bytes. nginx's 60s proxy_read_timeout starts
+   * only after the whole body has gone upstream, so it bounds kvmd's own
+   * finish (a 504, reported as PIKVM_MSD_STATE_UNKNOWN), not the drain,
+   * which can use the full 120s. A hash read that does not return
    * within the limit fails. A
    * 0-byte read ends the hash. The catalog wait uses
    * PIKVM_MSD_READY_TIMEOUT_MS, not this value.
@@ -2270,9 +2270,10 @@ export class PiKVMClient {
     // cannot see when kvmd has read the bytes, only when they were
     // handed to the socket, so the OS send buffer and the peer's receive
     // window can still be draining after onRequestSent. The 2× window
-    // allows for that drain. Stock nginx does not pre-empt that window:
-    // proxy_read_timeout starts only after the request body has been sent
-    // upstream, and client_body_timeout is a per-read gap on the client.
+    // allows for that drain. nginx's 60s proxy_read_timeout starts only
+    // after the whole body has gone upstream, so it bounds kvmd's own
+    // finish (a 504, reported as PIKVM_MSD_STATE_UNKNOWN), not the drain,
+    // which can use the full 120s.
     // write_remote has no body, so its headersTimeout is the header window
     // from send until headers.
     let dispatcher: Dispatcher = testDispatchers.get(this) ?? this.dispatcher;
