@@ -56,6 +56,7 @@ Modified 2026-10 by PLN: Node 24 and Windows test locations, and the CI matrix (
 Modified 2026-10 by PLN: hash reads use the idle timeout (GPL-3.0; see below).
 Modified 2026-10 by PLN: MSD progress windows (GPL-3.0; see below).
 Modified 2026-10 by PLN: finalise window arms on request sent (GPL-3.0; see below).
+Modified 2026-10 by PLN: stock nginx does not pre-empt the finalise window (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -1004,9 +1005,7 @@ No code from another pikvm_mcp_server fork was added for these methods.
   not removed. The job cap still stops a transfer that keeps making
   progress and stays a last-resort safety cap. The catalog wait is
   unchanged and still uses PIKVM_MSD_READY_TIMEOUT_MS. There is no new
-  environment variable. Per kvmd's shipped nginx config, /api/msd/write
-  does not set proxy timeouts. Stock kvmd nginx already ends that phase
-  after 60s.
+  environment variable.
   No code from another pikvm_mcp_server fork was copied.
 
 2026-10, by PLN:
@@ -1016,13 +1015,24 @@ No code from another pikvm_mcp_server fork was added for these methods.
   the local source ends. The client cannot see when kvmd has actually
   read the bytes, only when they were handed to the socket, so the OS
   send buffer and the peer's receive window can still be draining after
-  the body is sent. The 2× window allows for that drain. Stock kvmd
-  nginx already ends that phase after 60s. The body timer re-arms from
-  onBodySent. A compose interceptor adds those two methods.
+  the body is sent. The 2× window allows for that drain. The body
+  timer re-arms from onBodySent. A compose interceptor adds those two
+  methods.
   Readable.from uses highWaterMark 1. An upload headersTimeout is
   PIKVM_MSD_JOB_TIMEOUT_MS, defence in depth beside the job cap, because
   undici refreshes that timer only on socket backpressure and again at
   writer.end(). PIKVM_MSD_JOB_TIMEOUT_MS stays a last-resort safety cap.
   There is no new environment variable. The two window errors keep
   PIKVM_MSD_STATE_UNKNOWN and add phase finalise or write_remote_headers.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  The note that stock kvmd nginx ends the upload body or the upload
+  finalise phase after 60s was wrong. nginx's proxy_read_timeout starts
+  only after nginx has finished sending the request body upstream, and
+  client_body_timeout is a per-read gap on the client side, so stock
+  nginx does not pre-empt the 120s finalise window. /api/msd/write still
+  does not set those proxy timeouts. /api/msd/write_remote still sets
+  proxy_read_timeout 7d. The idle default, the 2× finalise window, and
+  the job cap are unchanged. There is no new environment variable.
   No code from another pikvm_mcp_server fork was copied.
