@@ -25,6 +25,7 @@
 // Modified 2026-10 by PLN: hash reads use the idle timeout (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: MSD progress windows (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: finalise window arms on request sent (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: upload finalise window is twice the idle timeout (GPL-3.0; see NOTICE).
 
 /**
  * MSD tools against the mock. The HTTP harness matches test/http.test.mjs.
@@ -1663,7 +1664,7 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
             assert.equal(failed.error.type, 'PIKVM_MSD_STATE_UNKNOWN');
             assert.equal(
               failed.error.message,
-              `timed out after ${idleMs}ms waiting for kvmd to finish the write (PIKVM_MSD_IDLE_TIMEOUT_MS); image may be partial or complete; re-read /api/msd; do not resend`,
+              `timed out after ${idleMs * 2}ms waiting for kvmd to finish the write (2× PIKVM_MSD_IDLE_TIMEOUT_MS); image may be partial or complete; re-read /api/msd; do not resend`,
             );
             assert.equal(failed.error.phase, 'finalise');
             assert.equal(failed.removed, undefined);

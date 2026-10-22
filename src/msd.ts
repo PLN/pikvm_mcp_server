@@ -18,6 +18,7 @@
 // Modified 2026-10 by PLN: hash reads use the idle timeout (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: MSD progress windows (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: finalise window arms on request sent (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: upload finalise window is twice the idle timeout (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: catalog budgets use a monotonic clock (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a catalog read is not started with under 1 ms left (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: tests can see one catalog read and the upload slot (GPL-3.0; see NOTICE).
@@ -1487,10 +1488,14 @@ async function runUpload(
  * is released without waiting for the file close. The descriptor is
  * closed from the in-flight read's callback, or immediately when no
  * read is in flight.
- * PIKVM_MSD_IDLE_TIMEOUT_MS bounds each hash read, the upload body, and
- * the finalise wait from undici's onRequestSent until kvmd's response
- * headers. A hash
- * read that does not return within the limit stops, threadpool queueing
+ * PIKVM_MSD_IDLE_TIMEOUT_MS bounds each hash read and the upload body.
+ * The upload finalise window is twice that value, from undici's
+ * onRequestSent until kvmd's response headers. The client cannot see
+ * when kvmd has read the bytes, only when they were handed to the
+ * socket, so the OS send buffer and the peer's receive window can still
+ * be draining. The 2× window allows for that drain. Stock kvmd nginx
+ * ends that phase after 60s. A hash read that does not return within
+ * the limit stops, threadpool queueing
  * included. A read that returns 0 bytes ends the hash. The bound resets
  * when a read returns and does not cap total hash time. On that idle
  * timeout the slot is released the same way and the upload POST is not

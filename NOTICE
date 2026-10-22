@@ -994,34 +994,35 @@ No code from another pikvm_mcp_server fork was added for these methods.
   whole hash and is still cleared when hashing finishes, so the upload
   POST gets its own cap of the same length.
   The same idle value is the progress bound for the upload body, the
-  upload finalise wait after the body ends until response headers, the
   write_remote wait for response headers (the connect timeout plus the
   idle value, from when the request is sent), and each gap in the
-  write_remote NDJSON stream. The final progress line is a chunk of
-  that stream. A finalise timeout and a header-window timeout are
+  write_remote NDJSON stream. The upload finalise window is twice that
+  idle value. The final progress line is a chunk of that stream. A
+  finalise timeout and a header-window timeout are
   PIKVM_MSD_STATE_UNKNOWN, the code a body-phase idle abort already
   uses, so the upload slot is released the same way and the image is
   not removed. The job cap still stops a transfer that keeps making
-  progress. The catalog wait is unchanged and still uses
-  PIKVM_MSD_READY_TIMEOUT_MS. There is no new environment variable.
-  Per kvmd's shipped nginx config, /api/msd/write does not set proxy
-  timeouts, so nginx's 60s defaults still apply to that phase.
+  progress and stays a last-resort safety cap. The catalog wait is
+  unchanged and still uses PIKVM_MSD_READY_TIMEOUT_MS. There is no new
+  environment variable. Per kvmd's shipped nginx config, /api/msd/write
+  does not set proxy timeouts. Stock kvmd nginx already ends that phase
+  after 60s.
   No code from another pikvm_mcp_server fork was copied.
 
 2026-10, by PLN:
-  The upload finalise window is armed from undici 7.24.1 handler
+  The upload finalise window is twice PIKVM_MSD_IDLE_TIMEOUT_MS (120
+  seconds by default) and is armed from undici 7.24.1 handler
   onRequestSent, when the body has been handed to the socket, not when
-  the local source ends. The body timer re-arms from onBodySent. A
-  compose interceptor adds those two methods. Readable.from uses
-  highWaterMark 1. The upload socket sets SO_SNDBUF to 16384 (the
-  kernel doubles it) so the send queue cannot take the whole image.
-  A slow peer can still hold about a megabyte in its receive
-  window. After four consecutive onBodySent gaps of 20ms or more, later
-  large chunks are paced at twice that gap so the window can empty, and
-  the idle finalise window covers what remains. A fast peer does not
-  keep such a streak and is not delayed. An upload headersTimeout is
-  PIKVM_MSD_JOB_TIMEOUT_MS, defence in depth, because undici refreshes
-  that timer only on socket backpressure and again at writer.end().
-  The two window errors keep PIKVM_MSD_STATE_UNKNOWN and add phase
-  finalise or write_remote_headers.
+  the local source ends. The client cannot see when kvmd has actually
+  read the bytes, only when they were handed to the socket, so the OS
+  send buffer and the peer's receive window can still be draining after
+  the body is sent. The 2× window allows for that drain. Stock kvmd
+  nginx already ends that phase after 60s. The body timer re-arms from
+  onBodySent. A compose interceptor adds those two methods.
+  Readable.from uses highWaterMark 1. An upload headersTimeout is
+  PIKVM_MSD_JOB_TIMEOUT_MS, defence in depth beside the job cap, because
+  undici refreshes that timer only on socket backpressure and again at
+  writer.end(). PIKVM_MSD_JOB_TIMEOUT_MS stays a last-resort safety cap.
+  There is no new environment variable. The two window errors keep
+  PIKVM_MSD_STATE_UNKNOWN and add phase finalise or write_remote_headers.
   No code from another pikvm_mcp_server fork was copied.

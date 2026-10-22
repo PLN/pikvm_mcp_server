@@ -2,7 +2,6 @@
 // Modified 2026-10 by PLN: classify TLS from the socket, and trust a pinned leaf (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a reset after the certificate stays a transport error (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: one TLS spec per registry device (GPL-3.0; see NOTICE).
-// Modified 2026-10 by PLN: upload send buffer stays small (GPL-3.0; see NOTICE).
 // The pin options follow the design's undici check: ca is the pinned PEM,
 // rejectUnauthorized stays true, and checkServerIdentity compares SPKI
 // sha256. This file is written fresh.
@@ -23,7 +22,6 @@
  * The registry builds one of these specs per device. `device` is that name.
  */
 
-import { spawnSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import {
   chmodSync,
@@ -469,101 +467,21 @@ function armTlsFailure(socket: tls.TLSSocket, spec: DeviceTls): void {
   }) as typeof socket.destroy;
 }
 
-function kvmdConnector(
-  spec: DeviceTls,
-  limitSendBuffer = false,
-): tls.ConnectionOptions | buildConnector.connector {
+function kvmdConnector(spec: DeviceTls): tls.ConnectionOptions | buildConnector.connector {
   const options = kvmdConnectOptions(spec);
-  if (!limitSendBuffer && spec.mode === 'insecure') return options;
+  if (spec.mode === 'insecure') return options;
   if (spec.mode === 'pin') assertPinNotInsecure(options);
   const inner = buildConnector(options);
   const connect: buildConnector.connector = (connectOptions, callback) => {
-    const wrapped: buildConnector.Callback = (err, socket) => {
-      if (limitSendBuffer && socket) limitTcpSendBuffer(socket);
-      if (err) {
-        callback(err, null);
-        return;
-      }
-      callback(null, socket);
-    };
     const socket = (inner as (
       options: buildConnector.Options,
       cb: buildConnector.Callback,
-    ) => tls.TLSSocket)(connectOptions, wrapped);
+    ) => tls.TLSSocket)(connectOptions, callback);
     if (socket && typeof socket.getPeerCertificate === 'function') {
       armTlsFailure(socket, spec);
     }
-    if (limitSendBuffer && socket) limitTcpSendBuffer(socket);
   };
   return connect;
-}
-
-/**
- * Keep the upload send queue small. undici's onRequestSent runs when
- * the bytes have been handed to the kernel, and an auto-tuned buffer
- * can hold megabytes the peer has not read. SO_SNDBUF makes further
- * writes wait until that queue drains, so onBodySent tracks
- * acknowledgements. The kernel doubles the value; 16384 is 32KiB.
- * A host with no Python interpreter skips this and keeps the default.
- */
-const sendBufferTuned = new WeakSet<net.Socket>();
-let pythonCmd: string | null | undefined;
-
-function pythonForSetsockopt(): string | null {
-  if (pythonCmd !== undefined) return pythonCmd;
-  const commands = process.platform === 'win32' ? ['python', 'python3'] : ['python3', 'python'];
-  for (const cmd of commands) {
-    const probe = spawnSync(cmd, ['-c', 'import socket'], { stdio: 'ignore' });
-    if (probe.status === 0) {
-      pythonCmd = cmd;
-      return cmd;
-    }
-  }
-  pythonCmd = null;
-  return null;
-}
-
-const SEND_BUFFER_SCRIPT = [
-  'import socket',
-  'fd = 3',
-  'try:',
-  '    s = socket.fromfd(fd, socket.AF_INET, socket.SOCK_STREAM)',
-  'except (AttributeError, OSError, ValueError):',
-  '    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM, fileno=fd)',
-  'try:',
-  '    s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 16384)',
-  'except OSError:',
-  '    pass',
-  's.detach()',
-].join('\n');
-
-function socketFd(socket: net.Socket): number | undefined {
-  const withHandle = socket as net.Socket & {
-    _handle?: { fd?: number };
-    _parent?: net.Socket & { _handle?: { fd?: number } };
-  };
-  // TLSWrap exposes the underlying TCP fd. A plain socket does too.
-  // If that fd is missing, the parent net.Socket has it.
-  const candidates = [withHandle._handle?.fd, withHandle._parent?._handle?.fd];
-  for (const fd of candidates) {
-    if (typeof fd === 'number' && fd >= 0) return fd;
-  }
-  return undefined;
-}
-
-export function limitTcpSendBuffer(socket: net.Socket): void {
-  if (sendBufferTuned.has(socket)) return;
-  const cmd = pythonForSetsockopt();
-  const fd = socketFd(socket);
-  if (!cmd || fd === undefined) return;
-  sendBufferTuned.add(socket);
-  try {
-    spawnSync(cmd, ['-c', SEND_BUFFER_SCRIPT], {
-      stdio: ['ignore', 'ignore', 'ignore', fd],
-    });
-  } catch {
-    // The kernel default remains. The upload still runs.
-  }
 }
 
 export function deviceTlsFrom(config: KvmdTlsSource): DeviceTls {
@@ -585,14 +503,14 @@ export function deviceTlsFrom(config: KvmdTlsSource): DeviceTls {
 
 export function createKvmdAgent(
   config: KvmdTlsSource,
-  timeouts?: { headersTimeout?: number; bodyTimeout?: number; limitSendBuffer?: boolean },
+  timeouts?: { headersTimeout?: number; bodyTimeout?: number },
 ): Agent {
   const spec = deviceTlsFrom(config);
   if ((spec.mode === 'pin' || spec.mode === 'verify') && config.host && !config.host.startsWith('https:')) {
     throw new Error(`PIKVM_TLS_MODE=${spec.mode} requires an https PIKVM_HOST`);
   }
   return new Agent({
-    connect: kvmdConnector(spec, timeouts?.limitSendBuffer === true),
+    connect: kvmdConnector(spec),
     headersTimeout: timeouts?.headersTimeout ?? 0,
     bodyTimeout: timeouts?.bodyTimeout ?? 0,
   });

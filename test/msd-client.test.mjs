@@ -8,6 +8,7 @@
 // Modified 2026-10 by PLN: teardown waits for the upload slot (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: MSD progress windows (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: finalise window arms on request sent (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: upload finalise window is twice the idle timeout (GPL-3.0; see NOTICE).
 
 /**
  * Plain kvmd MSD client methods against the mock. No MCP tools.
@@ -569,7 +570,7 @@ describe('MSD client', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
 
   msdTest('an upload reply inside the finalise window is not killed by the ordinary request timeout', async () => {
     // The hold is longer than PIKVM_REQUEST_TIMEOUT_MS and shorter than
-    // the finalise window (PIKVM_MSD_IDLE_TIMEOUT_MS). The ordinary
+    // the finalise window (2× PIKVM_MSD_IDLE_TIMEOUT_MS). The ordinary
     // deadline does not apply. The job cap is far longer than the hold.
     const idleMs = 1000;
     await withMock({ writeHoldMs: 400 }, async (_mock, client) => {
@@ -598,29 +599,35 @@ describe('MSD client', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
       assert.equal(mock.uploads[0].body.length, 4);
     }, { msdJobTimeoutMs: 20000, msdIdleTimeoutMs: idleMs });
     const elapsed = performance.now() - started;
-    assert.ok(elapsed >= idleMs / 2, `finalise window fired early: ${elapsed}ms`);
-    assert.ok(elapsed < 4000, `finalise window waited too long: ${elapsed}ms`);
+    // A 1× window is idleMs. The armed window is 2×.
+    assert.ok(elapsed >= idleMs * 2 * 0.75, `finalise window fired early: ${elapsed}ms`);
+    assert.ok(elapsed < idleMs * 2 + 1500, `finalise window waited too long: ${elapsed}ms`);
   });
 
-  msdTest('a slow multi-megabyte upload is not an idle timeout', { timeout: 30000 }, async () => {
-    const size = 8 * 1024 * 1024;
-    const step = 64 * 1024;
-    const pauseMs = 20;
-    const idleMs = 1000;
+  msdTest('a slow multi-megabyte upload finishes inside the 2× finalise window', { timeout: 20000 }, async () => {
+    // The peer reads one 512 KiB step, then waits. Eight waits are longer
+    // than one idle window and shorter than two. On a large send buffer
+    // onRequestSent is early, so that read is the drain after the body
+    // was handed to the socket. A 1× window would abort it. A small send
+    // buffer keeps the body timer re-arming and still finishes inside 2×.
+    const size = 4 * 1024 * 1024;
+    const step = 512 * 1024;
+    const pauseMs = 120;
+    const pauses = size / step;
+    const idleMs = 800;
     const started = performance.now();
     await withMock({ writePace: { step, pauseMs } }, async (mock, client) => {
       const result = await client.msdWrite('paced.img', chunkedBody(size, step), size);
       assert.equal(result.written, size);
       assert.equal(mock.uploads[0].body.length, size);
-      assert.ok(pauseMs < idleMs);
-      assert.ok(
-        mock.pace.pauses * pauseMs > idleMs,
-        `paced reads ${mock.pace.pauses}*${pauseMs}ms did not pass the ${idleMs}ms idle window`,
-      );
-    }, { msdJobTimeoutMs: 60000, msdIdleTimeoutMs: idleMs });
+      assert.equal(mock.pace.pauses, pauses);
+    }, { msdJobTimeoutMs: 20000, msdIdleTimeoutMs: idleMs });
     const elapsed = performance.now() - started;
-    assert.ok(elapsed > idleMs, `paced upload finished inside the idle window (${elapsed}ms)`);
-    assert.ok(elapsed < 20000, `paced upload hung (${elapsed}ms)`);
+    const paced = pauses * pauseMs;
+    assert.ok(paced > idleMs, `paced reads ${paced}ms did not pass the ${idleMs}ms idle window`);
+    assert.ok(paced < idleMs * 2, `paced reads ${paced}ms do not fit in the 2× window`);
+    assert.ok(elapsed > idleMs, `upload finished inside one idle window (${elapsed}ms)`);
+    assert.ok(elapsed < 8000, `upload hung (${elapsed}ms)`);
   });
 
   msdTest('the job cap stops a steadily trickled upload body', { timeout: 15000 }, async () => {
@@ -967,7 +974,7 @@ describe('MSD client', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
   const MSD_UNKNOWN = 'image may be partial or complete; re-read /api/msd; do not resend';
 
   function finaliseMessage(idleMs) {
-    return `timed out after ${idleMs}ms waiting for kvmd to finish the write (PIKVM_MSD_IDLE_TIMEOUT_MS); ${MSD_UNKNOWN}`;
+    return `timed out after ${idleMs * 2}ms waiting for kvmd to finish the write (2× PIKVM_MSD_IDLE_TIMEOUT_MS); ${MSD_UNKNOWN}`;
   }
 
   function headerMessage(headerMs) {
