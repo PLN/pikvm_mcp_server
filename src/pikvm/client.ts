@@ -23,6 +23,9 @@
 // Modified 2026-10 by PLN: MSD progress windows (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: finalise window arms on request sent (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: upload finalise window is twice the idle timeout (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: stock nginx does not pre-empt the finalise window (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: early headers leave the response idle timer in charge (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: forward onResponseStarted (GPL-3.0; see NOTICE).
 // AbortSignal.timeout and PIKVM_UNREACHABLE / PIKVM_AUTH_FAILED no-retry codes
 // adapted from dtrukr/pikvm_mcp_server src/pikvm/client.ts @ d120243 (GPL-3.0).
 // Snapshot HTTP 503 retry-once adapted from dvaerum/pikvm_mcp_server
@@ -86,10 +89,10 @@
 // AbortSignal remains the hard ceiling.
 // Per kvmd's shipped nginx config, location /api/msd/write does not set
 // proxy_read_timeout or proxy_send_timeout (loc-bigpost.conf only lifts
-// the body size and turns request buffering off), so nginx's 60s defaults
-// apply. Stock kvmd nginx already ends the upload body and the upload
-// finalise phase after 60s. An idle value above 60s, and a 2× finalise
-// window of 120s, do not extend those phases behind that config.
+// the body size and turns request buffering off). nginx's proxy_read_timeout
+// starts only after nginx has finished sending the request body upstream,
+// and client_body_timeout is a per-read gap on the client side, so stock
+// nginx does not pre-empt the 120s finalise window.
 // /api/msd/write_remote sets proxy_read_timeout 7d.
 // A stream that ends short of Content-Length, or a chunk that runs past
 // it, is UND_ERR_REQ_CONTENT_LENGTH_MISMATCH and is reported as
@@ -186,8 +189,11 @@ export interface PiKVMConfig {
    * stream. Default 60 seconds. The finalise window is twice as long
    * because the OS send buffer and the peer's receive window can still
    * be draining after the body is handed to the socket. We cannot see
-   * when kvmd has read the bytes. Stock kvmd nginx ends that phase
-   * after 60s. A hash read that does not return within the limit fails. A
+   * when kvmd has read the bytes. Stock nginx does not pre-empt that
+   * window: proxy_read_timeout starts only after nginx has finished
+   * sending the request body upstream, and client_body_timeout is a
+   * per-read gap on the client side. A hash read that does not return
+   * within the limit fails. A
    * 0-byte read ends the hash. The catalog wait uses
    * PIKVM_MSD_READY_TIMEOUT_MS, not this value.
    */
@@ -902,11 +908,15 @@ function trackUpload(
  * socket writer. onRequestSent is the handoff to the socket. The OS
  * send buffer and the peer's receive window can still be draining
  * after that, which is why the finalise window is twice the idle timeout.
+ * Hooks this interceptor does not use are forwarded. onResponseStarted
+ * is one of those: the wrapper replaces the handler, so omitting it
+ * would drop the call.
  */
 interface UploadProgressHandler {
   onConnect?: (abort: (err?: Error) => void, context: unknown) => void;
   onError?: (err: Error) => void;
   onUpgrade?: (statusCode: number, rawHeaders: Buffer[] | string[] | null, socket: unknown) => void;
+  onResponseStarted?: () => void;
   onHeaders?: (
     statusCode: number,
     rawHeaders: Buffer[],
@@ -930,6 +940,7 @@ function uploadProgressInterceptor(
       onConnect: (abort, context) => next.onConnect?.(abort, context),
       onError: (err) => next.onError?.(err),
       onUpgrade: (statusCode, rawHeaders, socket) => next.onUpgrade?.(statusCode, rawHeaders, socket),
+      onResponseStarted: () => next.onResponseStarted?.(),
       onHeaders: (statusCode, rawHeaders, resume, statusMessage) => (
         next.onHeaders?.(statusCode, rawHeaders, resume, statusMessage)
       ),
@@ -955,14 +966,21 @@ interface MsdDeadline {
   signal: AbortSignal;
   /** Refresh the body or stream progress timer. Length is the idle timeout. */
   arm: () => void;
-  /** undici has handed the whole body to the socket. Arm the 2× idle finalise window until headers. */
+  /**
+   * undici has handed the whole body to the socket. Arm the 2× idle
+   * finalise window until headers. If headers have already arrived,
+   * do not arm it: the per-chunk response idle timer stays in charge.
+   */
   armFinalise: () => void;
   /**
    * No request body. Arm the header window from now until response headers.
    * `headerMs` is the connect timeout in milliseconds plus the idle timeout.
    */
   armHeaderWindow: (headerMs: number) => void;
-  /** Response headers arrived. Stop the finalise or header window. */
+  /**
+   * Response headers arrived. Stop the finalise or header window.
+   * A later onRequestSent must not arm finalise.
+   */
   headersArrived: () => void;
   /** Stop the progress timer without aborting. */
   disarm: () => void;
@@ -984,6 +1002,7 @@ function startMsdDeadline(jobMs: number, idleMs: number): MsdDeadline {
   let phase: MsdProgressPhase | 'off' = 'body';
   let abortedPhase: MsdProgressPhase | undefined;
   let headerMs = idleMs;
+  let headersSeen = false;
   const timeoutError = () => new DOMException(
     'The operation was aborted due to timeout',
     'TimeoutError',
@@ -1013,6 +1032,11 @@ function startMsdDeadline(jobMs: number, idleMs: number): MsdDeadline {
     // Twice the idle timeout. onRequestSent means the bytes were handed
     // to the socket. The OS send buffer and the peer's receive window
     // can still be draining, and this window allows for that.
+    // Headers can arrive while that handoff is still in progress.
+    // Arming finalise afterwards would make arm() ignore response
+    // chunks, and a healthy stream would die at 2× idle. Leave the
+    // per-chunk response idle timer in charge.
+    if (headersSeen) return;
     schedule(idleMs * 2, 'finalise');
   };
   const armHeaderWindow = (windowMs: number) => {
@@ -1026,6 +1050,7 @@ function startMsdDeadline(jobMs: number, idleMs: number): MsdDeadline {
     phase = 'off';
   };
   const headersArrived = () => {
+    headersSeen = true;
     if (phase === 'finalise' || phase === 'headers') disarm();
   };
   const onJob = () => {
@@ -2245,7 +2270,9 @@ export class PiKVMClient {
     // cannot see when kvmd has read the bytes, only when they were
     // handed to the socket, so the OS send buffer and the peer's receive
     // window can still be draining after onRequestSent. The 2× window
-    // allows for that drain. Stock kvmd nginx ends that phase after 60s.
+    // allows for that drain. Stock nginx does not pre-empt that window:
+    // proxy_read_timeout starts only after the request body has been sent
+    // upstream, and client_body_timeout is a per-read gap on the client.
     // write_remote has no body, so its headersTimeout is the header window
     // from send until headers.
     let dispatcher: Dispatcher = testDispatchers.get(this) ?? this.dispatcher;
