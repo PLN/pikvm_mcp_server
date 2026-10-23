@@ -12,6 +12,7 @@
 // Modified 2026-10 by PLN: early upload headers keep the stream timer (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: finalise arms on request sent, and the upload highWaterMark is 1 (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: onResponseStarted is counted through the interceptor (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: a post-send job cap reports phase job_timeout (GPL-3.0; see NOTICE).
 
 /**
  * Plain kvmd MSD client methods against the mock. No MCP tools.
@@ -876,9 +877,10 @@ describe('MSD client', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
         () => client.msdWrite('trickle.img', pacedBody(text, gapMs), text.length),
         (err) => {
           assert.ok(err instanceof KvmdError);
+          assert.equal(err.status, 0);
           assert.equal(err.type, 'PIKVM_MSD_STATE_UNKNOWN');
-          assert.equal(err.message, MSD_UNKNOWN);
-          assert.equal(err.phase, undefined);
+          assert.equal(err.message, jobTimeoutMessage(jobMs));
+          assert.equal(err.phase, 'job_timeout');
           assert.equal(err.endpoint, 'POST /api/msd/write');
           return true;
         },
@@ -948,6 +950,7 @@ describe('MSD client', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
           assert.ok(err instanceof KvmdError);
           assert.equal(err.type, 'PIKVM_MSD_STATE_UNKNOWN');
           assert.equal(err.message, 'image may be partial or complete; re-read /api/msd; do not resend');
+          assert.equal(err.phase, undefined);
           return true;
         },
       );
@@ -1041,6 +1044,7 @@ describe('MSD client', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
           assert.ok(err instanceof KvmdError);
           assert.equal(err.type, 'PIKVM_MSD_STATE_UNKNOWN');
           assert.equal(err.message, MSD_UNKNOWN);
+          assert.equal(err.phase, undefined);
           assert.equal(err.endpoint, 'POST /api/msd/write_remote');
           return true;
         },
@@ -1069,8 +1073,10 @@ describe('MSD client', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
         },
         (err) => {
           assert.ok(err instanceof KvmdError);
+          assert.equal(err.status, 0);
           assert.equal(err.type, 'PIKVM_MSD_STATE_UNKNOWN');
-          assert.equal(err.message, MSD_UNKNOWN);
+          assert.equal(err.message, jobTimeoutMessage(jobMs));
+          assert.equal(err.phase, 'job_timeout');
           assert.equal(err.endpoint, 'POST /api/msd/write_remote');
           return true;
         },
@@ -1078,6 +1084,49 @@ describe('MSD client', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
     }, { msdJobTimeoutMs: jobMs, msdIdleTimeoutMs: idleMs });
     const elapsed = performance.now() - started;
     assert.ok(elapsed < 2500, `job cap waited for the idle bound: ${elapsed}ms`);
+  });
+
+  msdTest('the job cap during finalise is job_timeout, not the finalise phase', { timeout: 15000 }, async () => {
+    // The body is tiny, so finalise arms almost immediately. The finalise
+    // window is 2× idle, longer than the job cap, so the cap is what fires.
+    const jobMs = 400;
+    const idleMs = 3000;
+    await withMock({ writeHoldMs: 8000 }, async (_mock, client) => {
+      await assert.rejects(
+        () => client.msdWrite('held.img', bodyOf('abcd'), 4),
+        (err) => {
+          assert.ok(err instanceof KvmdError);
+          assert.equal(err.status, 0);
+          assert.equal(err.type, 'PIKVM_MSD_STATE_UNKNOWN');
+          assert.equal(err.message, jobTimeoutMessage(jobMs));
+          assert.equal(err.phase, 'job_timeout');
+          assert.equal(err.endpoint, 'POST /api/msd/write');
+          return true;
+        },
+      );
+    }, { msdJobTimeoutMs: jobMs, msdIdleTimeoutMs: idleMs });
+  });
+
+  msdTest('the job cap during write_remote headers is job_timeout, not the header phase', { timeout: 15000 }, async () => {
+    const jobMs = 400;
+    const idleMs = 3000;
+    const connectSec = 1;
+    await withMock({
+      remote: { headerDelayMs: 8000, lines: remoteLines('late.iso', 1) },
+    }, async (_mock, client) => {
+      await assert.rejects(
+        () => client.msdWriteRemote('https://example.test/pics/late.iso', { timeout: connectSec })[Symbol.asyncIterator]().next(),
+        (err) => {
+          assert.ok(err instanceof KvmdError);
+          assert.equal(err.status, 0);
+          assert.equal(err.type, 'PIKVM_MSD_STATE_UNKNOWN');
+          assert.equal(err.message, jobTimeoutMessage(jobMs));
+          assert.equal(err.phase, 'job_timeout');
+          assert.equal(err.endpoint, 'POST /api/msd/write_remote');
+          return true;
+        },
+      );
+    }, { msdJobTimeoutMs: jobMs, msdIdleTimeoutMs: idleMs });
   });
 
   msdTest('undici headersTimeout waits for headers and does not cap a writing body', { timeout: 20000 }, async () => {
@@ -1214,6 +1263,10 @@ describe('MSD client', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
 
   function headerMessage(headerMs) {
     return `timed out after ${headerMs}ms waiting for write_remote response headers (connect timeout + PIKVM_MSD_IDLE_TIMEOUT_MS); ${MSD_UNKNOWN}`;
+  }
+
+  function jobTimeoutMessage(jobMs) {
+    return `job timeout after ${jobMs}ms (PIKVM_MSD_JOB_TIMEOUT_MS); ${MSD_UNKNOWN}`;
   }
 
   msdTest('99999999999 for both MSD deadlines is clamped and the upload still finishes', { timeout: 5000 }, async () => {
@@ -1362,6 +1415,7 @@ describe('MSD client', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
           assert.ok(err instanceof KvmdError);
           assert.equal(err.type, 'PIKVM_MSD_STATE_UNKNOWN');
           assert.equal(err.message, MSD_UNKNOWN);
+          assert.equal(err.phase, undefined);
           assert.equal(err.endpoint, 'POST /api/msd/write');
           return true;
         },

@@ -23,9 +23,11 @@
 // Modified 2026-10 by PLN: MSD progress windows (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: finalise window arms on request sent (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: upload finalise window is twice the idle timeout (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: stock nginx does not pre-empt the finalise window (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: nginx 60s bounds kvmd's finish, not the drain (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: early headers leave the response idle timer in charge (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: forward onResponseStarted (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: a post-send job cap reports phase job_timeout (GPL-3.0; see NOTICE).
 // AbortSignal.timeout and PIKVM_UNREACHABLE / PIKVM_AUTH_FAILED no-retry codes
 // adapted from dtrukr/pikvm_mcp_server src/pikvm/client.ts @ d120243 (GPL-3.0).
 // Snapshot HTTP 503 retry-once adapted from dvaerum/pikvm_mcp_server
@@ -43,6 +45,15 @@
 // plus AbortController on each phase it already bounded: the upload POST
 // and write_remote as a whole. A trickle that keeps resetting the idle
 // timer is stopped by this cap, not by the idle timer.
+// After the request has been sent, that cap is PIKVM_MSD_STATE_UNKNOWN
+// with phase job_timeout. The message names PIKVM_MSD_JOB_TIMEOUT_MS and
+// the millisecond value, then says the image may be partial or complete;
+// re-read /api/msd and do not resend. It covers the upload body, upload
+// finalise, write_remote headers, and the write_remote stream. An idle,
+// finalise, or header window that fires keeps its own phase. The hash
+// cap stays PIKVM_MSD_HASH_TIMEOUT and does not use job_timeout. The
+// progress timer is cleared when the cap fires, and the cap timer is
+// cleared when a progress window fires, so only one of them rejects.
 // PIKVM_MSD_IDLE_TIMEOUT_MS (default 60 seconds, max 1 hour) is the
 // progress bound for every moving phase: each local hash read, the upload
 // body, the write_remote wait for response headers (connect timeout in ms
@@ -178,7 +189,9 @@ export interface PiKVMConfig {
    * Last-resort safety cap for msdWrite and msdWriteRemote. Default 6 hours.
    * These calls do not use requestTimeoutMs. 0 means the default.
    * Progress is bounded by msdIdleTimeoutMs. This cap stops a transfer
-   * that keeps making progress.
+   * that keeps making progress. After the request has been sent it is
+   * PIKVM_MSD_STATE_UNKNOWN with phase job_timeout. During hashing the
+   * same length is PIKVM_MSD_HASH_TIMEOUT.
    */
   msdJobTimeoutMs?: number;
   /**
@@ -339,8 +352,11 @@ export interface CalibrationResult {
  * `message` is kvmd's `error_msg` after secret redaction. `endpoint` is
  * the method and path with no query string.
  */
-/** Which progress window produced a PIKVM_MSD_STATE_UNKNOWN timeout. */
-export type MsdWindowPhase = 'finalise' | 'write_remote_headers';
+/**
+ * Which post-send timeout produced a PIKVM_MSD_STATE_UNKNOWN.
+ * `job_timeout` is only PIKVM_MSD_JOB_TIMEOUT_MS. Idle has no phase.
+ */
+export type MsdWindowPhase = 'finalise' | 'write_remote_headers' | 'job_timeout';
 
 export class KvmdError extends Error {
   readonly status: number;
@@ -354,8 +370,9 @@ export class KvmdError extends Error {
   readonly preSend: boolean;
 
   /**
-   * Set on the upload finalise window and the write_remote header window.
-   * The `type` stays PIKVM_MSD_STATE_UNKNOWN.
+   * Set on the upload finalise window, the write_remote header window,
+   * and a post-send job cap. The `type` stays PIKVM_MSD_STATE_UNKNOWN.
+   * An idle abort leaves this unset.
    */
   readonly phase?: MsdWindowPhase;
 
@@ -714,6 +731,25 @@ function msdHeaderWindowTimeout(headerMs: number, endpoint: string): KvmdError {
   );
 }
 
+/**
+ * PIKVM_MSD_JOB_TIMEOUT_MS ended the transfer after the request was sent.
+ * Same code as the other post-send aborts: the image may already be
+ * stored, so callers must not remove it or send the POST again.
+ * The parenthetical names the cap the way the hash-idle message names
+ * PIKVM_MSD_IDLE_TIMEOUT_MS. A cap during hashing stays
+ * PIKVM_MSD_HASH_TIMEOUT and does not use this phase.
+ */
+function msdJobTimeout(jobMs: number, endpoint: string): KvmdError {
+  return new KvmdError(
+    0,
+    'PIKVM_MSD_STATE_UNKNOWN',
+    `job timeout after ${jobMs}ms (PIKVM_MSD_JOB_TIMEOUT_MS); ${MSD_STATE_UNKNOWN_MESSAGE}`,
+    endpoint,
+    false,
+    'job_timeout',
+  );
+}
+
 function isHeadersTimeout(err: unknown): boolean {
   return errorCodes(err).includes('UND_ERR_HEADERS_TIMEOUT');
 }
@@ -991,6 +1027,11 @@ interface MsdDeadline {
   phase: () => MsdProgressPhase | 'off';
   /** Header window passed to armHeaderWindow, or the idle timeout. */
   headerWindowMs: () => number;
+  /**
+   * True when the job cap aborted and no idle, finalise, or header
+   * window had already aborted.
+   */
+  jobAbort: () => boolean;
 }
 
 function startMsdDeadline(jobMs: number, idleMs: number): MsdDeadline {
@@ -1001,21 +1042,28 @@ function startMsdDeadline(jobMs: number, idleMs: number): MsdDeadline {
   let generation = 0;
   let phase: MsdProgressPhase | 'off' = 'body';
   let abortedPhase: MsdProgressPhase | undefined;
+  let jobFired = false;
   let headerMs = idleMs;
   let headersSeen = false;
   const timeoutError = () => new DOMException(
     'The operation was aborted due to timeout',
     'TimeoutError',
   );
+  const clearJobTimer = () => {
+    if (jobTimer) clearTimeout(jobTimer);
+    jobTimer = undefined;
+  };
   const schedule = (ms: number, next: MsdProgressPhase) => {
-    if (idleCtrl.signal.aborted || jobCtrl.signal.aborted) return;
+    if (idleCtrl.signal.aborted || jobCtrl.signal.aborted || jobFired) return;
     phase = next;
     const gen = ++generation;
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
-      if (gen !== generation) return;
+      if (gen !== generation || jobFired || abortedPhase !== undefined) return;
       idleTimer = undefined;
       abortedPhase = next;
+      // This window won. The job cap must not reject as well.
+      clearJobTimer();
       idleCtrl.abort(timeoutError());
     }, ms);
   };
@@ -1054,17 +1102,20 @@ function startMsdDeadline(jobMs: number, idleMs: number): MsdDeadline {
     if (phase === 'finalise' || phase === 'headers') disarm();
   };
   const onJob = () => {
-    // The job cap aborted. Leave abortedPhase unset so this is not
-    // reported as a progress-window timeout.
+    // A progress window already aborted. Do not relabel that rejection.
+    if (abortedPhase !== undefined) return;
+    // Leave abortedPhase unset so this is not a progress-window timeout.
+    jobFired = true;
     disarm();
   };
   const done = () => {
     disarm();
-    if (jobTimer) clearTimeout(jobTimer);
-    jobTimer = undefined;
+    clearJobTimer();
     jobCtrl.signal.removeEventListener('abort', onJob);
   };
   jobTimer = setTimeout(() => {
+    jobTimer = undefined;
+    if (abortedPhase !== undefined || jobFired) return;
     jobCtrl.abort(timeoutError());
   }, jobMs);
   jobCtrl.signal.addEventListener('abort', onJob, { once: true });
@@ -1080,6 +1131,7 @@ function startMsdDeadline(jobMs: number, idleMs: number): MsdDeadline {
     idleAbort: () => abortedPhase,
     phase: () => phase,
     headerWindowMs: () => headerMs,
+    jobAbort: () => jobFired,
   };
 }
 
@@ -1117,9 +1169,11 @@ export function redactionPassword(client: PiKVMClient): string {
 
 /**
  * Resolved PIKVM_MSD_JOB_TIMEOUT_MS for this client.
- * Hashing uses the same last-resort cap on its own timer. The upload
- * POST still starts a fresh cap of this length. It is not the progress
- * bound.
+ * Hashing uses the same last-resort cap on its own timer and fails with
+ * PIKVM_MSD_HASH_TIMEOUT (`hash timeout after <ms>ms`). The upload POST
+ * still starts a fresh cap of this length. After that POST is sent, the
+ * cap is PIKVM_MSD_STATE_UNKNOWN with phase job_timeout. It is not the
+ * progress bound.
  */
 export function msdJobTimeoutOf(client: PiKVMClient): number {
   return msdJobTimeouts.get(client) ?? MSD_JOB_TIMEOUT_DEFAULT_MS;
@@ -2091,6 +2145,9 @@ export class PiKVMClient {
    * line is produced after kvmd finishes the download and is just the last
    * chunk, so that per-chunk bound already covers it. The job cap is the
    * overall limit, because a trickle keeps the idle timer from firing.
+   * After the request has been sent, that cap is PIKVM_MSD_STATE_UNKNOWN
+   * with phase job_timeout. A header window or a stream idle gap keeps
+   * its own phase.
    */
   async *msdWriteRemote(
     url: string,
@@ -2366,21 +2423,34 @@ export class PiKVMClient {
   }
 
   /**
-   * A progress-window timeout keeps PIKVM_MSD_STATE_UNKNOWN. The job cap
-   * and a body or stream idle abort keep the generic message. An upload
-   * headersTimeout is the job cap, so it does not race the finalise
-   * window. A headers timeout that still arrives while finalise or the
-   * write_remote header window is armed maps to that window.
+   * A progress-window timeout keeps PIKVM_MSD_STATE_UNKNOWN and its own
+   * phase. The job cap, after the request was sent, is the same code
+   * with phase job_timeout. A body or stream idle abort keeps the
+   * generic message and no phase. An upload headersTimeout is the job
+   * cap. write_remote headersTimeout is the header window, so a headers
+   * timeout while that window is still armed maps to write_remote_headers.
+   * Whichever timer aborted is the only rejection. The other timer is
+   * cleared before that abort.
    */
   private msdWindowTimeout(err: unknown, endpoint: string, deadline: MsdDeadline): KvmdError | undefined {
     if (!isTimeoutError(err)) return undefined;
     const which = deadline.idleAbort();
-    const phase = deadline.phase();
-    if (which === 'finalise' || (which === undefined && phase === 'finalise' && isHeadersTimeout(err))) {
+    if (which === 'finalise') {
       return msdFinaliseTimeout(this.config.msdIdleTimeoutMs, endpoint);
     }
-    if (which === 'headers' || (which === undefined && phase === 'headers' && isHeadersTimeout(err))) {
+    if (which === 'headers') {
       return msdHeaderWindowTimeout(deadline.headerWindowMs(), endpoint);
+    }
+    if (which === 'body' || which === 'stream') return undefined;
+    const phase = deadline.phase();
+    if (!deadline.jobAbort() && phase === 'headers' && isHeadersTimeout(err)) {
+      return msdHeaderWindowTimeout(deadline.headerWindowMs(), endpoint);
+    }
+    // The job timer, or the upload headersTimeout set to that same cap.
+    // This includes a cap that fires during body, finalise, headers, or
+    // the write_remote stream.
+    if (deadline.jobAbort() || isHeadersTimeout(err)) {
+      return msdJobTimeout(this.config.msdJobTimeoutMs, endpoint);
     }
     return undefined;
   }

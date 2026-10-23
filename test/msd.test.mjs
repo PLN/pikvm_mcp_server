@@ -26,6 +26,7 @@
 // Modified 2026-10 by PLN: MSD progress windows (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: finalise window arms on request sent (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: upload finalise window is twice the idle timeout (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: a post-send job cap reports phase job_timeout (GPL-3.0; see NOTICE).
 
 /**
  * MSD tools against the mock. The HTTP harness matches test/http.test.mjs.
@@ -1387,7 +1388,8 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
             const elapsed = performance.now() - began;
             assert.equal(failed.state, 'failed');
             assert.equal(failed.error.type, 'PIKVM_MSD_HASH_TIMEOUT');
-            assert.match(failed.error.message, /hash timeout/);
+            assert.equal(failed.error.message, 'hash timeout after 500ms');
+            assert.equal(failed.error.phase, undefined);
             assert.ok(elapsed >= 400, `hash failed before the ceiling (${elapsed}ms)`);
             assert.ok(elapsed < 4000, `hash hung past the bound (${elapsed}ms)`);
             assert.ok(hung.fd >= 0, 'hash never called fs.read');

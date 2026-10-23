@@ -19,10 +19,12 @@
 // Modified 2026-10 by PLN: MSD progress windows (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: finalise window arms on request sent (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: upload finalise window is twice the idle timeout (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: stock nginx does not pre-empt the finalise window (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: nginx 60s bounds kvmd's finish, not the drain (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: catalog budgets use a monotonic clock (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a catalog read is not started with under 1 ms left (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: tests can see one catalog read and the upload slot (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: a post-send job cap reports phase job_timeout (GPL-3.0; see NOTICE).
 
 /**
  * Policy for MSD status, mount, eject, upload, and remove.
@@ -48,6 +50,7 @@ import {
   msdIdleTimeoutOf,
   msdJobTimeoutOf,
   type MsdDriveState,
+  type MsdWindowPhase,
   type MsdImageRecord,
   type MsdState,
   type MsdWriteResult,
@@ -117,8 +120,11 @@ export interface ErrorFields {
   type: string;
   message: string;
   endpoint: string;
-  /** Set when a progress window produced PIKVM_MSD_STATE_UNKNOWN. */
-  phase?: 'finalise' | 'write_remote_headers';
+  /**
+   * Set when a post-send timeout produced PIKVM_MSD_STATE_UNKNOWN.
+   * `job_timeout` is the job cap. Idle leaves this unset.
+   */
+  phase?: MsdWindowPhase;
 }
 
 /**
@@ -1484,11 +1490,16 @@ async function runUpload(
  * Confine the path, then return a jobId. Hashing and the kvmd pre-check
  * run in the job (state hashing, then running, then awaiting_catalog).
  * PIKVM_MSD_JOB_TIMEOUT_MS is only a last-resort cap. Hashing stops at
- * that cap. The timer is not the upload POST cap: the POST starts its
+ * that cap with PIKVM_MSD_HASH_TIMEOUT (`hash timeout after <ms>ms`).
+ * The timer is not the upload POST cap: the POST starts its
  * own when hashing has finished. On that hash timeout the upload slot
  * is released without waiting for the file close. The descriptor is
  * closed from the in-flight read's callback, or immediately when no
- * read is in flight.
+ * read is in flight. After the upload POST has been sent, the same cap
+ * is PIKVM_MSD_STATE_UNKNOWN with phase job_timeout. The message names
+ * PIKVM_MSD_JOB_TIMEOUT_MS and the millisecond value, and keeps the
+ * partial-or-complete tail. The slot is still released and the image
+ * is not removed. An idle or finalise abort keeps its own phase.
  * PIKVM_MSD_IDLE_TIMEOUT_MS bounds each hash read and the upload body.
  * The upload finalise window is twice that value, from undici's
  * onRequestSent until kvmd's response headers. The client cannot see
