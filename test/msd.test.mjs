@@ -1387,7 +1387,8 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
             const elapsed = performance.now() - began;
             assert.equal(failed.state, 'failed');
             assert.equal(failed.error.type, 'PIKVM_MSD_HASH_TIMEOUT');
-            assert.match(failed.error.message, /hash timeout/);
+            assert.equal(failed.error.message, 'hash timeout after 500ms');
+            assert.equal(failed.error.phase, undefined);
             assert.ok(elapsed >= 400, `hash failed before the ceiling (${elapsed}ms)`);
             assert.ok(elapsed < 4000, `hash hung past the bound (${elapsed}ms)`);
             assert.ok(hung.fd >= 0, 'hash never called fs.read');

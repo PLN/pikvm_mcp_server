@@ -182,7 +182,11 @@ export interface Config {
     /**
      * Last-resort safety cap for one MSD upload or write_remote, from
      * PIKVM_MSD_JOB_TIMEOUT_MS. Default 6 hours, max 7 days. 0 means the default.
-     * It is not the progress bound.
+     * It is not the progress bound. During hashing it is
+     * PIKVM_MSD_HASH_TIMEOUT. After the request has been sent it is
+     * PIKVM_MSD_STATE_UNKNOWN with phase job_timeout, on the upload body,
+     * upload finalise, write_remote headers, and the write_remote stream.
+     * The message names this variable and the millisecond value.
      */
     msdJobTimeoutMs: number;
     /**
@@ -199,7 +203,9 @@ export interface Config {
      * PIKVM_MSD_STATE_UNKNOWN), not the drain, which can use the full
      * 120s. The idle
      * timeout does not cap a phase that keeps making progress.
-     * PIKVM_MSD_JOB_TIMEOUT_MS stays a last-resort safety cap.
+     * PIKVM_MSD_JOB_TIMEOUT_MS stays a last-resort safety cap. After the
+     * request has been sent that cap is phase job_timeout. An idle abort
+     * has no phase. Finalise stays phase finalise.
      * The catalog wait uses PIKVM_MSD_READY_TIMEOUT_MS.
      */
     msdIdleTimeoutMs: number;

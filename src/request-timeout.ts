@@ -41,6 +41,12 @@ export function parseRequestTimeoutMs(raw: string | undefined): number {
 /**
  * Wall clock for one MSD upload or remote download. Six hours.
  * Not clamped to REQUEST_TIMEOUT_MAX_MS: that cap is for ordinary calls.
+ * During hashing the failure is PIKVM_MSD_HASH_TIMEOUT. After the request
+ * has been sent, on the upload body, upload finalise, write_remote
+ * headers, or the write_remote stream, it is PIKVM_MSD_STATE_UNKNOWN
+ * with phase job_timeout. The message names PIKVM_MSD_JOB_TIMEOUT_MS
+ * and this millisecond value. An idle, finalise, or header window keeps
+ * its own phase.
  */
 export const MSD_JOB_TIMEOUT_DEFAULT_MS = 6 * 60 * 60 * 1000;
 
