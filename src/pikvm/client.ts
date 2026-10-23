@@ -28,6 +28,7 @@
 // Modified 2026-10 by PLN: early headers leave the response idle timer in charge (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: forward onResponseStarted (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a post-send job cap reports phase job_timeout (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: the upload response read is phase job_timeout (GPL-3.0; see NOTICE).
 // AbortSignal.timeout and PIKVM_UNREACHABLE / PIKVM_AUTH_FAILED no-retry codes
 // adapted from dtrukr/pikvm_mcp_server src/pikvm/client.ts @ d120243 (GPL-3.0).
 // Snapshot HTTP 503 retry-once adapted from dvaerum/pikvm_mcp_server
@@ -49,8 +50,9 @@
 // with phase job_timeout. The message names PIKVM_MSD_JOB_TIMEOUT_MS and
 // the millisecond value, then says the image may be partial or complete;
 // re-read /api/msd and do not resend. It covers the upload body, upload
-// finalise, write_remote headers, and the write_remote stream. An idle,
-// finalise, or header window that fires keeps its own phase. The hash
+// finalise, the upload response read, write_remote headers, and the
+// write_remote stream. An idle, finalise, or header window that fires
+// keeps its own phase. The hash
 // cap stays PIKVM_MSD_HASH_TIMEOUT and does not use job_timeout. The
 // progress timer is cleared when the cap fires, and the cap timer is
 // cleared when a progress window fires, so only one of them rejects.
@@ -2443,12 +2445,16 @@ export class PiKVMClient {
     }
     if (which === 'body' || which === 'stream') return undefined;
     const phase = deadline.phase();
-    if (!deadline.jobAbort() && phase === 'headers' && isHeadersTimeout(err)) {
+    // A job cap calls disarm(), which sets the phase to off, before this
+    // runs. A headers timeout that still sees phase headers is the
+    // write_remote header window.
+    if (phase === 'headers' && isHeadersTimeout(err)) {
       return msdHeaderWindowTimeout(deadline.headerWindowMs(), endpoint);
     }
     // The job timer, or the upload headersTimeout set to that same cap.
-    // This includes a cap that fires during body, finalise, headers, or
-    // the write_remote stream.
+    // This includes a cap that fires during the upload body, finalise,
+    // the upload response read, write_remote headers, or the
+    // write_remote stream.
     if (deadline.jobAbort() || isHeadersTimeout(err)) {
       return msdJobTimeout(this.config.msdJobTimeoutMs, endpoint);
     }

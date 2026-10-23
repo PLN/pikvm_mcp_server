@@ -13,6 +13,7 @@
 // Modified 2026-10 by PLN: finalise arms on request sent, and the upload highWaterMark is 1 (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: onResponseStarted is counted through the interceptor (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a post-send job cap reports phase job_timeout (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: the upload response read is phase job_timeout (GPL-3.0; see NOTICE).
 
 /**
  * Plain kvmd MSD client methods against the mock. No MCP tools.
@@ -1105,6 +1106,33 @@ describe('MSD client', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
         },
       );
     }, { msdJobTimeoutMs: jobMs, msdIdleTimeoutMs: idleMs });
+  });
+
+  msdTest('the job cap during the upload response read is job_timeout', { timeout: 15000 }, async () => {
+    // Headers go out as soon as the body has been read. The response body
+    // then waits longer than the job cap. The idle bound is longer than
+    // the cap, so the cap is what fires while that body is unread.
+    const jobMs = 400;
+    const idleMs = 3000;
+    const started = performance.now();
+    await withMock({ writeResponseHoldMs: 8000 }, async (mock, client) => {
+      await assert.rejects(
+        () => client.msdWrite('held.img', bodyOf('abcd'), 4),
+        (err) => {
+          assert.ok(err instanceof KvmdError);
+          assert.equal(err.status, 0);
+          assert.equal(err.type, 'PIKVM_MSD_STATE_UNKNOWN');
+          assert.equal(err.message, jobTimeoutMessage(jobMs));
+          assert.equal(err.phase, 'job_timeout');
+          assert.equal(err.endpoint, 'POST /api/msd/write');
+          return true;
+        },
+      );
+      assert.equal(mock.uploads[0].responseHeadersSent, true);
+    }, { msdJobTimeoutMs: jobMs, msdIdleTimeoutMs: idleMs });
+    const elapsed = performance.now() - started;
+    assert.ok(elapsed < idleMs, `response read waited for the idle bound: ${elapsed}ms`);
+    assert.ok(elapsed < 2500, `job cap waited too long: ${elapsed}ms`);
   });
 
   msdTest('the job cap during write_remote headers is job_timeout, not the header phase', { timeout: 15000 }, async () => {
