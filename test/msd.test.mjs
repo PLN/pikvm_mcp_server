@@ -27,6 +27,7 @@
 // Modified 2026-10 by PLN: finalise window arms on request sent (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: upload finalise window is twice the idle timeout (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a post-send job cap reports phase job_timeout (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: the upload response read is phase job_timeout (GPL-3.0; see NOTICE).
 
 /**
  * MSD tools against the mock. The HTTP harness matches test/http.test.mjs.
@@ -1682,6 +1683,42 @@ describe('MSD tools', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
             assert.equal(againFailed.state, 'failed');
             assert.equal(againFailed.error.type, 'PIKVM_MSD_STATE_UNKNOWN');
             assert.equal(msdUploadSlotsFree(), true);
+          });
+        });
+      });
+    });
+
+    await msdSubtest(t, 'a job cap after send fails the job with phase job_timeout', async () => {
+      await withDir(async (dir) => {
+        await writeFile(join(dir, 'disk.img'), body);
+        const jobMs = 400;
+        const idleMs = 3000;
+        await whileWatchingProcess(async () => {
+          const flags = uploadMsd(dir);
+          flags.msdIdleTimeoutMs = idleMs;
+          flags.msdJobTimeoutMs = jobMs;
+          await withSession({
+            images: [],
+            free: 1000,
+            writeResponseHoldMs: 8000,
+          }, flags, async ({ mock, base, sessionId }) => {
+            const started = await callTool(base, sessionId, 'pikvm_msd_upload', {
+              file: 'disk.img',
+              confirmImage: 'disk.img',
+            });
+            assert.equal(started.isError, undefined, started.content[0].text);
+            const { jobId } = JSON.parse(started.content[0].text);
+            const failed = await pollJob(base, sessionId, jobId, 4000);
+            assert.equal(failed.state, 'failed');
+            assert.equal(failed.error.status, 0);
+            assert.equal(failed.error.type, 'PIKVM_MSD_STATE_UNKNOWN');
+            assert.equal(failed.error.phase, 'job_timeout');
+            assert.equal(
+              failed.error.message,
+              `job timeout after ${jobMs}ms (PIKVM_MSD_JOB_TIMEOUT_MS); image may be partial or complete; re-read /api/msd; do not resend`,
+            );
+            assert.equal(mock.uploads[0].responseHeadersSent, true);
+            assert.equal(mock.calls.some((call) => call.path === '/api/msd/remove'), false);
           });
         });
       });

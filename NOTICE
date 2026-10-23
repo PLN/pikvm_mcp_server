@@ -64,6 +64,7 @@ Modified 2026-10 by PLN: a slow drain can end finalise with bytes in flight (GPL
 Modified 2026-10 by PLN: early headers leave the response idle timer in charge (GPL-3.0; see below).
 Modified 2026-10 by PLN: forward onResponseStarted (GPL-3.0; see below).
 Modified 2026-10 by PLN: a post-send job cap reports phase job_timeout (GPL-3.0; see below).
+Modified 2026-10 by PLN: the upload response read is phase job_timeout (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -1100,4 +1101,17 @@ No code from another pikvm_mcp_server fork was added for these methods.
   PIKVM_MSD_HASH_TIMEOUT (hash timeout after <ms>ms). The upload slot is
   released the same way and the image is not removed. There is no new
   environment variable.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  The pikvm_msd_upload and pikvm_msd_fetch_url descriptions quote the
+  post-send job cap as "re-read /api/msd; do not resend". A job cap that
+  fires while the upload response is being read, after the headers have
+  arrived and the body has stalled, stays PIKVM_MSD_STATE_UNKNOWN with
+  phase job_timeout and that same message. The phase lists name that
+  read along with the upload body, upload finalise, write_remote
+  headers, and the write_remote stream. The header-window headers
+  timeout no longer checks jobAbort, because disarm already sets the
+  phase to off. pikvm_msd_job returns that failure with the phase.
+  There is no new environment variable.
   No code from another pikvm_mcp_server fork was copied.

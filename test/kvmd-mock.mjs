@@ -15,6 +15,7 @@
 // Modified 2026-10 by PLN: stall a write_remote stream after N lines (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: pace a write body (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: stream an upload response before the body is finished (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: the upload response read is phase job_timeout (GPL-3.0; see NOTICE).
 
 /**
  * Minimal KVMD REST mock implementing exactly the routes src/pikvm/client.ts
@@ -42,7 +43,9 @@
  * An error line does not leave an image: kvmd removes the incomplete
  * file itself. `storeIncomplete` keeps that file so a test can see our remove.
  * `pauseWrite` accepts POST /api/msd/write, pauses the request, and does
- * not read the body until the socket closes. `resetDuringWrite` destroys
+ * not read the body until the socket closes. `writeResponseHoldMs` sends
+ * the upload response headers, then waits that long before the body.
+ * `resetDuringWrite` destroys
  * the socket after the first body chunk. A write in progress sets
  * `state.busy` and `state.uploading`. `holdMutations` is how many
  * MSD set_params calls wait until `releaseHold()`. `images` seeds storage
@@ -755,6 +758,22 @@ export async function startKvmdMock(options = {}) {
         if (options.writeHoldMs) await waitOrSocketClose(req, options.writeHoldMs);
         keepComplete();
         if (clientGone(req, res)) return true;
+        if (options.writeResponseHoldMs) {
+          const payload = JSON.stringify({
+            ok: true,
+            result: { image: { name: image, size: buf.length, written: buf.length } },
+          });
+          res.writeHead(200, {
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(payload),
+          });
+          res.flushHeaders();
+          const recorded = uploads[uploads.length - 1];
+          if (recorded) recorded.responseHeadersSent = true;
+          await waitOrSocketClose(req, options.writeResponseHoldMs);
+          if (!clientGone(req, res)) res.end(payload);
+          return true;
+        }
         kvmdOk(res, { image: { name: image, size: buf.length, written: buf.length } });
         return true;
       } finally {

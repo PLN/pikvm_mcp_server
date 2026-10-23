@@ -10,6 +10,7 @@
 // Modified 2026-10 by PLN: stock nginx does not pre-empt the finalise window (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: nginx 60s bounds kvmd's finish, not the drain (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a post-send job cap reports phase job_timeout (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: the upload response read is phase job_timeout (GPL-3.0; see NOTICE).
 
 /** Default abort deadline for one ordinary kvmd call. */
 export const REQUEST_TIMEOUT_DEFAULT_MS = 5000;
@@ -44,9 +45,10 @@ export function parseRequestTimeoutMs(raw: string | undefined): number {
  * Wall clock for one MSD upload or remote download. Six hours.
  * Not clamped to REQUEST_TIMEOUT_MAX_MS: that cap is for ordinary calls.
  * During hashing the failure is PIKVM_MSD_HASH_TIMEOUT. After the request
- * has been sent, on the upload body, upload finalise, write_remote
- * headers, or the write_remote stream, it is PIKVM_MSD_STATE_UNKNOWN
- * with phase job_timeout. The message names PIKVM_MSD_JOB_TIMEOUT_MS
+ * has been sent, on the upload body, upload finalise, the upload
+ * response read, write_remote headers, or the write_remote stream, it is
+ * PIKVM_MSD_STATE_UNKNOWN with phase job_timeout. The message names
+ * PIKVM_MSD_JOB_TIMEOUT_MS
  * and this millisecond value. An idle, finalise, or header window keeps
  * its own phase.
  */
