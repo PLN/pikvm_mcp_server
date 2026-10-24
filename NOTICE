@@ -65,6 +65,8 @@ Modified 2026-10 by PLN: early headers leave the response idle timer in charge (
 Modified 2026-10 by PLN: forward onResponseStarted (GPL-3.0; see below).
 Modified 2026-10 by PLN: a post-send job cap reports phase job_timeout (GPL-3.0; see below).
 Modified 2026-10 by PLN: the upload response read is phase job_timeout (GPL-3.0; see below).
+Modified 2026-10 by PLN: production dependency refresh and sharp 0.35 types (GPL-3.0; see below).
+Modified 2026-10 by PLN: allowScripts names sharp@0.35.5 (GPL-3.0; see below).
 Modified 2026-10 by PLN: private vulnerability reporting (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
@@ -1115,6 +1117,34 @@ No code from another pikvm_mcp_server fork was added for these methods.
   timeout no longer checks jobAbort, because disarm already sets the
   phase to off. pikvm_msd_job returns that failure with the phase.
   There is no new environment variable.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  Production dependencies move to the lowest releases that clear the
+  npm audit advisories reported at 5cbafa8. @modelcontextprotocol/sdk
+  is 1.32.0 (the 1.32.0 floor; 1.32.1 and 1.32.2 do not fix further
+  advisories). undici is 7.30.1. sharp is 0.35.5. Transitive packages
+  are the latest versions that still satisfy those parents and are not
+  vulnerable, including express 5.3.0, express-rate-limit 8.7.1,
+  ip-address 10.7.4, proxy-addr 2.0.8, body-parser 2.4.0, qs 6.16.1,
+  path-to-regexp 8.4.2, hono 4.13.13, @hono/node-server 2.1.5, zod
+  4.6.7, ajv 8.20.0, and fast-uri 3.1.9. dotenv stays 17.2.3. The dev
+  dependencies are unchanged. proxy-addr is not a direct dependency.
+  express 5.3.0 depends on proxy-addr ^2.0.8, and the lockfile resolves
+  2.0.8, so no override is added. allowScripts is unchanged, including
+  the sharp@0.33.5 allow. sharp 0.35.5 publishes no install script, and
+  npm ci --strict-allow-scripts still passes with that stale key.
+  limitedSharp uses the named Sharp type from that release.
+  engines.node stays >=22.9.0. The earlier note that no dependency
+  version was changed, and that undici was 7.24.1, describes the
+  licence edit only.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  Corrects the entry above: allowScripts now names sharp@0.35.5,
+  replacing the sharp@0.33.5 key. The value stays allowed. sharp
+  0.35.5 has no install script. esbuild@0.27.2 and fsevents@2.3.3
+  stay denied and are unchanged.
   No code from another pikvm_mcp_server fork was copied.
 
 2026-10, by PLN:
