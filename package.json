@@ -25,7 +25,7 @@
   "author": "",
   "license": "GPL-3.0-only",
   "allowScripts": {
-    "sharp@0.33.5": true,
+    "sharp@0.35.5": true,
     "esbuild@0.27.2": false,
     "fsevents@2.3.3": false
   },

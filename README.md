@@ -39,6 +39,7 @@
 <!-- Modified 2026-10 by PLN: a post-send job cap reports phase job_timeout (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: the upload response read is phase job_timeout (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: undici floor is 7.30.1 (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: allowScripts names sharp@0.35.5 (GPL-3.0; see NOTICE) -->
 
 # PiKVM MCP Server
 
@@ -101,7 +102,7 @@ npm install
 npm run build
 ```
 
-`package.json` `allowScripts` is pinned to the versions in `package-lock.json`: `sharp@0.33.5` is allowed, and `esbuild@0.27.2` and `fsevents@2.3.3` are denied. sharp is used at runtime and its install script stays allowed. esbuild is only pulled in by `tsx` for `npm run dev`, and its postinstall is denied. fsevents is an optional dependency of `tsx`, installed on macOS only, and its install script is denied. A bump of any of these packages must update that pin in the same change, after the new install script is reviewed. Do not replace the map with a blanket allow. CI installs with npm 12 and `--strict-allow-scripts`, which fails the install when a dependency install script is neither allowed nor denied.
+`package.json` `allowScripts` is pinned to the versions in `package-lock.json`: `sharp@0.35.5` is allowed, and `esbuild@0.27.2` and `fsevents@2.3.3` are denied. sharp is used at runtime. sharp 0.35.5 publishes no install script; the pin still names that version and allows it. esbuild is only pulled in by `tsx` for `npm run dev`, and its postinstall is denied. fsevents is an optional dependency of `tsx`, installed on macOS only, and its install script is denied. A bump of any of these packages must update that pin in the same change, after the new install script is reviewed. Do not replace the map with a blanket allow. CI installs with npm 12 and `--strict-allow-scripts`, which fails the install when a dependency install script is neither allowed nor denied.
 
 ## Configuration
 
