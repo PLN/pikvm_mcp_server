@@ -65,6 +65,7 @@ Modified 2026-10 by PLN: early headers leave the response idle timer in charge (
 Modified 2026-10 by PLN: forward onResponseStarted (GPL-3.0; see below).
 Modified 2026-10 by PLN: a post-send job cap reports phase job_timeout (GPL-3.0; see below).
 Modified 2026-10 by PLN: the upload response read is phase job_timeout (GPL-3.0; see below).
+Modified 2026-10 by PLN: private vulnerability reporting (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -1114,4 +1115,46 @@ No code from another pikvm_mcp_server fork was added for these methods.
   timeout no longer checks jobAbort, because disarm already sets the
   phase to off. pikvm_msd_job returns that failure with the phase.
   There is no new environment variable.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  Wrote .github/dependabot.yml fresh. It schedules weekly version
+  updates for npm and for GitHub Actions. Minor and patch updates
+  are one group per ecosystem. Each group sets applies-to to
+  version-updates. Dependabot security updates are configured in
+  the repository settings, not by that group, so each security
+  update stays its own pull request. The open pull request limit
+  is 3 per ecosystem. Commit prefixes are chore(deps) and
+  chore(ci). Docker is not included.
+  Wrote .github/workflows/codeql.yml fresh. It analyses
+  javascript-typescript with build-mode none on pull requests to
+  main, pushes to main, and a weekly schedule. The job may read
+  contents and write security events.
+  Wrote .github/workflows/dependency-review.yml fresh. It runs on
+  pull requests to main and fails when a pull request introduces
+  a high or critical advisory. It does not comment on the pull
+  request. The job may read contents.
+  The CI workflow gains one Ubuntu job on Node 22.14.0 that runs
+  npm audit --omit=dev. Advisories produce a warning annotation.
+  The job still succeeds. The hard gate belongs to the release
+  workflow later. The existing test and allow-scripts jobs are
+  unchanged. Their actions were already pinned to
+  actions/checkout v5.1.0
+  (fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09) and
+  actions/setup-node v5.0.0
+  (a0853c24544627f65ddf259abe73b1d18a591444). Those tag commits
+  were checked and the pins were left in place. Checkout in the
+  CI workflow still uses the action default for credentials.
+  New workflows pin actions/checkout v7.0.1
+  (3d3c42e5aac5ba805825da76410c181273ba90b1), github/codeql-action
+  v4.39.1 (9b3254085494b55a0f7c4c2b3d2d52cc712ce370), and
+  actions/dependency-review-action v5.0.0
+  (a1d282b36b6f3519aa1f3fc636f609c47dddb294), and set
+  persist-credentials to false.
+  Wrote SECURITY.md fresh. A vulnerability is reported from the
+  Security tab, Report a vulnerability, and not as a public issue.
+  Only the latest release and the main branch are supported. No
+  stable release has been published. PLN tries to acknowledge a
+  report within a few days. Assessment and a fix are best-effort.
+  There is no service-level agreement.
   No code from another pikvm_mcp_server fork was copied.

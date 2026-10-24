@@ -1,0 +1,39 @@
+# Modified 2026-10 by PLN: weekly npm and actions updates (GPL-3.0; see NOTICE).
+# Docker is not configured here. It joins in a separate change.
+#
+# Each group sets applies-to: version-updates. Dependabot security
+# updates are turned on in the repository settings, not by this file.
+# A group limited to version updates does not batch those security
+# updates, so each one stays its own pull request.
+
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: chore(deps)
+    groups:
+      npm-minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: chore(ci)
+    groups:
+      actions-minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - minor
+          - patch
