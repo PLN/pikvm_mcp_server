@@ -38,6 +38,7 @@
 <!-- Modified 2026-10 by PLN: rollbackError entries, typed eject, and catalog cleanup (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: a post-send job cap reports phase job_timeout (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: the upload response read is phase job_timeout (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: undici floor is 7.30.1 (GPL-3.0; see NOTICE) -->
 
 # PiKVM MCP Server
 
@@ -427,7 +428,7 @@ curl -i -X POST http://localhost:8675/mcp \
 
 ## Usage with Claude Code
 
-> **Node.js:** `engines` is `>=22.9.0`. Pin mode sets `allowPartialTrustChain`, which Node added in 22.9.0, so a CA-signed leaf can be the pin. Node.js 20 is end-of-life. The runtime dependency undici 7.24.1 needs Node.js >=20.18.1, and `npm test` quotes a glob that `node --test` expands only on Node.js 21 and later. This server uses ES modules. If `node --version` shows an older version, replace `"command": "node"` with the full path to a compatible binary (e.g. `"/usr/local/bin/node"` or your nvm path like `"~/.nvm/versions/node/v22.x.x/bin/node"`). This is common when nvm's default alias points to an older version.
+> **Node.js:** `engines` is `>=22.9.0`. Pin mode sets `allowPartialTrustChain`, which Node added in 22.9.0, so a CA-signed leaf can be the pin. Node.js 20 is end-of-life. The runtime dependency undici 7.30.1 needs Node.js >=20.18.1, and `npm test` quotes a glob that `node --test` expands only on Node.js 21 and later. This server uses ES modules. If `node --version` shows an older version, replace `"command": "node"` with the full path to a compatible binary (e.g. `"/usr/local/bin/node"` or your nvm path like `"~/.nvm/versions/node/v22.x.x/bin/node"`). This is common when nvm's default alias points to an older version.
 
 Add to your Claude Code MCP settings (`~/.config/claude-code/settings.json` or via the settings UI):
 
