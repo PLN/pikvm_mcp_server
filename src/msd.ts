@@ -25,6 +25,7 @@
 // Modified 2026-10 by PLN: a catalog read is not started with under 1 ms left (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: tests can see one catalog read and the upload slot (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a post-send job cap reports phase job_timeout (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: in-flight upload and fetch abort on shutdown (GPL-3.0; see NOTICE).
 
 /**
  * Policy for MSD status, mount, eject, upload, and remove.
@@ -586,6 +587,40 @@ export function msdUploadSlotsFree(): boolean {
 }
 
 const UPLOAD_POLL_MS = 1500;
+
+/**
+ * Uploads and fetch-URL writes that shutdown can abort. Added when the
+ * kvmd POST starts and removed in a finally. abort() on an already
+ * aborted controller is a no-op. The client removes its own listener
+ * when the POST ends.
+ */
+const inFlightTransfers = new Set<AbortController>();
+
+function openTransfer(): { signal: AbortSignal; end: () => void } {
+  const ctrl = new AbortController();
+  inFlightTransfers.add(ctrl);
+  let ended = false;
+  return {
+    signal: ctrl.signal,
+    end() {
+      if (ended) return;
+      ended = true;
+      inFlightTransfers.delete(ctrl);
+    },
+  };
+}
+
+/** Abort every in-flight upload and fetch-URL write. Idempotent. */
+export function abortInFlightTransfers(): void {
+  for (const ctrl of inFlightTransfers) {
+    if (!ctrl.signal.aborted) ctrl.abort();
+  }
+}
+
+/** Test-only. How many upload or fetch-URL writes are in the registry. */
+export function inFlightTransferCountForTests(): number {
+  return inFlightTransfers.size;
+}
 const JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const JOB_CAP = 64;
 const CATALOG_POLL_MIN_MS = 250;
@@ -1352,7 +1387,16 @@ async function runUpload(
       }).catch(() => undefined);
     }, pollMs);
     timer.unref();
-    const result = await client.msdWrite(file, body, size, { removeIncomplete: true });
+    const transfer = openTransfer();
+    let result: MsdWriteResult;
+    try {
+      result = await client.msdWrite(file, body, size, {
+        removeIncomplete: true,
+        signal: transfer.signal,
+      });
+    } finally {
+      transfer.end();
+    }
     wrote = true;
     if (timer) {
       clearInterval(timer);
@@ -1633,15 +1677,21 @@ async function runFetch(
     const addresses = await resolveFetchHost(inspected.hostname, request.resolveUrl);
     assertResolvedAddresses(addresses, request.allow, request.allowPrivate);
     await assertFetchAllowed(client, image);
-    for await (const row of client.msdWriteRemote(inspected.href, {
-      image,
-      removeIncomplete: true,
-      timeout: request.connectTimeoutSec,
-    })) {
-      last = row;
-      if (row.name === image) sawOurImage = true;
-      job.bytes = row.written;
-      job.total = row.size;
+    const transfer = openTransfer();
+    try {
+      for await (const row of client.msdWriteRemote(inspected.href, {
+        image,
+        removeIncomplete: true,
+        timeout: request.connectTimeoutSec,
+        signal: transfer.signal,
+      })) {
+        last = row;
+        if (row.name === image) sawOurImage = true;
+        job.bytes = row.written;
+        job.total = row.size;
+      }
+    } finally {
+      transfer.end();
     }
     // msdWriteRemote throws PIKVM_MSD_STATE_UNKNOWN when the stream ends
     // with written !== size. That happens before this line, and the catch

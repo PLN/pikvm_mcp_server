@@ -29,6 +29,7 @@
 // Modified 2026-10 by PLN: forward onResponseStarted (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a post-send job cap reports phase job_timeout (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: the upload response read is phase job_timeout (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: external abort on msd write and write_remote (GPL-3.0; see NOTICE).
 // AbortSignal.timeout and PIKVM_UNREACHABLE / PIKVM_AUTH_FAILED no-retry codes
 // adapted from dtrukr/pikvm_mcp_server src/pikvm/client.ts @ d120243 (GPL-3.0).
 // Snapshot HTTP 503 retry-once adapted from dvaerum/pikvm_mcp_server
@@ -121,6 +122,11 @@
 // re-read /api/msd"). That flag is the source stream's own error event.
 // On undici 7.24.1 an abort or reset while kvmd is not reading destroys
 // the upload wrapper; that is not a source error.
+// An AbortSignal passed to msdWrite or msdWriteRemote is joined to that
+// deadline. The external abort is PIKVM_MSD_STATE_UNKNOWN with no phase.
+// This client does not remove the image. remove_incomplete is unchanged.
+// close() still waits for in-flight calls. destroyDispatcher() drops the
+// sockets so shutdown does not wait out an upload.
 // MSD facts are from pikvm/kvmd v4.227 (0dd244f) and docs.pikvm.org.
 
 /**
@@ -456,6 +462,11 @@ export interface MsdWriteOptions {
    * leave a partial image. Pass false to keep kvmd's own default.
    */
   removeIncomplete?: boolean;
+  /**
+   * Aborts this POST. Reported as PIKVM_MSD_STATE_UNKNOWN. This method
+   * does not remove the image. The listener is removed when the call ends.
+   */
+  signal?: AbortSignal;
 }
 
 export interface MsdWriteResult {
@@ -482,6 +493,11 @@ export interface MsdWriteRemoteOptions {
    */
   timeout?: number;
   removeIncomplete?: boolean;
+  /**
+   * Aborts this POST. Reported as PIKVM_MSD_STATE_UNKNOWN. This method
+   * does not remove the image. The listener is removed when the call ends.
+   */
+  signal?: AbortSignal;
 }
 
 /** Idempotent GET attempts, including the first. */
@@ -1034,11 +1050,32 @@ interface MsdDeadline {
    * window had already aborted.
    */
   jobAbort: () => boolean;
+  /** True when the caller's AbortSignal aborted this deadline. */
+  externalAbort: () => boolean;
 }
 
-function startMsdDeadline(jobMs: number, idleMs: number): MsdDeadline {
+function watchExternalAbort(external: AbortSignal | undefined, fire: () => void): () => void {
+  if (!external) return () => {};
+  if (external.aborted) {
+    fire();
+    return () => {};
+  }
+  external.addEventListener('abort', fire);
+  return () => {
+    external.removeEventListener('abort', fire);
+  };
+}
+
+function startMsdDeadline(jobMs: number, idleMs: number, external?: AbortSignal): MsdDeadline {
   const jobCtrl = new AbortController();
   const idleCtrl = new AbortController();
+  const externalCtrl = new AbortController();
+  let externalFired = false;
+  const detachExternal = watchExternalAbort(external, () => {
+    if (externalFired) return;
+    externalFired = true;
+    if (!externalCtrl.signal.aborted) externalCtrl.abort();
+  });
   let idleTimer: ReturnType<typeof setTimeout> | undefined;
   let jobTimer: ReturnType<typeof setTimeout> | undefined;
   let generation = 0;
@@ -1111,6 +1148,7 @@ function startMsdDeadline(jobMs: number, idleMs: number): MsdDeadline {
     disarm();
   };
   const done = () => {
+    detachExternal();
     disarm();
     clearJobTimer();
     jobCtrl.signal.removeEventListener('abort', onJob);
@@ -1123,7 +1161,7 @@ function startMsdDeadline(jobMs: number, idleMs: number): MsdDeadline {
   jobCtrl.signal.addEventListener('abort', onJob, { once: true });
   arm();
   return {
-    signal: AbortSignal.any([jobCtrl.signal, idleCtrl.signal]),
+    signal: AbortSignal.any([jobCtrl.signal, idleCtrl.signal, externalCtrl.signal]),
     arm,
     armFinalise,
     armHeaderWindow,
@@ -1134,6 +1172,7 @@ function startMsdDeadline(jobMs: number, idleMs: number): MsdDeadline {
     phase: () => phase,
     headerWindowMs: () => headerMs,
     jobAbort: () => jobFired,
+    externalAbort: () => externalFired,
   };
 }
 
@@ -1196,6 +1235,14 @@ export function msdJobTimeoutOf(client: PiKVMClient): number {
  */
 export function msdIdleTimeoutOf(client: PiKVMClient): number {
   return msdIdleTimeouts.get(client) ?? MSD_IDLE_TIMEOUT_DEFAULT_MS;
+}
+
+function dropDispatcher(dispatcher: Dispatcher): void {
+  const flagged = dispatcher as Dispatcher & { destroyed?: boolean };
+  if (flagged.destroyed) return;
+  // The callback form does not return a promise. A second destroy is a no-op
+  // inside undici once `destroyed` is set, which happens before the callback.
+  dispatcher.destroy(() => {});
 }
 
 interface ResolvedPiKVMConfig extends PiKVMConfig {
@@ -1268,10 +1315,21 @@ export class PiKVMClient {
   }
 
   /**
-   * Close the kvmd dispatcher.
+   * Close the kvmd dispatcher. Waits for in-flight calls.
    */
   async close(): Promise<void> {
     await this.dispatcher.close();
+  }
+
+  /**
+   * Drop in-flight kvmd calls. close() waits for them and would hang on
+   * an upload. The owned dispatcher is destroyed, and so is a dispatcher
+   * installed for tests when that is a different object.
+   */
+  destroyDispatcher(): void {
+    const extra = testDispatchers.get(this);
+    dropDispatcher(this.dispatcher);
+    if (extra && extra !== this.dispatcher) dropDispatcher(extra);
   }
 
   /** Host string this client was given. The registry stores a normalised origin. */
@@ -2125,6 +2183,7 @@ export class PiKVMClient {
       'POST /api/msd/write',
       body,
       size,
+      options.signal,
     );
     const imageInfo = readWriteImage(outcome.result);
     if (!imageInfo) {
@@ -2166,7 +2225,11 @@ export class PiKVMClient {
     let deadline: MsdDeadline | undefined;
     let responseBody: AsyncIterable<Uint8Array> | undefined;
     try {
-      deadline = startMsdDeadline(this.config.msdJobTimeoutMs, this.config.msdIdleTimeoutMs);
+      deadline = startMsdDeadline(
+        this.config.msdJobTimeoutMs,
+        this.config.msdIdleTimeoutMs,
+        options.signal,
+      );
       const response = await this.msdDispatch(
         `/msd/write_remote?${query}`,
         endpoint,
@@ -2265,12 +2328,13 @@ export class PiKVMClient {
     endpoint: string,
     body: Readable | undefined,
     size: number | undefined,
+    signal?: AbortSignal,
   ): Promise<{ statusCode: number; result: unknown }> {
     let deadline: MsdDeadline | undefined;
     let responseBody: AsyncIterable<Uint8Array> | undefined;
     const watch: MsdWatch = { sourceError: false };
     try {
-      deadline = startMsdDeadline(this.config.msdJobTimeoutMs, this.config.msdIdleTimeoutMs);
+      deadline = startMsdDeadline(this.config.msdJobTimeoutMs, this.config.msdIdleTimeoutMs, signal);
       const response = await this.msdDispatch(path, endpoint, body, size, deadline, watch);
       responseBody = response.body;
       deadline.arm();
@@ -2421,6 +2485,9 @@ export class PiKVMClient {
       if (windowError) return windowError;
       return msdStateUnknown(0, endpoint);
     }
+    // An external abort is the same code as a post-send deadline. It has
+    // no phase: the job cap and the progress windows keep their own text.
+    if (deadline?.externalAbort()) return msdStateUnknown(0, endpoint);
     return new KvmdError(0, 'PIKVM_UNREACHABLE', 'kvmd network error', endpoint);
   }
 
