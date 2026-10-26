@@ -1239,4 +1239,6 @@ No code from another pikvm_mcp_server fork was added for these methods.
   A failed OCR spawn is dropped the same way as an exit.
   One throwing shutdown step does not skip the later steps. The
   exit code is 1 if any step threw.
+  The process starts from a direct launch and from a symlink. No
+  startup-hold environment variable is read.
   No code from another pikvm_mcp_server fork was copied.

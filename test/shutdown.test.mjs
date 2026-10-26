@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { spawn } from 'node:child_process';
 import { getEventListeners } from 'node:events';
-import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -34,7 +34,7 @@ import {
   OcrError,
   setOcrSpawnForTests,
 } from '../dist/ocr.js';
-import { shutdownTargetsForTests } from '../dist/index.js';
+import { shutdownTargets } from '../dist/shutdown-targets.js';
 import { startHttpServer } from '../dist/http.js';
 import {
   requestShutdown,
@@ -283,6 +283,49 @@ describe('shutdown', { concurrency: 1 }, () => {
     assert.equal(inFlightTransferCountForTests(), 0);
   });
 
+  test('shutdown does not remove an image after a fetch progress line', async (t) => {
+    arm(t);
+    const mock = await startKvmdMock({
+      remote: { stallAfterLines: 1, stallMs: 120000 },
+    });
+    const client = makeClient(mock);
+    t.after(() => mock.close());
+    const { jobId } = await startMsdFetch(client, {
+      device: 'fetch-progress-shutdown',
+      url: 'https://images.example/iso/disk.img',
+      image: 'disk.img',
+      confirmImage: 'disk.img',
+      extensions: ['.img'],
+      allow: ALLOW,
+      allowPrivate: false,
+      connectTimeoutSec: 30,
+      resolveUrl: async () => ['192.0.3.10'],
+    });
+    await waitFor('fetch progress', () => {
+      const job = readMsdJob(jobId);
+      return job !== undefined && job.bytes > 0;
+    });
+    const codes = [];
+    requestShutdown(noopTargets({
+      destroyDispatchers() {
+        client.destroyDispatcher();
+      },
+      abortTransfers: abortInFlightTransfers,
+      exit(code) {
+        codes.push(code);
+      },
+    }));
+    await waitFor('shutdown exit', () => codes.length > 0, 2000);
+    assert.deepEqual(codes, [0]);
+    await waitFor('fetch job failed', () => readMsdJob(jobId)?.state === 'failed', 5000);
+    const job = readMsdJob(jobId);
+    assert.equal(job.error.type, 'PIKVM_MSD_STATE_UNKNOWN');
+    assert.equal(job.removed, undefined);
+    assert.equal(mock.calls.some((call) => call.path === '/api/msd/remove'), false);
+    await waitFor('fetch slot', () => msdUploadSlotsFree());
+    assert.equal(inFlightTransferCountForTests(), 0);
+  });
+
   test('shutdown with nothing in flight exits 0 quickly', async (t) => {
     arm(t);
     const codes = [];
@@ -469,6 +512,73 @@ describe('shutdown', { concurrency: 1 }, () => {
     assert.equal(result.signal, null, stderr);
   });
 
+  test('stdio exits 0 when stdin ends during an upload', async (t) => {
+    arm(t);
+    const mock = await startKvmdMock({ pauseWrite: true });
+    const dir = await mkdtemp(join(tmpdir(), 'pikvm-shutdown-'));
+    t.after(async () => {
+      await mock.close();
+      await rm(dir, { recursive: true, force: true });
+    });
+    await writeFile(join(dir, 'disk.iso'), Buffer.alloc(1024, 7));
+    const env = baseEnv({
+      PIKVM_HOST: mock.url,
+      PIKVM_MSD_LOCAL_DIR: dir,
+      PIKVM_MSD_MAX_BYTES: String(1024 * 1024),
+      PIKVM_MCP_ARM_MSD: '1',
+    });
+    const child = spawn(process.execPath, [join(REPO, 'dist', 'index.js')], {
+      cwd: REPO,
+      env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let stderr = '';
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk;
+    });
+    const lines = stdioLines(child);
+    t.after(() => {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    });
+    await waitFor('stdio ready', () => stderr.includes('PiKVM MCP Server running'), 5000);
+    child.stdin.write(`${JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: {
+        protocolVersion: '2025-06-18',
+        capabilities: {},
+        clientInfo: { name: 'shutdown-test', version: '1' },
+      },
+    })}\n`);
+    await lines.waitForId(1);
+    child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`);
+    child.stdin.write(`${JSON.stringify({
+      jsonrpc: '2.0',
+      id: 2,
+      method: 'tools/call',
+      params: {
+        name: 'pikvm_msd_upload',
+        arguments: { file: 'disk.iso', confirmImage: 'disk.iso' },
+      },
+    })}\n`);
+    const uploaded = await lines.waitForId(2);
+    assert.equal(uploaded.result?.isError, undefined, JSON.stringify(uploaded));
+    await waitFor('upload POST', () => mock.calls.some((entry) => entry.path === '/api/msd/write'));
+    await waitFor('upload paused', () => mock.state.uploading !== null);
+    const exit = new Promise((resolve) => {
+      child.once('exit', (code, signal) => resolve({ code, signal, at: performance.now() }));
+    });
+    const began = performance.now();
+    child.stdin.end();
+    const result = await waitForExit(exit, 2000);
+    assert.equal(result.code, 0, stderr);
+    assert.equal(result.signal, null, stderr);
+    assert.ok(result.at - began < 2000, `exit took ${result.at - began}ms`);
+    assertQuiet(stderr);
+  });
+
   // Windows process.kill(pid, 'SIGTERM') terminates the process without
   // running the signal handler, so this test cannot observe shutdown.
   test('stdio exits 0 on SIGTERM', {
@@ -563,7 +673,7 @@ describe('shutdown', { concurrency: 1 }, () => {
     const codes = [];
     const started = performance.now();
     requestShutdown({
-      ...shutdownTargetsForTests([client]),
+      ...shutdownTargets([client]),
       exit(code) {
         codes.push(code);
       },
@@ -597,7 +707,7 @@ describe('shutdown', { concurrency: 1 }, () => {
     await waitFor('ocr child', () => ocrChildCountForTests() === 1);
     const codes = [];
     requestShutdown({
-      ...shutdownTargetsForTests([]),
+      ...shutdownTargets([]),
       exit(code) {
         codes.push(code);
       },
@@ -852,30 +962,107 @@ describe('shutdown', { concurrency: 1 }, () => {
   });
 
   // Windows process.kill(pid, 'SIGTERM') terminates the process without
-  // running the signal handler. The hold is an injected startup delay so
-  // the signal arrives before listen.
+  // running the signal handler. The PiKVM host is a local TCP server that
+  // accepts the connection and never answers, so checkAuth is still running.
   test('a signal during startup exits 0', {
     skip: process.platform === 'win32'
       ? 'Windows process.kill(pid, SIGTERM) terminates the process without running the signal handler'
       : false,
   }, async (t) => {
     arm(t);
-    const port = await freePort();
+    const accepted = [];
+    const blackhole = net.createServer((sock) => {
+      accepted.push(sock);
+      sock.on('error', () => {});
+    });
+    await new Promise((resolve, reject) => {
+      blackhole.once('error', reject);
+      blackhole.listen(0, '127.0.0.1', resolve);
+    });
+    const address = blackhole.address();
+    assert.ok(address && typeof address === 'object');
+    t.after(() => new Promise((resolve) => {
+      for (const sock of accepted) sock.destroy();
+      blackhole.close(() => resolve());
+    }));
     const env = baseEnv({
-      PIKVM_HOST: 'http://127.0.0.1:9',
-      PIKVM_MCP_PORT: String(port),
-      PIKVM_MCP_HOST: '127.0.0.1',
-      PIKVM_MCP_BEARER: 'test-bearer-token',
-      PIKVM_MCP_STARTUP_HOLD_MS: '30000',
+      PIKVM_HOST: `http://127.0.0.1:${address.port}`,
     });
     const started = await spawnServer(t, env);
-    await waitFor('startup hold', () => started.stderr().includes('startup hold'), 2000);
+    await waitFor('auth connected', () => accepted.length > 0, 5000);
     assert.equal(started.stderr().includes('PiKVM MCP Server running'), false);
     const result = await signalChild(started, 'SIGTERM', 2000);
     assert.equal(result.code, 0, started.stderr());
     assert.equal(result.signal, null, started.stderr());
     assert.ok(result.ms < 2000, `startup signal took ${result.ms}ms`);
     assert.equal(started.stderr().includes('PiKVM MCP Server running'), false);
+    assertQuiet(started.stderr());
+  });
+
+  // A symlink is how npm exposes the bin. Windows CI does not create one
+  // for an unprivileged test, and process.kill(pid, 'SIGTERM') there does
+  // not run the signal handler.
+  test('a symlinked entry reaches running and exits 0 on SIGTERM', {
+    skip: process.platform === 'win32'
+      ? 'Windows process.kill(pid, SIGTERM) terminates the process without running the signal handler'
+      : false,
+  }, async (t) => {
+    arm(t);
+    const mock = await startKvmdMock();
+    const dir = await mkdtemp(join(tmpdir(), 'pikvm-shutdown-'));
+    const link = join(dir, 'pikvm-mcp-server');
+    await symlink(join(REPO, 'dist', 'index.js'), link);
+    t.after(async () => {
+      await mock.close();
+      await rm(dir, { recursive: true, force: true });
+    });
+    const started = await spawnServer(t, baseEnv({ PIKVM_HOST: mock.url }), [], link);
+    await waitFor('symlink ready', () => started.stderr().includes('PiKVM MCP Server running'), 5000);
+    const result = await signalChild(started, 'SIGTERM', 2000);
+    assert.equal(result.code, 0, started.stderr());
+    assert.equal(result.signal, null, started.stderr());
+    assertQuiet(started.stderr());
+  });
+
+  // Same symlink gate as the running test. pin does not need a signal.
+  test('pin through a symlink prints the same usage error as a direct run', {
+    skip: process.platform === 'win32'
+      ? 'Windows CI does not create the symlink this launch uses'
+      : false,
+  }, async (t) => {
+    arm(t);
+    const dir = await mkdtemp(join(tmpdir(), 'pikvm-shutdown-'));
+    const link = join(dir, 'pikvm-mcp-server');
+    await symlink(join(REPO, 'dist', 'index.js'), link);
+    t.after(() => rm(dir, { recursive: true, force: true }));
+    const direct = await runPin(join(REPO, 'dist', 'index.js'));
+    const linked = await runPin(link);
+    assert.equal(direct.code, 1, direct.stderr);
+    assert.equal(linked.code, 1, linked.stderr);
+    assert.equal(linked.signal, null);
+    assert.equal(usageLine(linked.stderr), usageLine(direct.stderr));
+    assert.match(usageLine(linked.stderr), /usage: pikvm-mcp-server pin <device> \[--yes\] \[--out path\]/);
+  });
+
+  // node dist/index (no .js) is another launch that must start the server.
+  test('an extension-less entry reaches running and exits 0 on SIGTERM', {
+    skip: process.platform === 'win32'
+      ? 'Windows process.kill(pid, SIGTERM) terminates the process without running the signal handler'
+      : false,
+  }, async (t) => {
+    arm(t);
+    const mock = await startKvmdMock();
+    t.after(() => mock.close());
+    const started = await spawnServer(
+      t,
+      baseEnv({ PIKVM_HOST: mock.url }),
+      [],
+      join(REPO, 'dist', 'index'),
+    );
+    await waitFor('extension-less ready', () => started.stderr().includes('PiKVM MCP Server running'), 5000);
+    const result = await signalChild(started, 'SIGTERM', 2000);
+    assert.equal(result.code, 0, started.stderr());
+    assert.equal(result.signal, null, started.stderr());
     assertQuiet(started.stderr());
   });
 
@@ -981,7 +1168,6 @@ function baseEnv(extra = {}) {
   const env = { ...process.env, ...extra };
   delete env.PIKVM_MCP_PORT;
   delete env.PIKVM_MCP_BEARER;
-  delete env.PIKVM_MCP_STARTUP_HOLD_MS;
   for (const [key, value] of Object.entries(extra)) env[key] = value;
   env.PIKVM_MCP_NO_DOTENV = '1';
   env.PIKVM_PASSWORD = env.PIKVM_PASSWORD || 'testpw';
@@ -1000,8 +1186,8 @@ function freePort() {
   });
 }
 
-async function spawnServer(t, env, args = []) {
-  const child = spawn(process.execPath, [...args, join(REPO, 'dist', 'index.js')], {
+async function spawnServer(t, env, args = [], entry = join(REPO, 'dist', 'index.js')) {
+  const child = spawn(process.execPath, [...args, entry], {
     cwd: REPO,
     env,
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -1179,6 +1365,73 @@ function closedFlag(sock) {
   });
   sock.on('error', () => {});
   return () => closed || sock.destroyed === true;
+}
+
+function usageLine(text) {
+  const line = text.split('\n').find((row) => row.includes('usage: pikvm-mcp-server pin'));
+  assert.ok(line, text);
+  return line;
+}
+
+function runPin(entry) {
+  const env = baseEnv({ PIKVM_HOST: 'http://127.0.0.1:9' });
+  const child = spawn(process.execPath, [entry, 'pin', 'default', 'extra'], {
+    cwd: REPO,
+    env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stderr = '';
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', (chunk) => {
+    stderr += chunk;
+  });
+  return new Promise((resolve) => {
+    child.once('exit', (code, signal) => resolve({ code, signal, stderr }));
+  });
+}
+
+function stdioLines(child) {
+  const responses = new Map();
+  let carry = '';
+  let closed = false;
+  let wakeup = null;
+  child.stdout.setEncoding('utf8');
+  child.stdout.on('data', (chunk) => {
+    carry += chunk;
+    let idx;
+    while ((idx = carry.indexOf('\n')) !== -1) {
+      const line = carry.slice(0, idx).trim();
+      carry = carry.slice(idx + 1);
+      if (!line) continue;
+      const msg = JSON.parse(line);
+      if (msg.id !== undefined) responses.set(msg.id, msg);
+    }
+    if (wakeup) {
+      wakeup();
+      wakeup = null;
+    }
+  });
+  child.on('exit', () => {
+    closed = true;
+    if (wakeup) {
+      wakeup();
+      wakeup = null;
+    }
+  });
+  return {
+    async waitForId(id, timeoutMs = 5000) {
+      const deadline = Date.now() + timeoutMs;
+      while (!responses.has(id)) {
+        if (closed) throw new Error(`child exited before id=${id}`);
+        if (Date.now() > deadline) throw new Error(`timed out waiting for id=${id}`);
+        await new Promise((resolve) => {
+          wakeup = resolve;
+          setTimeout(resolve, 50);
+        });
+      }
+      return responses.get(id);
+    },
+  };
 }
 
 function waitForExit(exit, ms = 4000) {

@@ -23,7 +23,6 @@
  */
 
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import type { Server as HttpServer } from 'node:http';
 import { PiKVMClient } from './pikvm/client.js';
 import { loadConfig, type Config } from './config.js';
 import { BusyLock } from './pikvm/lock.js';
@@ -33,39 +32,10 @@ import { abortInFlightTransfers } from './msd.js';
 import { createMcpServer, type McpServerDeps } from './server.js';
 import { startHttpServer } from './http.js';
 import { requestShutdown, type ShutdownTargets } from './shutdown.js';
+import { shutdownTargets } from './shutdown-targets.js';
 import { pinCommand } from './pin.js';
-import { resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
 import { inspect } from 'node:util';
 import { redactUrl } from './url-policy.js';
-
-/** Test seam. Unset in normal use. Digits only, capped so a stray value cannot wait for days. */
-const STARTUP_HOLD_MAX_MS = 60000;
-
-function shutdownTargets(
-  clients: PiKVMClient[],
-  httpServer?: HttpServer,
-  stdioTransport?: StdioServerTransport,
-): ShutdownTargets {
-  return {
-    httpServer,
-    stdioTransport,
-    abortTransfers: abortInFlightTransfers,
-    destroyDispatchers() {
-      for (const client of clients) client.destroyDispatcher();
-    },
-    killOcrChildren,
-  };
-}
-
-/** Test-only. The signal handler publishes this same object once listen has a server. */
-export function shutdownTargetsForTests(
-  clients: PiKVMClient[],
-  httpServer?: HttpServer,
-  stdioTransport?: StdioServerTransport,
-): ShutdownTargets {
-  return shutdownTargets(clients, httpServer, stdioTransport);
-}
 
 // Replaced when listen has clients and, in HTTP mode, the server.
 // A signal before that still exits 0.
@@ -91,18 +61,6 @@ function armSignals(): void {
 function armStdioEof(): void {
   if (process.stdin.readableEnded) onEof();
   else process.stdin.on('end', onEof);
-}
-
-async function startupHold(): Promise<void> {
-  const raw = process.env.PIKVM_MCP_STARTUP_HOLD_MS;
-  if (raw === undefined || raw === '') return;
-  if (!/^[0-9]+$/.test(raw)) return;
-  const ms = Number(raw);
-  if (ms < 1) return;
-  console.error('startup hold');
-  await new Promise((resolveHold) => {
-    setTimeout(resolveHold, Math.min(ms, STARTUP_HOLD_MAX_MS));
-  });
 }
 
 function clientsOf(deps: McpServerDeps): PiKVMClient[] {
@@ -152,7 +110,6 @@ async function main() {
   armSignals();
   // Load configuration (deferred to here for proper error handling)
   const config = loadConfig();
-  await startupHold();
   // ENGINE=host fails here when the binary is missing. Unset with no
   // binary is off. kvmd is not selected as a fallback.
   const ocr = await resolveOcr(config.ocr);
@@ -210,20 +167,12 @@ async function main() {
   if (ocrUsesKvmdProbe(ocr, [])) startOcrProbes([{ name: 'default', client: pikvm }]);
 }
 
-function launchedAsCli(): boolean {
-  const entry = process.argv[1];
-  if (!entry) return false;
-  return import.meta.url === pathToFileURL(resolve(entry)).href;
-}
+const started = process.argv[2] === 'pin'
+  ? pinCommand(process.argv.slice(3))
+  : main();
 
-if (launchedAsCli()) {
-  const started = process.argv[2] === 'pin'
-    ? pinCommand(process.argv.slice(3))
-    : main();
-
-  started.catch((error) => {
-    const text = error instanceof Error ? inspect(error) : String(error);
-    console.error('Fatal error:', redactUrl(text));
-    process.exit(1);
-  });
-}
+started.catch((error) => {
+  const text = error instanceof Error ? inspect(error) : String(error);
+  console.error('Fatal error:', redactUrl(text));
+  process.exit(1);
+});
