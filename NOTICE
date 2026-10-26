@@ -68,6 +68,8 @@ Modified 2026-10 by PLN: the upload response read is phase job_timeout (GPL-3.0;
 Modified 2026-10 by PLN: production dependency refresh and sharp 0.35 types (GPL-3.0; see below).
 Modified 2026-10 by PLN: allowScripts names sharp@0.35.5 (GPL-3.0; see below).
 Modified 2026-10 by PLN: private vulnerability reporting (GPL-3.0; see below).
+Modified 2026-10 by PLN: public-file privacy guard (GPL-3.0; see below).
+Modified 2026-10 by PLN: privacy guard review fixes (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -1187,4 +1189,36 @@ No code from another pikvm_mcp_server fork was added for these methods.
   stable release has been published. PLN tries to acknowledge a
   report within a few days. Assessment and a fix are best-effort.
   There is no service-level agreement.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  Added a privacy guard for tracked file names and contents, for the
+  commits in a bounded range, and for a pull request title and body.
+  scripts/check-public.sh applies the generic rules, the PLN-only
+  identity rule, and a denylist supplied outside the repository.
+  Another person's commits fail that identity rule until it is changed.
+  .github/workflows/public-guard.yml runs the guard on pull requests
+  and on pushes to main. A separate job runs test/public-guard/run.sh
+  and does not receive the denylist secret. The denylist fails closed
+  when it is missing, except the fork and dependabot[bot] pull_request
+  skip. Push never skips it. History outside the range is not checked.
+  assets/simple_setup.jpg was replaced with a metadata-stripped copy.
+  The primary picture's decoded pixels are unchanged. The previous
+  bytes remain in history.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  Tightened the public-file guard after review. A private address at
+  the end of a sentence is a hit. Text that contains a NUL or an
+  invalid byte is still scanned. Image metadata now covers a JPEG
+  comment, an IPTC segment, PNG text chunks, WebP EXIF and XMP chunks,
+  and a TIFF GPS pointer. More image name suffixes are inspected.
+  Secret shapes include the unencrypted private-key banner and the
+  other gh token prefixes. The coauthor trailer match ignores case.
+  An actions run with no commit range fails. Denylist lines are
+  trimmed. Example-domain mail is limited to the example, example.com,
+  example.net, and example.org suffixes. Head and base repository
+  names compare without case. The workflow reads the event from the
+  actions event file and does not place that event in the environment.
+  Pushes to main do not cancel each other.
   No code from another pikvm_mcp_server fork was copied.
