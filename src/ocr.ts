@@ -344,11 +344,19 @@ export function setOcrSpawnForTests(spawn?: OcrSpawn): void {
   ocrSpawn = spawn ?? ((file, args, options, callback) => execFile(file, args, options, callback));
 }
 
+function untrackOcrChild(child: ChildProcess): void {
+  ocrChildren.delete(child);
+}
+
 function trackOcrChild(child: ChildProcess): void {
   ocrChildren.add(child);
-  child.once('exit', () => {
-    ocrChildren.delete(child);
-  });
+  const drop = () => {
+    untrackOcrChild(child);
+  };
+  // A failed spawn emits error and close, and does not emit exit.
+  child.once('exit', drop);
+  child.once('close', drop);
+  child.once('error', drop);
 }
 
 function spawnOcr(
@@ -670,11 +678,16 @@ export function createTesseractEngine(settings: Pick<OcrSettings, 'bin' | 'tessd
         const onAbort = () => {
           child.kill('SIGKILL');
         };
+        const dropAbort = () => {
+          options.signal.removeEventListener('abort', onAbort);
+        };
         if (options.signal.aborted) onAbort();
         else options.signal.addEventListener('abort', onAbort);
-        child.once('exit', () => {
-          options.signal.removeEventListener('abort', onAbort);
-        });
+        // exit is missing when the binary cannot be spawned. close and
+        // error still run, and removing the listener twice is a no-op.
+        child.once('exit', dropAbort);
+        child.once('close', dropAbort);
+        child.once('error', dropAbort);
         child.stdin?.on('error', () => {});
         child.stdin?.end(png);
       });

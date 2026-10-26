@@ -18,6 +18,9 @@
  * closes any sockets that are still open. Stdio mode aborts, destroys,
  * and kills the same way, then closes the transport. Uploads are aborted,
  * not drained. The process stores nothing that has to be saved.
+ *
+ * Each step runs even if an earlier step threw. The exit code is 1 if
+ * any step threw. The message is only that a step failed.
  */
 
 export const SHUTDOWN_DEADLINE_MS = 8000;
@@ -63,25 +66,76 @@ function finish(code: number, token: number): void {
   exitFn(code);
 }
 
-async function run(targets: ShutdownTargets): Promise<void> {
+async function run(targets: ShutdownTargets): Promise<boolean> {
+  let failed = false;
+  // Synchronous on purpose. requestShutdown returns after these steps, and
+  // a second signal in that same turn must already see them finished.
+  const step = (fn: () => void): void => {
+    try {
+      fn();
+    } catch {
+      failed = true;
+      console.error('shutdown step failed');
+    }
+  };
+  const stepAsync = async (fn: () => unknown): Promise<void> => {
+    try {
+      await fn();
+    } catch {
+      failed = true;
+      console.error('shutdown step failed');
+    }
+  };
+
   if (targets.httpServer) {
     const httpServer = targets.httpServer;
-    const closed = new Promise<void>((resolve) => {
-      releaseWait = resolve;
-      httpServer.close(() => resolve());
+    let closed = Promise.resolve();
+    step(() => {
+      let settle = () => {};
+      closed = new Promise<void>((resolve) => {
+        settle = resolve;
+        releaseWait = resolve;
+      });
+      try {
+        httpServer.close(() => settle());
+      } catch (err) {
+        settle();
+        throw err;
+      }
     });
-    httpServer.closeIdleConnections();
-    targets.abortTransfers();
-    targets.destroyDispatchers();
-    targets.killOcrChildren();
-    httpServer.closeAllConnections();
-    await closed;
-    return;
+    step(() => {
+      httpServer.closeIdleConnections();
+    });
+    step(() => {
+      targets.abortTransfers();
+    });
+    step(() => {
+      targets.destroyDispatchers();
+    });
+    step(() => {
+      targets.killOcrChildren();
+    });
+    step(() => {
+      httpServer.closeAllConnections();
+    });
+    await stepAsync(() => closed);
+    return failed;
   }
-  targets.abortTransfers();
-  targets.destroyDispatchers();
-  targets.killOcrChildren();
-  if (targets.stdioTransport) await targets.stdioTransport.close();
+
+  step(() => {
+    targets.abortTransfers();
+  });
+  step(() => {
+    targets.destroyDispatchers();
+  });
+  step(() => {
+    targets.killOcrChildren();
+  });
+  if (targets.stdioTransport) {
+    const transport = targets.stdioTransport;
+    await stepAsync(() => transport.close());
+  }
+  return failed;
 }
 
 /**
@@ -102,8 +156,8 @@ export function requestShutdown(targets: ShutdownTargets, reason: 'signal' | 'eo
   const deadlineMs = targets.deadlineMs ?? SHUTDOWN_DEADLINE_MS;
   timer = setTimeout(() => finish(1, token), deadlineMs);
   timer.unref();
-  void run(targets).then(() => {
-    finish(0, token);
+  void run(targets).then((failed) => {
+    finish(failed ? 1 : 0, token);
   }, () => {
     finish(1, token);
   });

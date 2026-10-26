@@ -34,8 +34,13 @@ import { createMcpServer, type McpServerDeps } from './server.js';
 import { startHttpServer } from './http.js';
 import { requestShutdown, type ShutdownTargets } from './shutdown.js';
 import { pinCommand } from './pin.js';
+import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { inspect } from 'node:util';
 import { redactUrl } from './url-policy.js';
+
+/** Test seam. Unset in normal use. Digits only, capped so a stray value cannot wait for days. */
+const STARTUP_HOLD_MAX_MS = 60000;
 
 function shutdownTargets(
   clients: PiKVMClient[],
@@ -53,18 +58,51 @@ function shutdownTargets(
   };
 }
 
-function installShutdown(targets: ShutdownTargets, stdio: boolean): void {
-  const onSignal = () => {
-    requestShutdown(targets, 'signal');
-  };
+/** Test-only. The signal handler publishes this same object once listen has a server. */
+export function shutdownTargetsForTests(
+  clients: PiKVMClient[],
+  httpServer?: HttpServer,
+  stdioTransport?: StdioServerTransport,
+): ShutdownTargets {
+  return shutdownTargets(clients, httpServer, stdioTransport);
+}
+
+// Replaced when listen has clients and, in HTTP mode, the server.
+// A signal before that still exits 0.
+let bound: ShutdownTargets = {
+  abortTransfers: abortInFlightTransfers,
+  destroyDispatchers() {},
+  killOcrChildren,
+};
+
+function onSignal(): void {
+  requestShutdown(bound, 'signal');
+}
+
+function onEof(): void {
+  requestShutdown(bound, 'eof');
+}
+
+function armSignals(): void {
   process.on('SIGTERM', onSignal);
   process.on('SIGINT', onSignal);
-  if (!stdio) return;
-  const onEof = () => {
-    requestShutdown(targets, 'eof');
-  };
+}
+
+function armStdioEof(): void {
   if (process.stdin.readableEnded) onEof();
   else process.stdin.on('end', onEof);
+}
+
+async function startupHold(): Promise<void> {
+  const raw = process.env.PIKVM_MCP_STARTUP_HOLD_MS;
+  if (raw === undefined || raw === '') return;
+  if (!/^[0-9]+$/.test(raw)) return;
+  const ms = Number(raw);
+  if (ms < 1) return;
+  console.error('startup hold');
+  await new Promise((resolveHold) => {
+    setTimeout(resolveHold, Math.min(ms, STARTUP_HOLD_MAX_MS));
+  });
 }
 
 function clientsOf(deps: McpServerDeps): PiKVMClient[] {
@@ -91,7 +129,7 @@ async function listen(config: Config, deps: McpServerDeps): Promise<void> {
       bearerToken,
       createServer: () => createMcpServer(deps),
     });
-    installShutdown(shutdownTargets(clients, httpServer), false);
+    bound = shutdownTargets(clients, httpServer);
     console.error(
       `PiKVM MCP Server running (HTTP on ${host}:${port}, HID ${armHid ? 'ARMED' : 'DISARMED'}, MSD ${armMsd ? 'ARMED' : 'DISARMED'})`,
     );
@@ -101,14 +139,20 @@ async function listen(config: Config, deps: McpServerDeps): Promise<void> {
   const server = createMcpServer(deps);
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  installShutdown(shutdownTargets(clients, undefined, transport), true);
+  bound = shutdownTargets(clients, undefined, transport);
+  armStdioEof();
   console.error('PiKVM MCP Server running');
 }
 
 // Start server
 async function main() {
+  // Before checkAuth and listen. A signal while those are still running
+  // uses this handler. Node's default action would kill the process
+  // without the shutdown path. bound has no server until listen.
+  armSignals();
   // Load configuration (deferred to here for proper error handling)
   const config = loadConfig();
+  await startupHold();
   // ENGINE=host fails here when the binary is missing. Unset with no
   // binary is off. kvmd is not selected as a fallback.
   const ocr = await resolveOcr(config.ocr);
@@ -166,12 +210,20 @@ async function main() {
   if (ocrUsesKvmdProbe(ocr, [])) startOcrProbes([{ name: 'default', client: pikvm }]);
 }
 
-const started = process.argv[2] === 'pin'
-  ? pinCommand(process.argv.slice(3))
-  : main();
+function launchedAsCli(): boolean {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  return import.meta.url === pathToFileURL(resolve(entry)).href;
+}
 
-started.catch((error) => {
-  const text = error instanceof Error ? inspect(error) : String(error);
-  console.error('Fatal error:', redactUrl(text));
-  process.exit(1);
-});
+if (launchedAsCli()) {
+  const started = process.argv[2] === 'pin'
+    ? pinCommand(process.argv.slice(3))
+    : main();
+
+  started.catch((error) => {
+    const text = error instanceof Error ? inspect(error) : String(error);
+    console.error('Fatal error:', redactUrl(text));
+    process.exit(1);
+  });
+}

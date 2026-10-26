@@ -430,11 +430,11 @@ curl -i -X POST http://localhost:8675/mcp \
 
 ## Shutdown
 
-SIGTERM and SIGINT start one shutdown in both stdio and HTTP mode. A finished shutdown exits 0. Eight seconds after the first signal, the process exits 1 if shutdown has not finished. That timer does not keep the process alive on its own. A second SIGTERM or SIGINT during shutdown does not start another shutdown. It exits immediately with code 1.
+SIGTERM and SIGINT start one shutdown in both stdio and HTTP mode. The handlers are registered before the startup checks, so a signal during startup exits 0. A finished shutdown exits 0. Eight seconds after the first signal, the process exits 1 if shutdown has not finished. That timer does not keep the process alive on its own. A second SIGTERM or SIGINT during shutdown does not start another shutdown. It exits immediately with code 1.
 
 Stdio mode also shuts down when stdin reaches EOF, which is the same path and still exits 0. EOF during an in-progress shutdown is ignored.
 
-In-flight uploads and fetch-URL jobs are aborted, not drained. An aborted upload or fetch-URL job is `PIKVM_MSD_STATE_UNKNOWN`. The server does not remove the image. The kvmd request still sends `remove_incomplete=1`.
+In-flight uploads and fetch-URL jobs are aborted, not drained. An aborted upload or fetch-URL job is `PIKVM_MSD_STATE_UNKNOWN`. This server does not itself delete the image after an abort. kvmd may remove an incomplete upload because the client sends `remove_incomplete=1`.
 
 HTTP mode stops accepting new connections, closes idle connections, aborts those jobs, destroys the kvmd dispatchers, kills OCR child processes, and then closes any sockets that are still open. Stdio mode aborts those jobs, destroys the dispatchers, kills OCR children, and closes its transport. Nothing is written at shutdown.
 

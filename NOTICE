@@ -1235,4 +1235,8 @@ No code from another pikvm_mcp_server fork was added for these methods.
   remove_incomplete is unchanged. In-flight uploads and fetch-URL jobs
   are aborted on shutdown, and then each kvmd dispatcher is destroyed.
   OCR child processes are killed. close() still waits for in-flight calls.
+  A signal during startup shuts down with whatever is already up.
+  A failed OCR spawn is dropped the same way as an exit.
+  One throwing shutdown step does not skip the later steps. The
+  exit code is 1 if any step threw.
   No code from another pikvm_mcp_server fork was copied.

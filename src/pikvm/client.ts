@@ -2487,6 +2487,9 @@ export class PiKVMClient {
     }
     // An external abort is the same code as a post-send deadline. It has
     // no phase: the job cap and the progress windows keep their own text.
+    // The message says the image may be partial or complete and not to
+    // resend. That wording is deliberate when the abort is before anything
+    // was sent: this client cannot prove the request never reached kvmd.
     if (deadline?.externalAbort()) return msdStateUnknown(0, endpoint);
     return new KvmdError(0, 'PIKVM_UNREACHABLE', 'kvmd network error', endpoint);
   }
