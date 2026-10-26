@@ -1,5 +1,6 @@
 // Modified 2026-10 by PLN: host OCR with the system tesseract binary (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: the OCR remaining budget is monotonic (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: track OCR children so shutdown can kill them (GPL-3.0; see NOTICE).
 
 /**
  * Host OCR. The recognizer is the tesseract binary on PATH, or
@@ -10,7 +11,7 @@
  * called because host failed.
  */
 
-import { execFile } from 'node:child_process';
+import { execFile, type ChildProcess, type ExecFileException, type ExecFileOptions } from 'node:child_process';
 import { pixelToNormalized } from './pikvm/client.js';
 import type { ClickFrame } from './pikvm/client.js';
 import {
@@ -321,6 +322,70 @@ export class OcrSemaphore {
   }
 }
 
+type OcrCallback = (
+  err: ExecFileException | null,
+  stdout: string | Buffer,
+  stderr: string | Buffer,
+) => void;
+
+type OcrSpawn = (
+  file: string,
+  args: readonly string[],
+  options: ExecFileOptions,
+  callback: OcrCallback,
+) => ChildProcess;
+
+const ocrChildren = new Set<ChildProcess>();
+
+let ocrSpawn: OcrSpawn = (file, args, options, callback) => execFile(file, args, options, callback);
+
+/** Test-only. Replaces the OCR spawn. Omit the argument to restore execFile. */
+export function setOcrSpawnForTests(spawn?: OcrSpawn): void {
+  ocrSpawn = spawn ?? ((file, args, options, callback) => execFile(file, args, options, callback));
+}
+
+function untrackOcrChild(child: ChildProcess): void {
+  ocrChildren.delete(child);
+}
+
+function trackOcrChild(child: ChildProcess): void {
+  ocrChildren.add(child);
+  const drop = () => {
+    untrackOcrChild(child);
+  };
+  // A failed spawn emits error and close, and does not emit exit.
+  child.once('exit', drop);
+  child.once('close', drop);
+  child.once('error', drop);
+}
+
+function spawnOcr(
+  file: string,
+  args: readonly string[],
+  options: ExecFileOptions,
+  callback: OcrCallback,
+): ChildProcess {
+  const child = ocrSpawn(file, args, options, callback);
+  trackOcrChild(child);
+  return child;
+}
+
+/** Kill OCR children started by the host recognizer or the tesseract probe. */
+export function killOcrChildren(): void {
+  for (const child of ocrChildren) {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      ocrChildren.delete(child);
+      continue;
+    }
+    child.kill('SIGKILL');
+  }
+}
+
+/** Test-only. Children still in the shutdown set. */
+export function ocrChildCountForTests(): number {
+  return ocrChildren.size;
+}
+
 function childEnv(tessdataDir?: string): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
     PATH: process.env.PATH ?? '',
@@ -338,7 +403,7 @@ function runFile(
   tessdataDir?: string,
 ): Promise<{ stdout: Buffer; stderr: Buffer }> {
   return new Promise((resolve, reject) => {
-    const child = execFile(bin, args, {
+    const child = spawnOcr(bin, args, {
       timeout: timeoutMs,
       killSignal: 'SIGKILL',
       maxBuffer: OCR_MAX_BUFFER,
@@ -599,7 +664,7 @@ export function createTesseractEngine(settings: Pick<OcrSettings, 'bin' | 'tessd
           if (err) reject(hostFailure(settings.bin, err));
           else resolve({ stdout });
         };
-        const child = execFile(settings.bin, args, {
+        const child = spawnOcr(settings.bin, args, {
           timeout: settings.timeoutMs,
           killSignal: 'SIGKILL',
           maxBuffer: OCR_MAX_BUFFER,
@@ -613,8 +678,16 @@ export function createTesseractEngine(settings: Pick<OcrSettings, 'bin' | 'tessd
         const onAbort = () => {
           child.kill('SIGKILL');
         };
+        const dropAbort = () => {
+          options.signal.removeEventListener('abort', onAbort);
+        };
         if (options.signal.aborted) onAbort();
-        else options.signal.addEventListener('abort', onAbort, { once: true });
+        else options.signal.addEventListener('abort', onAbort);
+        // exit is missing when the binary cannot be spawned. close and
+        // error still run, and removing the listener twice is a no-op.
+        child.once('exit', dropAbort);
+        child.once('close', dropAbort);
+        child.once('error', dropAbort);
         child.stdin?.on('error', () => {});
         child.stdin?.end(png);
       });

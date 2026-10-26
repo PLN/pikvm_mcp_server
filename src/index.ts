@@ -10,6 +10,7 @@
 // Modified 2026-10 by PLN: probe OCR at startup (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: OCR probes start after listen (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: probe host tesseract before listen (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: SIGTERM and SIGINT shut down (GPL-3.0; see NOTICE).
 /**
  * PiKVM MCP Server
  *
@@ -26,14 +27,49 @@ import { PiKVMClient } from './pikvm/client.js';
 import { loadConfig, type Config } from './config.js';
 import { BusyLock } from './pikvm/lock.js';
 import { buildFleet, startOcrProbes } from './devices.js';
-import { ocrUsesKvmdProbe, resolveOcr } from './ocr.js';
+import { killOcrChildren, ocrUsesKvmdProbe, resolveOcr } from './ocr.js';
+import { abortInFlightTransfers } from './msd.js';
 import { createMcpServer, type McpServerDeps } from './server.js';
 import { startHttpServer } from './http.js';
+import { requestShutdown, type ShutdownTargets } from './shutdown.js';
+import { shutdownTargets } from './shutdown-targets.js';
 import { pinCommand } from './pin.js';
 import { inspect } from 'node:util';
 import { redactUrl } from './url-policy.js';
 
+// Replaced when listen has clients and, in HTTP mode, the server.
+// A signal before that still exits 0.
+let bound: ShutdownTargets = {
+  abortTransfers: abortInFlightTransfers,
+  destroyDispatchers() {},
+  killOcrChildren,
+};
+
+function onSignal(): void {
+  requestShutdown(bound, 'signal');
+}
+
+function onEof(): void {
+  requestShutdown(bound, 'eof');
+}
+
+function armSignals(): void {
+  process.on('SIGTERM', onSignal);
+  process.on('SIGINT', onSignal);
+}
+
+function armStdioEof(): void {
+  if (process.stdin.readableEnded) onEof();
+  else process.stdin.on('end', onEof);
+}
+
+function clientsOf(deps: McpServerDeps): PiKVMClient[] {
+  if (deps.fleet) return [...deps.fleet.devices.values()].map((device) => device.client);
+  return [deps.pikvm];
+}
+
 async function listen(config: Config, deps: McpServerDeps): Promise<void> {
+  const clients = clientsOf(deps);
   if (config.http) {
     const { port, host, bearerToken, armHid, armMsd } = config.http;
     // Fail closed: an unauthenticated network listener on a HID server would
@@ -45,12 +81,13 @@ async function listen(config: Config, deps: McpServerDeps): Promise<void> {
       );
       process.exit(1);
     }
-    await startHttpServer({
+    const httpServer = await startHttpServer({
       port,
       host,
       bearerToken,
       createServer: () => createMcpServer(deps),
     });
+    bound = shutdownTargets(clients, httpServer);
     console.error(
       `PiKVM MCP Server running (HTTP on ${host}:${port}, HID ${armHid ? 'ARMED' : 'DISARMED'}, MSD ${armMsd ? 'ARMED' : 'DISARMED'})`,
     );
@@ -60,11 +97,17 @@ async function listen(config: Config, deps: McpServerDeps): Promise<void> {
   const server = createMcpServer(deps);
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  bound = shutdownTargets(clients, undefined, transport);
+  armStdioEof();
   console.error('PiKVM MCP Server running');
 }
 
 // Start server
 async function main() {
+  // Before checkAuth and listen. A signal while those are still running
+  // uses this handler. Node's default action would kill the process
+  // without the shutdown path. bound has no server until listen.
+  armSignals();
   // Load configuration (deferred to here for proper error handling)
   const config = loadConfig();
   // ENGINE=host fails here when the binary is missing. Unset with no

@@ -70,6 +70,7 @@ Modified 2026-10 by PLN: allowScripts names sharp@0.35.5 (GPL-3.0; see below).
 Modified 2026-10 by PLN: private vulnerability reporting (GPL-3.0; see below).
 Modified 2026-10 by PLN: public-file privacy guard (GPL-3.0; see below).
 Modified 2026-10 by PLN: privacy guard review fixes (GPL-3.0; see below).
+Modified 2026-10 by PLN: graceful shutdown and an external upload abort (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -1221,4 +1222,23 @@ No code from another pikvm_mcp_server fork was added for these methods.
   names compare without case. The workflow reads the event from the
   actions event file and does not place that event in the environment.
   Pushes to main do not cancel each other.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  SIGTERM and SIGINT shut the process down in stdio and HTTP mode.
+  A finished shutdown exits 0. Eight seconds after the first signal
+  the process exits 1 if shutdown has not finished. A second signal
+  during shutdown exits 1 immediately and does not start another
+  shutdown. Stdio also shuts down when stdin ends.
+  msdWrite and msdWriteRemote take an AbortSignal. An external abort
+  is PIKVM_MSD_STATE_UNKNOWN and the server does not remove the image.
+  remove_incomplete is unchanged. In-flight uploads and fetch-URL jobs
+  are aborted on shutdown, and then each kvmd dispatcher is destroyed.
+  OCR child processes are killed. close() still waits for in-flight calls.
+  A signal during startup shuts down with whatever is already up.
+  A failed OCR spawn is dropped the same way as an exit.
+  One throwing shutdown step does not skip the later steps. The
+  exit code is 1 if any step threw.
+  The process starts from a direct launch and from a symlink. No
+  startup-hold environment variable is read.
   No code from another pikvm_mcp_server fork was copied.
