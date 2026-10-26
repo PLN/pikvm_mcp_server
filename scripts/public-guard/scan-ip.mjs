@@ -1,10 +1,11 @@
 // Modified 2026-10 by PLN: public-file privacy guard (GPL-3.0; see NOTICE).
-// GPL-3.0-only. See LICENSE and NOTICE.
 //
 // Prints "path:line R-ip" or "path:line R-ip6" for private-range hits.
 // The address text is not printed. IPv6 (fc00::/7 and fe80::/10) is
 // included because every measured hit on this tree is either on an
 // allowlisted path or one of the exact documentation tokens.
+// Image extensions are skipped here; the image rule reads those files.
+// A NUL byte does not skip a text file.
 
 import { readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
@@ -148,7 +149,18 @@ function ipv6Kind(token) {
   return null
 }
 
-const ipv4Re = /(?<![0-9A-Za-z.])(?:\d{1,3}\.){3}\d{1,3}(?:\/\d{1,2})?(?![0-9A-Za-z.])/g
+const ipv4Re = /(?<![0-9A-Za-z])(?<![0-9]\.)(?:\d{1,3}\.){3}\d{1,3}(?:\/\d{1,2})?(?![0-9A-Za-z])(?!\.[0-9])/g
+const imageExt = new Set([
+  '.jpg', '.jpeg', '.jpe', '.jfif', '.png', '.gif', '.webp',
+  '.tif', '.tiff', '.heic', '.avif',
+])
+
+function isImage(rel) {
+  const base = rel.split('/').pop() || ''
+  const dot = base.lastIndexOf('.')
+  if (dot <= 0) return false
+  return imageExt.has(base.slice(dot).toLowerCase())
+}
 const ipv6Re = /(?<![0-9A-Za-z:])(?:[0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F:]*(?:\/\d{1,3})?(?![0-9A-Za-z:])/g
 
 function scanText(rel, text) {
@@ -189,7 +201,7 @@ for (const rel of readInputs()) {
     process.stderr.write('address scan: unreadable file\n')
     process.exit(1)
   }
-  if (buf.includes(0)) continue
-  hits.push(...scanText(rel, buf.toString('utf8')))
+  if (isImage(rel)) continue
+  hits.push(...scanText(rel, buf.toString('latin1')))
 }
 if (hits.length) process.stdout.write(`${hits.join('\n')}\n`)

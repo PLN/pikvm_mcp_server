@@ -5,6 +5,10 @@
 # PUBLIC_DENYLIST is a repository secret. This job fails closed when
 # that secret is missing. A fork pull request, and a pull_request whose
 # actor is dependabot[bot], skip only the denylist. Push never skips it.
+# The event is read from GITHUB_EVENT_PATH. It is not copied into the
+# environment, and the job does not print titles, bodies, or messages.
+# Pull request runs share a group and cancel superseded runs. Each
+# push keeps its own group, so pushes to main do not cancel each other.
 
 name: public-guard
 
@@ -22,7 +26,7 @@ on:
 permissions: {}
 
 concurrency:
-  group: public-guard-${{ github.ref }}
+  group: public-guard-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -43,7 +47,6 @@ jobs:
         id: denylist
         env:
           EVENT_NAME: ${{ github.event_name }}
-          EVENT_JSON: ${{ toJSON(github.event) }}
           ACTOR: ${{ github.actor }}
           REPOSITORY: ${{ github.repository }}
         run: bash scripts/public-guard/decide-skip.sh
@@ -51,7 +54,6 @@ jobs:
       - name: Check public files
         env:
           EVENT_NAME: ${{ github.event_name }}
-          EVENT_JSON: ${{ toJSON(github.event) }}
           GIT_SHA: ${{ github.sha }}
           PUBLIC_GUARD_SKIP_DENYLIST: ${{ steps.denylist.outputs.skip }}
           PUBLIC_GUARD_SKIP_REASON: ${{ steps.denylist.outputs.reason }}

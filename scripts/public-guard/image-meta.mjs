@@ -1,14 +1,28 @@
 // Modified 2026-10 by PLN: public-file privacy guard (GPL-3.0; see NOTICE).
-// GPL-3.0-only. See LICENSE and NOTICE.
 //
 // Dependency-free image metadata check. Node on a GitHub ubuntu-24.04
 // runner already provides this; the job does not install exiftool.
-// JPEG: walk markers up to the scan, including a second JPEG after EOI.
-// An APP1 Exif segment (which is where a GPS IFD, TIFF tag 0x8825, lives)
-// or an APP1 XMP segment is a hit. JFIF APP0 and an ICC APP2 are not.
-// PNG: an eXIf chunk, or an iTXt/tEXt/zTXt keyword XML:com.adobe.xmp, is a hit.
-// Other image types: the same Exif and XMP magics anywhere in the file.
-// Values are never printed. A parse failure fails closed.
+// Values are never printed. A parse failure of JPEG, PNG, GIF, WebP,
+// or TIFF fails closed (the process exits, and the file is not skipped).
+//
+// JPEG (.jpg, .jpeg, .jpe, .jfif): walk markers up to the scan,
+// including a second JPEG after EOI. A hit is APP1 Exif (a GPS IFD is
+// TIFF tag 0x8825 inside that segment), APP1 XMP, APP13 (marker 0xED,
+// IPTC / Photoshop 3.0 / 8BIM), or COM (marker 0xFE). JFIF APP0 and an
+// ICC APP2 are not hits.
+// PNG: an eXIf chunk, a tEXt chunk, a zTXt chunk, or any iTXt chunk is
+// a hit. The keyword is not consulted.
+// WebP: walk RIFF chunks. A chunk named EXIF or "XMP " is a hit. The
+// EXIF chunk is a hit even when its payload has no Exif prefix.
+// GIF: GIF87a / GIF89a is a hit only when the file contains an Exif
+// prefix or an XMP packet.
+// TIFF (.tif, .tiff): a GPS IFD pointer (tag 0x8825), including one
+// reached through the Exif IFD (tag 0x8769), or an XMP tag (0x02BC),
+// is a hit.
+// HEIC and AVIF: an Exif or XMP box, or those byte sequences inside a
+// box, is a hit. A file with one of those extensions that is not a
+// complete ISO box stream is a hit, so an unknown image is not skipped.
+// Any other extension in the inspected set is a hit for the same reason.
 
 import { readFileSync } from 'node:fs'
 import { extname } from 'node:path'
@@ -16,7 +30,10 @@ import { extname } from 'node:path'
 const EXIF = Buffer.from('Exif\0\0', 'latin1')
 const XAP = Buffer.from('http://ns.adobe.com/xap/1.0/', 'latin1')
 const XMP_META = Buffer.from('<x:xmpmeta', 'latin1')
-const IMAGE_EXT = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif', '.tif', '.tiff'])
+const IMAGE_EXT = new Set([
+  '.jpg', '.jpeg', '.jpe', '.jfif', '.png', '.gif', '.webp',
+  '.tif', '.tiff', '.heic', '.avif',
+])
 
 function u16(buf, offset, le) {
   return le ? buf.readUInt16LE(offset) : buf.readUInt16BE(offset)
@@ -26,21 +43,16 @@ function u32(buf, offset, le) {
   return le ? buf.readUInt32LE(offset) : buf.readUInt32BE(offset)
 }
 
-function exifHasGps(payload) {
-  try {
-    return exifHasGpsInner(payload)
-  } catch {
-    return false
-  }
+function magicHit(buf) {
+  return buf.includes(EXIF) || buf.includes(XAP) || buf.includes(XMP_META)
 }
 
-function exifHasGpsInner(payload) {
-  if (payload.length < 14 || !payload.subarray(0, 6).equals(EXIF)) return false
-  const tiff = payload.subarray(6)
+function tiffFlag(tiff) {
+  if (tiff.length < 8) return false
   const endian = tiff.toString('latin1', 0, 2)
   if (endian !== 'II' && endian !== 'MM') return false
   const le = endian === 'II'
-  if (tiff.length < 8) return false
+  if (u16(tiff, 2, le) !== 42) return false
   const seen = new Set()
   function walk(offset, depth) {
     if (depth > 8 || seen.has(offset)) return false
@@ -51,7 +63,7 @@ function exifHasGpsInner(payload) {
     for (let k = 0; k < count; k++) {
       const entry = offset + 2 + k * 12
       const tag = u16(tiff, entry, le)
-      if (tag === 0x8825) return true
+      if (tag === 0x8825 || tag === 0x02bc) return true
       if (tag === 0x8769) {
         const pointer = u32(tiff, entry + 8, le)
         if (walk(pointer, depth + 1)) return true
@@ -62,6 +74,15 @@ function exifHasGpsInner(payload) {
     return false
   }
   return walk(u32(tiff, 4, le), 0)
+}
+
+function exifHasGps(payload) {
+  try {
+    if (payload.length < 14 || !payload.subarray(0, 6).equals(EXIF)) return false
+    return tiffFlag(payload.subarray(6))
+  } catch {
+    return false
+  }
 }
 
 function isXmp(payload) {
@@ -88,9 +109,9 @@ function jpegHits(buf, start) {
     const payload = buf.subarray(i + 2, i + len)
     if (marker === 0xe1) {
       const exif = payload.length >= 6 && payload.subarray(0, 6).equals(EXIF)
-      const gps = exifHasGps(payload)
-      if (exif || gps || isXmp(payload)) hit = true
+      if (exif || exifHasGps(payload) || isXmp(payload)) hit = true
     }
+    if (marker === 0xed || marker === 0xfe) hit = true
     i += len
     if (marker === 0xda) {
       while (i + 1 < buf.length) {
@@ -133,12 +154,6 @@ function inspectJpeg(buf) {
   return hit
 }
 
-function keywordOf(chunk) {
-  const end = chunk.indexOf(0)
-  const slice = end === -1 ? chunk : chunk.subarray(0, end)
-  return slice.toString('latin1')
-}
-
 function inspectPng(buf) {
   const sig = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
   if (buf.length < 8 || !buf.subarray(0, 8).equals(sig)) throw new Error('not a png')
@@ -148,25 +163,81 @@ function inspectPng(buf) {
     const len = buf.readUInt32BE(i)
     if (i + 12 + len > buf.length) throw new Error('png chunk')
     const type = buf.toString('latin1', i + 4, i + 8)
-    const data = buf.subarray(i + 8, i + 8 + len)
-    if (type === 'eXIf') hit = true
-    if (type === 'iTXt' || type === 'tEXt' || type === 'zTXt') {
-      if (keywordOf(data) === 'XML:com.adobe.xmp') hit = true
-    }
+    if (type === 'eXIf' || type === 'tEXt' || type === 'zTXt' || type === 'iTXt') hit = true
     i += 12 + len
     if (type === 'IEND') return hit
   }
   throw new Error('png end')
 }
 
-function magicHit(buf) {
-  return buf.includes(EXIF) || buf.includes(XAP) || buf.includes(XMP_META)
+function inspectGif(buf) {
+  const sig = buf.toString('latin1', 0, 6)
+  if (sig !== 'GIF87a' && sig !== 'GIF89a') throw new Error('not a gif')
+  return magicHit(buf)
+}
+
+function inspectWebp(buf) {
+  if (buf.length < 12 || buf.toString('latin1', 0, 4) !== 'RIFF' || buf.toString('latin1', 8, 12) !== 'WEBP') {
+    throw new Error('not a webp')
+  }
+  let i = 12
+  let hit = false
+  while (i + 8 <= buf.length) {
+    const four = buf.toString('latin1', i, i + 4)
+    const size = buf.readUInt32LE(i + 4)
+    const dataStart = i + 8
+    if (dataStart + size > buf.length) throw new Error('webp chunk')
+    if (four === 'EXIF' || four === 'XMP ') hit = true
+    i = dataStart + size
+    if ((size % 2) === 1 && i < buf.length) i += 1
+  }
+  return hit
+}
+
+function inspectTiff(buf) {
+  if (buf.length < 8) throw new Error('not a tiff')
+  const endian = buf.toString('latin1', 0, 2)
+  if (endian !== 'II' && endian !== 'MM') throw new Error('not a tiff')
+  const le = endian === 'II'
+  if (u16(buf, 2, le) !== 42) throw new Error('not a tiff')
+  return tiffFlag(buf)
+}
+
+function inspectIsoBmff(buf) {
+  if (buf.length < 8 || buf.toString('latin1', 4, 8) !== 'ftyp') return true
+  let i = 0
+  let hit = false
+  while (i + 8 <= buf.length) {
+    let size = buf.readUInt32BE(i)
+    const type = buf.toString('latin1', i + 4, i + 8)
+    let header = 8
+    if (size === 1) {
+      if (i + 16 > buf.length) return true
+      const big = buf.readBigUInt64BE(i + 8)
+      if (big > BigInt(Number.MAX_SAFE_INTEGER)) return true
+      size = Number(big)
+      header = 16
+    } else if (size === 0) {
+      size = buf.length - i
+    }
+    if (!Number.isInteger(size) || size < header || i + size > buf.length) return true
+    if (type === 'Exif' || type === 'exif' || type === 'XMP ' || type === 'xmp ') hit = true
+    const payload = buf.subarray(i + header, i + size)
+    if (payload.includes(EXIF) || payload.includes(XAP) || payload.includes(XMP_META)) hit = true
+    i += size
+  }
+  if (i !== buf.length) return true
+  return hit
 }
 
 function inspect(buf, ext) {
-  if (ext === '.jpg' || ext === '.jpeg') return inspectJpeg(buf)
+  if (ext === '.jpg' || ext === '.jpeg' || ext === '.jpe' || ext === '.jfif') return inspectJpeg(buf)
   if (ext === '.png') return inspectPng(buf)
-  return magicHit(buf)
+  if (ext === '.gif') return inspectGif(buf)
+  if (ext === '.webp') return inspectWebp(buf)
+  if (ext === '.tif' || ext === '.tiff') return inspectTiff(buf)
+  if (ext === '.heic' || ext === '.avif') return inspectIsoBmff(buf)
+  return true
 }
 
 function readInputs() {

@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # Modified 2026-10 by PLN: public-file privacy guard (GPL-3.0; see NOTICE).
-# GPL-3.0-only. See LICENSE and NOTICE.
 #
 # Usage:
 #   PUBLIC_DENYLIST_FILE=/path/outside/repo scripts/check-public.sh [git-range]
@@ -8,6 +7,12 @@
 # (pull_request base..head, push before..sha). With no range, only the
 # tracked tree is checked. History outside the range is never checked:
 # main already contains upstream commits that fail the identity rule.
+# On Actions, an unknown or empty event with no range fails (R-range)
+# instead of checking no commits.
+#
+# Denylist lines are trimmed of leading and trailing whitespace.
+# A blank line or a whitespace-only line is dropped. A blank pattern
+# would match everything, so it is not kept.
 #
 # Identity is PLN-only on purpose. Author and committer names must be
 # PLN or GitHub, and addresses must be the PLN noreply forms or
@@ -61,14 +66,19 @@ ts_re="[A-Za-z0-9.-]+\\.${ts_suf}"
 home_re="/$(printf '%s' 'home')/[A-Za-z0-9._-]+"
 users_re="/$(printf '%s' 'Users')/[A-Za-z0-9._-]+"
 sec_ghp=$(printf '%s%s' 'gh' 'p_')
+sec_gho=$(printf '%s%s' 'gh' 'o_')
+sec_ghs=$(printf '%s%s' 'gh' 's_')
+sec_ghu=$(printf '%s%s' 'gh' 'u_')
+sec_ghr=$(printf '%s%s' 'gh' 'r_')
 sec_pat=$(printf '%s%s' 'github_' 'pat_')
 sec_ts=$(printf '%s%s' 'ts' 'key-')
 sec_begin=$(printf '%s' '-----BEGIN ')
-sec_kind=$(printf '%s' '.* PRIVATE KEY')
+sec_kind=$(printf '%s%s%s' '([A-Z0-9]+ )*' 'PRIVATE ' 'KEY')
 sec_key="${sec_begin}${sec_kind}"
 co_prefix=$(printf '%s%s' 'Co-authored-' 'by:')
-pln_co_re="^${co_prefix} PLN <([0-9]+\\+)?PLN@users\\.noreply\\.github\\.com>$"
-bot_co_re="^${co_prefix} ${bot_name_re} <[0-9]+\\+${bot_name_re}@users\\.noreply\\.github\\.com>$"
+co_re=$(printf '%s%s' '[Cc]o-[Aa]uthored-' '[Bb]y:')
+pln_co_re="^${co_re} PLN <([0-9]+\\+)?PLN@users\\.noreply\\.github\\.com>$"
+bot_co_re="^${co_re} ${bot_name_re} <[0-9]+\\+${bot_name_re}@users\\.noreply\\.github\\.com>$"
 sob_line=$(printf '%s%s%s%s%s' 'Signed-off-by: ' "$bot_name" ' <' "$(printf '%s%s' 'support@' 'github.com')" '>')
 
 excluded() {
@@ -95,7 +105,7 @@ email_allowed() {
   fi
   local domain=${email#*@}
   local domain_lc=${domain,,}
-  if [[ $domain_lc == *.example || $domain_lc == *'.example.'* ]]; then
+  if [[ $domain_lc == *.example || $domain_lc == *.example.com || $domain_lc == *.example.net || $domain_lc == *.example.org ]]; then
     return 0
   fi
   return 1
@@ -131,7 +141,9 @@ line_has_bad_ts() {
 
 line_has_bad_coauthor() {
   local line=$1
-  [[ $line == *"$co_prefix"* ]] || return 1
+  local lower=${line,,}
+  local prefix_lc=${co_prefix,,}
+  [[ $lower == *"$prefix_lc"* ]] || return 1
   if [[ $line =~ $pln_co_re ]]; then
     return 1
   fi
@@ -139,6 +151,18 @@ line_has_bad_coauthor() {
     return 1
   fi
   return 0
+}
+
+is_image() {
+  local base=${1##*/}
+  local ext
+  [[ $base == *.* ]] || return 1
+  ext=${base##*.}
+  ext=${ext,,}
+  case $ext in
+    jpg|jpeg|jpe|jfif|png|gif|webp|tif|tiff|heic|avif) return 0 ;;
+  esac
+  return 1
 }
 
 party_ok() {
@@ -163,9 +187,11 @@ grep_locs() {
   local locs status
   set +e
   if [[ $mode == deny ]]; then
-    locs=$(grep -nIHEiE -f "$pattern" -- "$@" 2>/dev/null | cut -d: -f1,2)
+    locs=$(grep -naHEiE -f "$pattern" -- "$@" 2>/dev/null | cut -d: -f1,2)
+  elif [[ $mode == coi ]]; then
+    locs=$(grep -naHEiE -e "$pattern" -- "$@" 2>/dev/null | cut -d: -f1,2)
   else
-    locs=$(grep -nIHE -e "$pattern" -- "$@" 2>/dev/null | cut -d: -f1,2)
+    locs=$(grep -naHE -e "$pattern" -- "$@" 2>/dev/null | cut -d: -f1,2)
   fi
   status=$?
   set -e
@@ -193,7 +219,9 @@ read_line() {
 }
 
 load_ci_event() {
-  [[ -n ${EVENT_JSON:-} ]] || return 0
+  if [[ -z ${EVENT_JSON:-} && -z ${PUBLIC_GUARD_EVENT_PATH:-} && -z ${GITHUB_EVENT_PATH:-} ]]; then
+    return 0
+  fi
   local dir
   dir=$(mktemp -d)
   tmps+=("$dir")
@@ -242,6 +270,8 @@ load_denylist() {
   raw=${raw//$'\r'/}
   DENY_FILE=$(mk)
   while IFS= read -r line || [[ -n $line ]]; do
+    line=${line#"${line%%[![:space:]]*}"}
+    line=${line%"${line##*[![:space:]]}"}
     if [[ -z $line ]]; then
       continue
     fi
@@ -290,6 +320,10 @@ resolve_range() {
   fi
   if [[ -n $RANGE_SPEC && $RANGE_SPEC != *..* ]]; then
     RANGE_ONE=1
+  fi
+  RANGE_MISSING=0
+  if [[ -z $RANGE_SPEC && ${GITHUB_ACTIONS:-} == true ]]; then
+    RANGE_MISSING=1
   fi
 }
 
@@ -365,24 +399,20 @@ scan_patterns() {
   local relax=$2
   shift 2
   [[ $# -gt 0 ]] || return 0
-  local locs
+  local locs sec
   take_locs locs plain "$bc_re" "$@"
   note_simple_locs "$label_mode" R-bc "$locs"
   take_locs locs plain "$home_re" "$@"
   note_simple_locs "$label_mode" R-home "$locs"
   take_locs locs plain "$users_re" "$@"
   note_simple_locs "$label_mode" R-home "$locs"
-  take_locs locs plain "$sec_ghp" "$@"
-  note_simple_locs "$label_mode" R-secret "$locs"
-  take_locs locs plain "$sec_pat" "$@"
-  note_simple_locs "$label_mode" R-secret "$locs"
-  take_locs locs plain "$sec_ts" "$@"
-  note_simple_locs "$label_mode" R-secret "$locs"
-  take_locs locs plain "$sec_key" "$@"
-  note_simple_locs "$label_mode" R-secret "$locs"
+  for sec in "$sec_ghp" "$sec_gho" "$sec_ghs" "$sec_ghu" "$sec_ghr" "$sec_pat" "$sec_ts" "$sec_key"; do
+    take_locs locs plain "$sec" "$@"
+    note_simple_locs "$label_mode" R-secret "$locs"
+  done
   take_locs locs plain "$ts_re" "$@"
   note_filtered_locs "$label_mode" R-tsnet ts "$locs"
-  take_locs locs plain "$co_prefix" "$@"
+  take_locs locs coi "$co_prefix" "$@"
   note_filtered_locs "$label_mode" R-coauthor co "$locs"
   if [[ $relax -eq 0 ]]; then
     take_locs locs plain "$email_re" "$@"
@@ -514,19 +544,27 @@ else
 fi
 
 resolve_range "${1:-}"
+if [[ ${RANGE_MISSING:-0} -eq 1 ]]; then
+  add_hit 'range R-range'
+fi
 
 all_files=()
 while IFS= read -r -d '' path; do
   all_files+=("$path")
 done < <(git ls-files -z)
 
-content_files=()
+text_files=()
+image_files=()
 if [[ ${#all_files[@]} -gt 0 ]]; then
   for path in "${all_files[@]}"; do
     if excluded "$path"; then
       continue
     fi
-    content_files+=("$path")
+    if is_image "$path"; then
+      image_files+=("$path")
+    else
+      text_files+=("$path")
+    fi
   done
 fi
 
@@ -539,10 +577,12 @@ if [[ ${#all_files[@]} -gt 0 ]]; then
   scan_addresses names "$name_file"
 fi
 
-if [[ ${#content_files[@]} -gt 0 ]]; then
-  scan_patterns file 0 "${content_files[@]}"
-  scan_addresses file "${content_files[@]}"
-  scan_images "${content_files[@]}"
+if [[ ${#text_files[@]} -gt 0 ]]; then
+  scan_patterns file 0 "${text_files[@]}"
+  scan_addresses file "${text_files[@]}"
+fi
+if [[ ${#image_files[@]} -gt 0 ]]; then
+  scan_images "${image_files[@]}"
 fi
 
 scan_commits
