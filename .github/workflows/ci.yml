@@ -4,6 +4,7 @@
 # Modified 2026-10 by PLN: sharp loads after the strict install (GPL-3.0; see NOTICE).
 # Modified 2026-10 by PLN: test job covers Node 24 and Windows (GPL-3.0; see NOTICE).
 # Modified 2026-10 by PLN: Node 24.22.0 and windows-2025 are pinned (GPL-3.0; see NOTICE).
+# Modified 2026-10 by PLN: production npm audit is a warning (GPL-3.0; see NOTICE).
 # Test-job idea adapted from dvaerum/pikvm_mcp_server
 # .github/workflows/ci.yml @ 00cbfc0207c1be2b28b25679019e7fe9bd9d9654
 # (GPL-3.0, test job only).
@@ -62,3 +63,26 @@ jobs:
         run: npm ci --strict-allow-scripts
       - name: Load sharp
         run: node -e "require('sharp')"
+
+  # Production npm audit is a warning, not a gate.
+  # The hard gate belongs to the release workflow later.
+  npm-audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22.14.0
+      - name: Audit production dependencies (warning only)
+        run: |
+          set +e
+          npm audit --omit=dev
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo "npm audit --omit=dev: no production advisories"
+            exit 0
+          fi
+          echo "::warning::npm audit --omit=dev reported production advisories (exit ${status}). This step is a warning, not a gate."
+          exit 0
