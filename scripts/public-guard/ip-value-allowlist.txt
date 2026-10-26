@@ -1,0 +1,17 @@
+# Modified 2026-10 by PLN: public-file privacy guard (GPL-3.0; see NOTICE).
+# Exact IPv4 tokens allowed in any tracked file. Loopback is not a
+# violation and is not listed. Any other private, CGNAT, or link-local
+# address still fails.
+100.64.0.0/10
+169.254.0.0/16
+100.100.100.100
+100.100.100.200
+169.254.169.254
+100.100.100.100/32
+100.100.100.200/32
+169.254.169.254/32
+100.101.102.103/32
+172.17.0.1
+# README device-registry example host. One CGNAT address outside the
+# URL-policy bullets, so the section skip does not cover it.
+100.64.0.8

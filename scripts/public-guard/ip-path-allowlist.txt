@@ -1,0 +1,9 @@
+# Modified 2026-10 by PLN: public-file privacy guard (GPL-3.0; see NOTICE).
+# R-ip and R-ip6 skip these paths. A trailing slash is a directory prefix.
+# A pattern that starts with "*." matches the final path segment.
+# README and NOTICE are not listed. Only their URL-policy sections are
+# skipped, and that decision lives in scan-ip.mjs. docs/ is not listed.
+src/url-policy.ts
+test/
+.env.example
+*.example

@@ -1,0 +1,74 @@
+# Modified 2026-10 by PLN: public-file privacy guard (GPL-3.0; see NOTICE).
+# Checkout is actions/checkout v5.1.0, the same pin as ci.yml.
+# Tag v5.1.0 points at fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09.
+#
+# PUBLIC_DENYLIST is a repository secret. This job fails closed when
+# that secret is missing. A fork pull request, and a pull_request whose
+# actor is dependabot[bot], skip only the denylist. Push never skips it.
+
+name: public-guard
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited
+  push:
+    branches:
+      - main
+
+permissions: {}
+
+concurrency:
+  group: public-guard-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  public-guard:
+    name: public-guard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Decide whether the denylist applies
+        id: denylist
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_JSON: ${{ toJSON(github.event) }}
+          ACTOR: ${{ github.actor }}
+          REPOSITORY: ${{ github.repository }}
+        run: bash scripts/public-guard/decide-skip.sh
+
+      - name: Check public files
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_JSON: ${{ toJSON(github.event) }}
+          GIT_SHA: ${{ github.sha }}
+          PUBLIC_GUARD_SKIP_DENYLIST: ${{ steps.denylist.outputs.skip }}
+          PUBLIC_GUARD_SKIP_REASON: ${{ steps.denylist.outputs.reason }}
+          PUBLIC_DENYLIST: ${{ secrets.PUBLIC_DENYLIST }}
+        run: bash scripts/check-public.sh
+
+  public-guard-self-test:
+    name: public-guard-self-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Run guard self-tests
+        run: bash test/public-guard/run.sh

@@ -1,0 +1,10 @@
+# Modified 2026-10 by PLN: public-file privacy guard (GPL-3.0; see NOTICE).
+# Exact fc00::/7 and fe80::/10 tokens allowed in any tracked file.
+# Measured on this main: URL-policy text in README and NOTICE.
+# .env.example, src/url-policy.ts, and test/ are path-skipped.
+# A bare "fd:" in source is a file descriptor, not an address.
+fd7a:115c:a1e0::/48
+fd7a:115c:a1e0::53
+fd00:ec2::254
+fe80::/10
+fc00::/7
