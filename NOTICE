@@ -83,6 +83,7 @@ Modified 2026-10 by PLN: situation-first errors, no-signal cause, plain-text OCR
 Modified 2026-10 by PLN: pikvm_keep_awake (GPL-3.0; see below).
 Modified 2026-10 by PLN: pikvm_status (GPL-3.0; see below).
 Modified 2026-10 by PLN: wake, observe, pikvm_wait_for, pikvm_click_text (GPL-3.0; see below).
+Modified 2026-10 by PLN: version 0.4.0 (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -1444,4 +1445,13 @@ No code from another pikvm_mcp_server fork was added for these methods.
   image comparison. pikvm_click_text clicks the centre of OCR words that
   match a phrase in reading order, refuses an ambiguous match unless
   nth picks one, and returns the screenshot after.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  The version is 0.4.0: clearer output, pikvm_keep_awake, pikvm_status
+  and the intent tools. Breaking: pikvm_read_text returns plain text
+  unless detail is words, and the no-signal next step is a screenshot
+  with wake. compose.yaml, compose.tailscale.yaml and docs/docker.md
+  name the 0.4.0 image. A keep-awake test now waits for its fallback
+  reason, which a poll skipped for the HID settle can hide for a moment.
   No code from another pikvm_mcp_server fork was copied.
