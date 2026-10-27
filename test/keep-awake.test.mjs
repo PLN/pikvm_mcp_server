@@ -174,6 +174,17 @@ test('without kvmd inactivity it acts once per interval; mixed mode still altern
     await waitUntil(() => /kvmd does not report inactivity/.test(client.keepAwake.state().lastSkip ?? ''));
   });
 
+  // A tool's input, such as a wake key from a screenshot, resets that fallback clock.
+  await withClient({ routes: { 'GET /api/hid/inactivity': { status: 404, body: { ok: false } } } }, async ({ mock, client }) => {
+    client.keepAwake.start(options({ intervalSeconds: 60 }), () => false);
+    await waitUntil(() => moves(mock).length >= 1);
+    await sleep(300);
+    await client.sendKey('F15');
+    const keyAt = Date.now();
+    await waitUntil(() => moves(mock).length >= 2, 3000);
+    assert.ok(moves(mock)[1].at - keyAt >= 550, `moved ${moves(mock)[1].at - keyAt} ms after the key`);
+  });
+
   await withClient({}, async ({ mock, client }) => {
     client.keepAwake.start(options({ mode: 'mixed' }), () => false);
     await waitUntil(() => moves(mock).length >= 2, 5000);

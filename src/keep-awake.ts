@@ -179,10 +179,18 @@ export class KeepAwake {
   /** That call ended. Suspension runs `suspendSeconds` from now. */
   callEnded(): void {
     this.activeCalls = Math.max(0, this.activeCalls - 1);
-    this.lastKnownInput = Date.now();
     if (!this.options) return;
     const until = Date.now() + this.options.suspendSeconds * this.timing().secondMs;
     this.suspendedUntil = Math.max(this.suspendedUntil, until);
+  }
+
+  /**
+   * A tool sent HID input (sent, or possibly applied). Feeds the fallback
+   * idle clock used when kvmd does not report inactivity. Calls that do not
+   * pause keep-awake, such as a wake key from a screenshot, count too.
+   */
+  noteInput(): void {
+    this.lastKnownInput = Date.now();
   }
 
   state(): KeepAwakeState {
