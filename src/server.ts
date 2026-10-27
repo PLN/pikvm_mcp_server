@@ -36,6 +36,7 @@
 // Modified 2026-10 by PLN: pikvm_keep_awake, suspended by other tool calls (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: pikvm_status (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: wake, observe, pikvm_wait_for, pikvm_click_text (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: only input tools pause keep-awake; status line without repeats (GPL-3.0; see NOTICE).
 
 /**
  * MCP server factory for PiKVM tools
@@ -417,8 +418,15 @@ export function kvmdErrorDetails(error: KvmdError, password = '', otherPasswords
   };
 }
 
-/** Tool calls that do not suspend keep-awake: keep-awake itself and state reads. */
-const KEEP_AWAKE_NEUTRAL_TOOLS = new Set(['pikvm_keep_awake', 'pikvm_devices', 'pikvm_status']);
+/**
+ * Tool calls that pause keep-awake: those that send keyboard or mouse input
+ * to the machine, which are the HID-gated tools other than keep-awake
+ * itself. Screenshots, OCR, status, waits and media tools only look, so
+ * keep-awake keeps the screen on during them.
+ */
+function pausesKeepAwake(name: string): boolean {
+  return ARM_GATED_TOOLS.has(name) && name !== 'pikvm_keep_awake';
+}
 
 function requireIntegerIn(value: unknown, fieldName: string, range: { default: number; min: number; max: number }): number {
   if (value === undefined) return range.default;
@@ -436,7 +444,7 @@ function keepAwakeText(state: KeepAwakeState): string {
   const key = `the ${KEEP_AWAKE_KEY} key, which applications ignore`;
   const input = state.mode === 'mouse' ? mouse : state.mode === 'keyboard' ? key : `${mouse} and ${key}, in turn`;
   return `Keep-awake is on: ${input}, whenever the computer has had no keyboard or mouse input for `
-    + `${state.intervalSeconds} s. Other tool calls on this device pause it while they run and for `
+    + `${state.intervalSeconds} s. Tool calls that send keyboard or mouse input to this device pause it while they run and for `
     + `${state.suspendSeconds} s after; then it resumes. It stays on until pikvm_keep_awake is called with `
     + `enabled false, or the server restarts.\n${JSON.stringify(state)}`;
 }
@@ -606,9 +614,14 @@ function deviceStatusText(status: DeviceStatus, now: number): string {
     ? `  Screen: on, ${picture.width}x${picture.height}${picture.fps !== undefined ? ` at ${picture.fps} fps` : ''}`
     : `  Screen: ${PICTURE_TEXT[picture.state] ?? picture.state}`;
   if (screen) {
-    screenLine += screen.since === screen.lastChecked
-      ? `; ${screen.state}, first seen just now by this server`
-      : `; ${screen.state} for ${durationText((now - Date.parse(screen.since)) / 1000)}, as seen by this server`;
+    // The tracked state usually says the same as the picture; then only its age is added.
+    const same = (picture.state === 'visible' && screen.state === 'on')
+      || (picture.state === 'capture_stopped' && screen.state === 'capture stopped')
+      || (['display_asleep', 'usb_offline', 'no_signal'].includes(picture.state) && screen.state === 'off');
+    const age = screen.since === screen.lastChecked
+      ? 'first seen just now by this server'
+      : `for ${durationText((now - Date.parse(screen.since)) / 1000)} as seen by this server`;
+    screenLine += same ? `, ${age}` : `; ${screen.state}, ${age}`;
   }
   lines.push(`${screenLine}.`);
   const input = status.input;
@@ -1321,7 +1334,7 @@ const tools: Tool[] = [
   },
   {
     name: 'pikvm_keep_awake',
-    description: 'Keep the computer awake until stopped: a toggle. Whenever the computer has had no keyboard or mouse input from anyone for intervalSeconds, send one harmless input: mouse moves near the centre of a screen quadrant (never the screen centre or an edge), the F15 key (ignored by applications), or both in turn. Any other tool call on this device pauses it while the call runs and for suspendSeconds after, then it resumes by itself. Needs HID armed. State is in memory; a server restart stops it.',
+    description: 'Keep the computer awake until stopped: a toggle. Whenever the computer has had no keyboard or mouse input from anyone for intervalSeconds, send one harmless input: mouse moves near the centre of a screen quadrant (never the screen centre or an edge), the F15 key (ignored by applications), or both in turn. A tool call that sends keyboard or mouse input to this device pauses it while the call runs and for suspendSeconds after, then it resumes by itself; screenshots, OCR, status and waits do not pause it. Needs HID armed. State is in memory; a server restart stops it.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1342,7 +1355,7 @@ const tools: Tool[] = [
         },
         suspendSeconds: {
           type: 'number',
-          description: `Pause after another tool call on this device (${KEEP_AWAKE_SUSPEND.min}-${KEEP_AWAKE_SUSPEND.max}, default ${KEEP_AWAKE_SUSPEND.default}).`,
+          description: `Pause after a tool call that sends input to this device (${KEEP_AWAKE_SUSPEND.min}-${KEEP_AWAKE_SUSPEND.max}, default ${KEEP_AWAKE_SUSPEND.default}).`,
         },
       },
       required: ['enabled'],
@@ -1599,9 +1612,9 @@ export function createMcpServer(deps: McpServerDeps): Server {
       };
       let typedQueuedMs = 0;
 
-      // Every other tool call on this device pauses keep-awake while it runs
-      // and for its suspendSeconds after.
-      const suspends = !KEEP_AWAKE_NEUTRAL_TOOLS.has(name);
+      // A tool that sends input pauses keep-awake while it runs and for its
+      // suspendSeconds after.
+      const suspends = pausesKeepAwake(name);
       if (suspends) active.client.keepAwake.callStarted();
       const produced = await (async () => {
       switch (name) {

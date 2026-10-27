@@ -1,4 +1,5 @@
 // Modified 2026-10 by PLN: keep-awake modes, quadrants, suspension and resume (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: only input tools pause it (GPL-3.0; see NOTICE).
 
 /**
  * pikvm_keep_awake keeps the computer awake until stopped: harmless input
@@ -181,7 +182,7 @@ test('without kvmd inactivity it acts once per interval; mixed mode still altern
   });
 });
 
-test('through the server: a toggle, paused by another tool call, then resumed; disarmed is refused', async () => {
+test('through the server: a toggle, paused by an input tool, not by looking or waiting; disarmed is refused', async () => {
   const mock = await startKvmdMock({ inactivitySecondMs: SECOND_MS });
   const pikvm = new PiKVMClient({ host: mock.url, username: 'admin', password: 'testpw', verifySsl: false });
   setKeepAwakeTimingForTests(pikvm, { pollMs: 20, secondMs: SECOND_MS });
@@ -235,8 +236,8 @@ test('through the server: a toggle, paused by another tool call, then resumed; d
     await waitUntil(() => moves(mock).length >= 1);
     assert.equal(moves(mock).length, 1, 'long idle: one move at once');
 
-    // Another tool call pauses it for 30 configured seconds (300 ms) after it ends.
-    await call(base, id, 'pikvm_screenshot', {});
+    // A tool that sends input pauses it for 30 configured seconds (300 ms) after it ends.
+    await call(base, id, 'pikvm_key', { key: 'KeyA' });
     const ended = Date.now();
     await sleep(240);
     assert.equal(moves(mock).length, 1, 'no move while suspended');
@@ -244,8 +245,19 @@ test('through the server: a toggle, paused by another tool call, then resumed; d
     assert.equal(moves(mock).length, 2, 'resumed after the suspension');
     assert.ok(moves(mock)[1].at - ended >= 290);
 
+    // Screenshots every 50 ms only look: keep-awake keeps acting between them.
+    const watching = Date.now();
+    while (Date.now() - watching < 600) await call(base, id, 'pikvm_screenshot', {});
+    assert.ok(moves(mock).length >= 3, 'a move while screenshots were taken');
+
+    // A one-second wait does not pause it either.
+    const before = moves(mock).length;
+    const waited = await call(base, id, 'pikvm_wait_for', { changed: true, timeoutSeconds: 1, intervalMs: 250 });
+    assert.equal(waited.isError, true, 'the screen does not change, so the wait times out');
+    assert.ok(moves(mock).length > before, 'a move during the wait');
+
     const off = await call(base, id, 'pikvm_keep_awake', { enabled: false });
-    assert.match(off.content[0].text, /Keep-awake is off\. It sent 2 input/);
+    assert.match(off.content[0].text, /Keep-awake is off\. It sent \d+ input/);
 
     const bad = await call(base, id, 'pikvm_keep_awake', { enabled: true, intervalSeconds: 5 });
     assert.equal(bad.isError, true);
