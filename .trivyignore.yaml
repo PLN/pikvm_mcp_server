@@ -1,0 +1,8 @@
+# Modified 2026-10 by PLN: image scan waivers (GPL-3.0; see NOTICE).
+#
+# Each waiver needs an id, purls or paths, a statement, and expired_at at
+# most 90 days out; scripts/lint-waivers.sh enforces that. An id-only
+# entry would waive the advisory for every package. The pull request that
+# adds a waiver states why the finding is not reachable. A waiver holds no
+# host names or personal data.
+vulnerabilities: []
