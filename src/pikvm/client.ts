@@ -36,6 +36,7 @@
 // Modified 2026-10 by PLN: no-signal cause, error hints, typing drain estimate (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: keep-awake input and HID inactivity (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: device status: picture, screen on-time, input idle timers (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: wake a dark display, shorter signal wait (GPL-3.0; see NOTICE).
 // AbortSignal.timeout and PIKVM_UNREACHABLE / PIKVM_AUTH_FAILED no-retry codes
 // adapted from dtrukr/pikvm_mcp_server src/pikvm/client.ts @ d120243 (GPL-3.0).
 // Snapshot HTTP 503 retry-once adapted from dvaerum/pikvm_mcp_server
@@ -774,9 +775,12 @@ export const SERVER_ERROR_TYPES: ReadonlySet<string> = new Set([
  */
 export type NoSignalCause = 'display_asleep' | 'usb_offline' | 'unknown';
 
+/** The key that wakes a dark display: kvmd maps it, applications ignore it. */
+export const WAKE_KEY = 'F15';
+
 const NO_SIGNAL_MESSAGES: Record<NoSignalCause, string> = {
   display_asleep: 'no picture: the display is off or asleep. The computer is connected (its USB keyboard is online); '
-    + 'a key press such as ShiftLeft wakes the display',
+    + `pikvm_screenshot with wake: true presses ${WAKE_KEY} once to wake it`,
   usb_offline: 'no picture, and the computer\'s USB keyboard and mouse are offline: it is off, suspended or '
     + 'unplugged. A key press can only wake a suspended computer that allows USB wake-up',
   unknown: 'capture is running but reports no video signal. The computer may be off or asleep, '
@@ -1850,6 +1854,8 @@ export class PiKVMClient {
     quality?: number;
     region?: ScreenshotRegion;
     track?: boolean;
+    /** How long a capture this call starts waits for a signal. Default CAPTURE_SIGNAL_WAIT_MS. */
+    signalWaitMs?: number;
   }): Promise<ScreenshotResult> {
     const track = options?.track !== false;
     const seq = track ? this.frameSeq++ : -1;
@@ -1866,7 +1872,7 @@ export class PiKVMClient {
     const { buffer, actualResolution } = await this.withCapture(async (source) => ({
       buffer: Buffer.from(await this.request<ArrayBuffer>('GET', path)),
       actualResolution: source,
-    }));
+    }), options?.signalWaitMs);
     const metadata = await limitedSharp(buffer).metadata();
     if (!metadata.width || !metadata.height) {
       throw new Error('Failed to read screenshot dimensions');
@@ -2196,7 +2202,7 @@ export class PiKVMClient {
    * and the signal gets CAPTURE_SIGNAL_WAIT_MS to appear. Capture that was
    * already running without a signal fails at once with PIKVM_NO_SIGNAL.
    */
-  private async withCapture<T>(capture: (source: ScreenResolution) => Promise<T>): Promise<T> {
+  private async withCapture<T>(capture: (source: ScreenResolution) => Promise<T>, signalWaitMs?: number): Promise<T> {
     let release: (() => void) | undefined;
     try {
       // Keep an open session through this capture. Holding it opens nothing.
@@ -2204,7 +2210,7 @@ export class PiKVMClient {
       let source = await this.streamerSource();
       if (source === null) {
         release ??= await this.acquireCapture();
-        source = await this.awaitSignal();
+        source = await this.awaitSignal(signalWaitMs);
       }
       if (!source.online) throw await this.noSignalError();
       this.cachedResolution = { width: source.width, height: source.height };
@@ -2296,7 +2302,7 @@ export class PiKVMClient {
     }
     const err = new KvmdError(503, PIKVM_NO_SIGNAL, NO_SIGNAL_MESSAGES[cause], 'GET /api/streamer');
     err.reason = cause;
-    if (cause !== 'usb_offline') err.next = { tool: 'pikvm_key', args: { key: 'ShiftLeft' } };
+    if (cause !== 'usb_offline') err.next = { tool: 'pikvm_screenshot', args: { wake: true } };
     return err;
   }
 
@@ -2326,9 +2332,9 @@ export class PiKVMClient {
   }
 
   /** After the session opened: poll until ustreamer reports a signal or the wait ends. */
-  private async awaitSignal(): Promise<StreamerSource> {
+  private async awaitSignal(waitOverrideMs?: number): Promise<StreamerSource> {
     const timing = captureTimings.get(this);
-    const waitMs = timing?.signalWaitMs ?? CAPTURE_SIGNAL_WAIT_MS;
+    const waitMs = waitOverrideMs ?? timing?.signalWaitMs ?? CAPTURE_SIGNAL_WAIT_MS;
     const pollMs = timing?.pollMs ?? CAPTURE_POLL_MS;
     const deadline = performance.now() + waitMs;
     let source = await this.streamerSource();
@@ -2345,6 +2351,36 @@ export class PiKVMClient {
       );
     }
     return source;
+  }
+
+  /**
+   * Poll until the video signal is up, or `timeoutMs` passes. Starts no
+   * capture: call it while capture runs, such as after a wake key.
+   */
+  async waitForSignal(timeoutMs: number): Promise<{ online: boolean; afterMs: number }> {
+    const started = performance.now();
+    const pollMs = captureTimings.get(this)?.pollMs ?? CAPTURE_POLL_MS;
+    for (;;) {
+      const source = await this.streamerSource();
+      const afterMs = Math.round(performance.now() - started);
+      if (source?.online) return { online: true, afterMs };
+      if (afterMs >= timeoutMs) return { online: false, afterMs };
+      await delay(pollMs);
+    }
+  }
+
+  /**
+   * Keep this client's stream session open while `fn` runs, when one is
+   * open already. A wake key and the screenshot after it then share the
+   * capture the failed screenshot started.
+   */
+  async holdingCapture<T>(fn: () => Promise<T>): Promise<T> {
+    const release = this.capture.isOpen ? await this.acquireCapture() : undefined;
+    try {
+      return await fn();
+    } finally {
+      release?.();
+    }
   }
 
   /** /api/ws?stream=1 with this client's dispatcher (and TLS mode) and credentials. */

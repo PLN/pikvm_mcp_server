@@ -500,10 +500,10 @@ test('in a fleet, a next step names its device, and recognized text is not merge
       });
       assert.equal(dark.result.isError, true);
       assert.deepEqual(dark.result.structuredContent.error.next, {
-        tool: 'pikvm_key',
-        args: { key: 'ShiftLeft', device: 'lab2' },
+        tool: 'pikvm_screenshot',
+        args: { wake: true, device: 'lab2' },
       });
-      assert.match(dark.result.content[0].text, /\nNext: pikvm_key \{"key":"ShiftLeft","device":"lab2"\}\n/);
+      assert.match(dark.result.content[0].text, /\nNext: pikvm_screenshot \{"wake":true,"device":"lab2"\}\n/);
 
       const read = await rpc(srv.base, sessionId, 'tools/call', {
         name: 'pikvm_read_text',

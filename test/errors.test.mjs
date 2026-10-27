@@ -157,9 +157,9 @@ test('an error this server raises leads with the situation, cause and next step'
     const { text, details } = parseKvmdToolError(result);
     const lines = text.split('\n');
     assert.match(lines[0], /^Error \[PIKVM_NO_SIGNAL\]: no picture: the display is off or asleep/);
-    assert.equal(lines[1], 'Next: pikvm_key {"key":"ShiftLeft"}');
+    assert.equal(lines[1], 'Next: pikvm_screenshot {"wake":true}');
     assert.equal(details.cause, 'display_asleep');
-    assert.deepEqual(details.next, { tool: 'pikvm_key', args: { key: 'ShiftLeft' } });
+    assert.deepEqual(details.next, { tool: 'pikvm_screenshot', args: { wake: true } });
     assert.equal(details.endpoint, 'GET /api/streamer');
     assert.deepEqual(result.structuredContent.error, details);
   });
