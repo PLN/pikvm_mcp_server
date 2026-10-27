@@ -98,6 +98,7 @@ test('screenshot wake: one F15 brings a dark display back; never with USB offlin
     const shot = await call('pikvm_screenshot', { wake: true });
     assert.equal(shot.isError, true);
     assert.match(shot.content[0].text, /wake did not press a key: HID is disarmed/);
+    assert.equal(shot.structuredContent.error.next, undefined, 'no hint to repeat a wake that cannot work');
     assert.equal(keysSent(mock).length, 0);
   });
 });

@@ -1533,6 +1533,8 @@ export function createMcpServer(deps: McpServerDeps): Server {
         if (!(error instanceof KvmdError) || error.type !== 'PIKVM_NO_SIGNAL' || error.reason === 'usb_offline') throw error;
         if (!active.armHid) {
           error.message += '. wake did not press a key: HID is disarmed';
+          // Repeating the wake cannot help.
+          error.next = undefined;
           throw error;
         }
         return deviceClient.holdingCapture(async () => {
@@ -1540,6 +1542,7 @@ export function createMcpServer(deps: McpServerDeps): Server {
           const signal = await deviceClient.waitForSignal(WAKE_SIGNAL_WAIT_MS);
           if (!signal.online) {
             error.message += `. Pressed ${WAKE_KEY}; still no picture after ${WAKE_SIGNAL_WAIT_MS / 1000} s`;
+            error.next = undefined;
             throw error;
           }
           return `Woke the display: pressed ${WAKE_KEY}, picture after ${signal.afterMs} ms. `;
