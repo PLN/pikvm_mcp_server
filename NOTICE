@@ -72,6 +72,7 @@ Modified 2026-10 by PLN: public-file privacy guard (GPL-3.0; see below).
 Modified 2026-10 by PLN: privacy guard review fixes (GPL-3.0; see below).
 Modified 2026-10 by PLN: graceful shutdown and an external upload abort (GPL-3.0; see below).
 Modified 2026-10 by PLN: Docker image, entrypoint, compose file, and image smoke test (GPL-3.0; see below).
+Modified 2026-10 by PLN: a cut-short POST reply is state unknown; CI checkouts keep no credentials (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -1264,4 +1265,18 @@ No code from another pikvm_mcp_server fork was added for these methods.
   test/docker/smoke.sh checks the image without a real PiKVM, and CI
   runs it on amd64 and arm64. Dependabot proposes base image updates
   weekly, except a new Node major.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  A reply to a HID or MSD POST that is cut short after it started is
+  now PIKVM_HID_STATE_UNKNOWN or PIKVM_MSD_STATE_UNKNOWN, not
+  PIKVM_UNREACHABLE. This covers a body shorter than its Content-Length
+  and a chunked body that ends without its last chunk, both seen with
+  Connection: close. The request reached kvmd, so it is not resent.
+  Connection refused, a connect timeout and DNS failures stay
+  PIKVM_UNREACHABLE. The kvmd mock gained a truncateBody route option.
+  The test, allow-scripts and npm-audit checkouts in the CI workflow
+  set persist-credentials to false, as the docker job already does.
+  The npm audit warning says the audit may have failed rather
+  than claiming advisories for every non-zero exit.
   No code from another pikvm_mcp_server fork was copied.

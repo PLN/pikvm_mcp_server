@@ -30,6 +30,7 @@
 // Modified 2026-10 by PLN: a post-send job cap reports phase job_timeout (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: the upload response read is phase job_timeout (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: external abort on msd write and write_remote (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: a cut-short reply to a POST is state unknown (GPL-3.0; see NOTICE).
 // AbortSignal.timeout and PIKVM_UNREACHABLE / PIKVM_AUTH_FAILED no-retry codes
 // adapted from dtrukr/pikvm_mcp_server src/pikvm/client.ts @ d120243 (GPL-3.0).
 // Snapshot HTTP 503 retry-once adapted from dvaerum/pikvm_mcp_server
@@ -598,10 +599,30 @@ function errorCodes(err: unknown): string[] {
   return codes;
 }
 
+/**
+ * The response started and was cut short or could not be parsed, so the
+ * request reached kvmd. A body shorter than its Content-Length has a code.
+ * undici's parser error, such as a chunked body that ends without its last
+ * chunk, has none, so it is matched by name.
+ */
+const POST_SEND_RESPONSE_CODES = new Set(['UND_ERR_RES_CONTENT_LENGTH_MISMATCH']);
+
+function isResponseParseError(err: unknown): boolean {
+  const seen = new Set<unknown>();
+  let current: unknown = err;
+  while (current && typeof current === 'object' && !seen.has(current)) {
+    seen.add(current);
+    if ((current as { name?: unknown }).name === 'HTTPParserError') return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
 function failedAfterSend(err: unknown): boolean {
   const codes = errorCodes(err);
   if (codes.some((code) => PRE_SEND_CODES.has(code))) return false;
-  return codes.some((code) => POST_SEND_SOCKET_CODES.has(code));
+  return codes.some((code) => POST_SEND_SOCKET_CODES.has(code) || POST_SEND_RESPONSE_CODES.has(code))
+    || isResponseParseError(err);
 }
 
 function isPreSendFailure(err: unknown): boolean {

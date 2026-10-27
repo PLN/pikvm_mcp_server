@@ -2,6 +2,7 @@
 // Modified 2026-10 by PLN: connect timeout and DNS unreachable tests (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: pikvm_type delay is milliseconds (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: header and body timeouts stay timeouts (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: a reply cut short after Connection: close (GPL-3.0; see NOTICE).
 
 /**
  * KvmdError, request timeout, and bounded GET retry.
@@ -444,6 +445,19 @@ test('a body reset on a HID POST maps to PIKVM_HID_STATE_UNKNOWN and is not retr
     assert.equal(details.message, 'input may still be applying; do not resend');
     assert.equal(count(mock, 'POST', '/api/hid/events/send_key'), 1);
   });
+});
+
+test('a HID reply cut short after Connection: close maps to PIKVM_HID_STATE_UNKNOWN and is not retried', async () => {
+  for (const truncateBody of ['length', 'chunked']) {
+    await withSession({
+      'POST /api/hid/events/send_key': { truncateBody },
+    }, false, async ({ mock, srv, sessionId }) => {
+      const result = await callTool(srv.base, sessionId, 'pikvm_key', { key: 'KeyA' });
+      const { details } = parseKvmdToolError(result);
+      assert.equal(details.type, 'PIKVM_HID_STATE_UNKNOWN', truncateBody);
+      assert.equal(count(mock, 'POST', '/api/hid/events/send_key'), 1);
+    });
+  }
 });
 
 test('a HID POST refused at connect stays PIKVM_UNREACHABLE and is not retried', async () => {
