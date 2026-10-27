@@ -42,6 +42,7 @@
 <!-- Modified 2026-10 by PLN: allowScripts names sharp@0.35.5 (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: graceful shutdown (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: Docker quick start, client setup, CA wording, upstream badges removed (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: the image is published (GPL-3.0; see NOTICE) -->
 
 # PiKVM MCP Server
 
@@ -96,7 +97,7 @@ This next demonstration shows Claude, connected via the PiKVM MCP server, respon
 
 The container image is the default way to run the server: Node.js, tesseract, and a `/data` volume for secrets, pinned certificates, and ISO images, running as an unprivileged user. `compose.yaml` adds a read-only root filesystem with every capability dropped. The full guide, including the Tailscale sidecar, is [docs/docker.md](docs/docker.md).
 
-> **Not yet published.** Until the first image release, build it with `docker buildx build --load -t pikvm-mcp:local .` and set `image: pikvm-mcp:local` in a `compose.override.yaml` (see [docs/docker.md](docs/docker.md)).
+Images are published to `ghcr.io/pln/pikvm_mcp_server` for amd64 and arm64.
 
 ```bash
 umask 077

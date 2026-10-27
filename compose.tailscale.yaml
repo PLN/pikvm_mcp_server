@@ -1,6 +1,5 @@
 # Modified 2026-10 by PLN: Tailscale sidecar example (GPL-3.0; see NOTICE).
-#
-# Not yet published: the first image release is still to come.
+# Modified 2026-10 by PLN: the image is published (GPL-3.0; see NOTICE).
 #
 # The MCP endpoint is reachable over the tailnet only: tailscale serve
 # (./ts-config/serve.json) forwards HTTPS 443 to http://127.0.0.1:8675.

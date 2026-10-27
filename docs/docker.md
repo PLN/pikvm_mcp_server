@@ -1,15 +1,9 @@
 <!-- Modified 2026-10 by PLN: Docker guide (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: the image is published; verify and build sections (GPL-3.0; see NOTICE) -->
 
 # Running the server in Docker
 
-> **Not yet published.** The first image release (`ghcr.io/pln/pikvm_mcp_server`) is still to come. Until then, build the image yourself and point Compose at it:
->
-> ```bash
-> docker buildx build --load -t pikvm-mcp:local .
-> printf 'services:\n  pikvm-mcp:\n    image: pikvm-mcp:local\n' > compose.override.yaml
-> ```
->
-> Compose merges `compose.override.yaml` into `compose.yaml` automatically. Building needs BuildKit (`docker buildx build`, or `DOCKER_BUILDKIT=1 docker build`).
+Images are published to `ghcr.io/pln/pikvm_mcp_server` for `linux/amd64` and `linux/arm64`, with the tags `X.Y.Z`, `X.Y` and `latest`. To build the image yourself instead, see the end of this guide.
 
 The image runs the server as uid 10001 under `tini`. `compose.yaml` adds a read-only root filesystem, drops every capability and sets `no-new-privileges`; the `docker run` example below uses the first two as well. Everything the server keeps lives in one `/data` volume. It includes `tesseract` with English data, so `pikvm_read_text` is available by default. `npm` is not in the image.
 
@@ -161,7 +155,7 @@ cat > ts-config/serve.json <<'EOF'
 EOF
 ```
 
-Write the bearer, password and pin into the volume as in the quick start, using `docker compose -f compose.tailscale.yaml run ...`, then `docker compose -f compose.tailscale.yaml up -d`. With `-f`, Compose does not read `compose.override.yaml` on its own: until the first release, use `-f compose.tailscale.yaml -f compose.override.yaml` so the local build is used. The client URL is `https://pikvm-mcp.<tailnet>.ts.net/mcp`. See Tailscale's documentation for `serve` configuration.
+Write the bearer, password and pin into the volume as in the quick start, using `docker compose -f compose.tailscale.yaml run ...`, then `docker compose -f compose.tailscale.yaml up -d`. With `-f`, Compose does not read `compose.override.yaml` on its own, so for a local build add `-f compose.override.yaml` after `-f compose.tailscale.yaml`. The client URL is `https://pikvm-mcp.<tailnet>.ts.net/mcp`. See Tailscale's documentation for `serve` configuration.
 
 Things to know:
 
@@ -198,6 +192,25 @@ Pin `X.Y.Z` (or `@sha256:...`) in production. Upgrade with `docker compose pull 
 - **Healthcheck stays "starting".** Startup checks each device before listening, about 16 s per device that drops packets. The start period is 60 s.
 - **No `npm` in the container.** It is removed from the runtime image. Rebuild the image to change dependencies.
 - **Log timestamps** are in UTC, the container default.
+
+## Verifying an image
+
+Each release carries a build provenance attestation made by the release workflow:
+
+```bash
+gh attestation verify oci://ghcr.io/pln/pikvm_mcp_server:0.3.0 --repo PLN/pikvm_mcp_server --signer-workflow PLN/pikvm_mcp_server/.github/workflows/release.yml
+```
+
+Check the signer workflow and repository. The source commit is in the image's `org.opencontainers.image.revision` label and the matching `vX.Y.Z` git tag.
+
+## Building the image yourself
+
+```bash
+docker buildx build --load -t pikvm-mcp:local .
+printf 'services:\n  pikvm-mcp:\n    image: pikvm-mcp:local\n' > compose.override.yaml
+```
+
+Compose merges `compose.override.yaml` into `compose.yaml` automatically. Building needs BuildKit (`docker buildx build`, or `DOCKER_BUILDKIT=1 docker build`).
 
 ## Licence and source
 
