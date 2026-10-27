@@ -169,7 +169,8 @@ test('without kvmd inactivity it acts once per interval; mixed mode still altern
     await waitUntil(() => moves(mock).length >= 3);
     const seen = moves(mock);
     for (let i = 1; i < seen.length; i += 1) assert.ok(seen[i].at - seen[i - 1].at >= 90, 'not every poll');
-    assert.match(client.keepAwake.state().lastSkip, /kvmd does not report inactivity/);
+    // A poll right after a move skips for the HID settle instead; the next one names the fallback.
+    await waitUntil(() => /kvmd does not report inactivity/.test(client.keepAwake.state().lastSkip ?? ''));
   });
 
   await withClient({}, async ({ mock, client }) => {
