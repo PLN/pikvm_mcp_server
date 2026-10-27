@@ -1,0 +1,519 @@
+# Modified 2026-10 by PLN: manual image release (GPL-3.0; see NOTICE).
+#
+# Dispatch from main with a version, X.Y.Z or X.Y.Z-rc.N, whose core
+# matches package.json. Normal mode builds each architecture by digest,
+# smoke-tests and scans that exact digest, and only then tags the image,
+# attests it, creates the git tag and the release, so a failed run burns
+# no version. Resume mode finishes a run that failed after the image tag
+# existed: it builds nothing and releases the commit in the image's
+# revision label after checking it. no-cache rebuilds every layer, for
+# example to pick up a fixed Debian package.
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version, X.Y.Z or X.Y.Z-rc.N, no leading v
+        required: true
+        type: string
+      resume:
+        description: Finish a release whose image tag already exists
+        type: boolean
+        default: false
+      no-cache:
+        description: Rebuild every image layer
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/pln/pikvm_mcp_server
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      version: ${{ steps.inputs.outputs.version }}
+      resume: ${{ steps.result.outputs.resume }}
+      sha: ${{ steps.result.outputs.sha }}
+    steps:
+      - name: Check the inputs
+        id: inputs
+        env:
+          VERSION: ${{ inputs.version }}
+          RESUME: ${{ inputs.resume }}
+          NO_CACHE: ${{ inputs.no-cache }}
+          REF: ${{ github.ref }}
+        run: |
+          if [ "$REF" != refs/heads/main ]; then
+            echo "::error::dispatch the release from main, not $REF"
+            exit 1
+          fi
+          if ! [[ $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+            echo "::error::version must be X.Y.Z or X.Y.Z-rc.N with no leading v"
+            exit 1
+          fi
+          if [ "$RESUME" = true ] && [ "$NO_CACHE" = true ]; then
+            echo "::error::no-cache has no effect in resume mode, nothing is built; re-dispatch without it"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: The dispatch commit is on main
+        run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Normal mode checks
+        if: ${{ !inputs.resume }}
+        env:
+          VERSION: ${{ steps.inputs.outputs.version }}
+        run: |
+          core=${VERSION%%-*}
+          pkg=$(jq -r .version package.json)
+          if [ "$pkg" != "$core" ]; then
+            echo "::error::package.json version is $pkg, not $core"
+            exit 1
+          fi
+          if [ -n "$(git ls-remote --tags origin "refs/tags/v$VERSION")" ]; then
+            echo "::error::git tag v$VERSION already exists"
+            exit 1
+          fi
+          state=$(bash scripts/image-tag-state.sh "$IMAGE:$VERSION")
+          if [ "$state" != absent ]; then
+            echo "::error::image tag $VERSION already exists; use resume to finish that release"
+            exit 1
+          fi
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        if: ${{ !inputs.resume }}
+        with:
+          node-version: 24.22.0
+          cache: npm
+      - name: Install, typecheck and test
+        if: ${{ !inputs.resume }}
+        run: |
+          npm ci
+          npm run typecheck
+          npm test
+      - name: Waiver lint
+        if: ${{ !inputs.resume }}
+        run: bash scripts/lint-waivers.sh
+      - name: Gate self-test
+        if: ${{ !inputs.resume }}
+        run: |
+          bash scripts/install-trivy.sh "$RUNNER_TEMP/trivy"
+          PATH="$RUNNER_TEMP/trivy:$PATH" bash scripts/gate-selftest.sh
+      - name: Production npm audit (warning only)
+        if: ${{ !inputs.resume }}
+        run: |
+          set +e
+          npm audit --omit=dev
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            echo "::warning::npm audit --omit=dev exited ${status}: production advisories, or the audit itself failed. The image scan is the release gate."
+          fi
+
+      # The tag exists only because publish ran after build, smoke and
+      # scan passed. R is the commit those ran on.
+      - name: Resume mode checks
+        id: resume
+        if: ${{ inputs.resume }}
+        env:
+          VERSION: ${{ steps.inputs.outputs.version }}
+        run: |
+          state=$(bash scripts/image-tag-state.sh "$IMAGE:$VERSION")
+          if [ "$state" != present ]; then
+            echo "::error::resume needs image tag $VERSION, and it does not exist"
+            exit 1
+          fi
+          image=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Image}}')
+          amd=$(jq -r '.["linux/amd64"].config.Labels["org.opencontainers.image.revision"] // empty' <<<"$image")
+          arm=$(jq -r '.["linux/arm64"].config.Labels["org.opencontainers.image.revision"] // empty' <<<"$image")
+          if [ "$amd" != "$arm" ] || ! [[ $amd =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::revision labels differ or are not commit SHAs (amd64 '$amd', arm64 '$arm')"
+            exit 1
+          fi
+          rc=0
+          git merge-base --is-ancestor "$amd" origin/main || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::$amd is not an ancestor of main (git merge-base exit $rc)"
+            exit 1
+          fi
+          pkg=$(git show "$amd:package.json" | jq -r .version)
+          if [ "$pkg" != "${VERSION%%-*}" ]; then
+            echo "::error::package.json at $amd is $pkg, not ${VERSION%%-*}"
+            exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
+            tagged=$(git rev-parse "v$VERSION^{commit}")
+            if [ "$tagged" != "$amd" ]; then
+              echo "::error::git tag v$VERSION points at $tagged, not $amd"
+              exit 1
+            fi
+          fi
+          echo "sha=$amd" >> "$GITHUB_OUTPUT"
+      - name: Result
+        id: result
+        env:
+          RESUME: ${{ inputs.resume }}
+          RESUME_SHA: ${{ steps.resume.outputs.sha }}
+        run: |
+          if [ "$RESUME" = true ]; then
+            echo "resume=true" >> "$GITHUB_OUTPUT"
+            echo "sha=$RESUME_SHA" >> "$GITHUB_OUTPUT"
+          else
+            echo "resume=false" >> "$GITHUB_OUTPUT"
+            echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: verify
+    if: github.repository_owner == 'PLN' && needs.verify.outputs.resume != 'true'
+    environment: release-build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux/amd64
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.verify.outputs.sha }}
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          tags: type=raw,value=${{ needs.verify.outputs.version }}
+          labels: |
+            org.opencontainers.image.licenses=GPL-3.0-only
+            org.opencontainers.image.revision=${{ needs.verify.outputs.sha }}
+            org.opencontainers.image.version=${{ needs.verify.outputs.version }}
+      - id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          provenance: false
+          sbom: false
+          no-cache: ${{ inputs.no-cache }}
+          cache-from: type=gha,scope=release-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=release-${{ matrix.arch }}
+      - name: Save the digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          if ! [[ $DIGEST =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::unexpected digest '$DIGEST'"
+            exit 1
+          fi
+          mkdir -p digests
+          printf '%s\n' "$DIGEST" > "digests/$ARCH"
+      # A few bytes. publish may wait days for approval; past this window
+      # it fails closed and a fresh dispatch is safe.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digest-${{ matrix.arch }}
+          path: digests/${{ matrix.arch }}
+          retention-days: 7
+          if-no-files-found: error
+
+  smoke:
+    needs: [verify, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.verify.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: digest-${{ matrix.arch }}
+          path: digests
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Pull the digest
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          digest=$(cat "digests/$ARCH")
+          docker pull "$IMAGE@$digest"
+          docker tag "$IMAGE@$digest" pikvm-mcp:release
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 24.22.0
+      - name: Smoke test
+        env:
+          EXPECT_REVISION: ${{ needs.verify.outputs.sha }}
+        run: bash test/docker/smoke.sh pikvm-mcp:release
+
+  scan:
+    needs: [verify, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.verify.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: digest-${{ matrix.arch }}
+          path: digests
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Save the digest as a tarball
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          digest=$(cat "digests/$ARCH")
+          docker pull "$IMAGE@$digest"
+          docker tag "$IMAGE@$digest" pikvm-mcp:scan
+          docker save pikvm-mcp:scan -o "$RUNNER_TEMP/image.tar"
+      - name: Install Trivy
+        run: |
+          bash scripts/install-trivy.sh "$RUNNER_TEMP/trivy"
+          echo "$RUNNER_TEMP/trivy" >> "$GITHUB_PATH"
+      - name: Scan gate (fixable CRITICAL or HIGH fails)
+        run: bash scripts/trivy-gate.sh "$RUNNER_TEMP/image.tar"
+      # Report only: every severity, fixed or not.
+      - name: Full report in the job summary
+        if: ${{ always() }}
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          [ -f "$RUNNER_TEMP/image.tar" ] || exit 0
+          {
+            echo "### Trivy report, linux/$ARCH (not a gate)"
+            echo '```'
+            trivy image --input "$RUNNER_TEMP/image.tar" --scanners vuln --no-progress --format table 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    needs: [verify, build, smoke, scan]
+    # One line, no folding: release-condition-test.yml matches it against test/fixtures/release-publish-if.txt.
+    if: ${{ !cancelled() && needs.verify.result == 'success' && ( (needs.verify.outputs.resume != 'true' && needs.build.result == 'success' && needs.smoke.result == 'success' && needs.scan.result == 'success') || (needs.verify.outputs.resume == 'true' && needs.build.result == 'skipped' && needs.smoke.result == 'skipped' && needs.scan.result == 'skipped') ) }}
+    runs-on: ubuntu-24.04
+    environment: release
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+      SHA: ${{ needs.verify.outputs.sha }}
+      RESUME: ${{ needs.verify.outputs.resume }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: The commits are on main
+        run: |
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          git merge-base --is-ancestor "$SHA" origin/main
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.verify.outputs.resume != 'true'
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+
+      # The real immutability guard: approval may have taken days, and
+      # anyone with package write could have created the tag since verify.
+      # A tag made from these same digests (a re-run) is left alone.
+      - name: (a) Create the image tag
+        if: needs.verify.outputs.resume != 'true'
+        run: |
+          amd=$(cat digests/amd64)
+          arm=$(cat digests/arm64)
+          state=$(bash scripts/image-tag-state.sh "$IMAGE:$VERSION")
+          if [ "$state" = absent ]; then
+            docker buildx imagetools create -t "$IMAGE:$VERSION" "$IMAGE@$amd" "$IMAGE@$arm"
+            exit 0
+          fi
+          have=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --raw | jq -r '[.manifests[].digest] | sort | join(" ")')
+          want=$(printf '%s\n' "$amd" "$arm" | sort | paste -sd' ')
+          if [ "$have" != "$want" ]; then
+            echo "::error::image tag $VERSION exists with other digests ($have); refusing to overwrite"
+            exit 1
+          fi
+          echo "image tag $VERSION already points at these digests"
+      - name: (b) Read the index digest
+        id: index
+        run: |
+          digest=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' | jq -r .digest)
+          if ! [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::unexpected index digest '$digest'"
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      # A duplicate attestation is harmless, so anything but a clean
+      # verify means attest. In resume mode the attestation names the
+      # resume run; verify by signer workflow, not by source commit.
+      - name: (c) Check for an existing attestation
+        id: attested
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DIGEST: ${{ steps.index.outputs.digest }}
+        run: |
+          if gh attestation verify "oci://$IMAGE@$DIGEST" --owner PLN >/dev/null 2>&1; then
+            echo "done=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "done=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: (c) Attest build provenance
+        if: steps.attested.outputs.done != 'true'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.index.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
+      - name: (d) Create the git tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          existing=$(git ls-remote --tags origin "refs/tags/v$VERSION" | cut -f1)
+          if [ -z "$existing" ]; then
+            gh api "repos/$GITHUB_REPOSITORY/git/refs" -f "ref=refs/tags/v$VERSION" -f "sha=$SHA" >/dev/null
+            echo "created v$VERSION at $SHA"
+          elif [ "$existing" = "$SHA" ]; then
+            echo "v$VERSION already points at $SHA"
+          else
+            echo "::error::v$VERSION exists at $existing, not $SHA"
+            exit 1
+          fi
+      # latest and X.Y move only to the highest stable version (and the
+      # highest patch of its line), so releasing an older line never
+      # moves them. No floating major tag while the major is 0.
+      - name: (e) Move latest and X.Y
+        if: ${{ !contains(needs.verify.outputs.version, '-') }}
+        env:
+          DIGEST: ${{ steps.index.outputs.digest }}
+        run: |
+          git fetch -q --tags --force origin
+          stable=$(git tag --list 'v[0-9]*' --sort=-v:refname | grep -v -- - || true)
+          minor=${VERSION%.*}
+          if [ "$(head -n 1 <<<"$stable")" = "v$VERSION" ]; then
+            docker buildx imagetools create -t "$IMAGE:latest" "$IMAGE@$DIGEST"
+          else
+            echo "latest stays: v$VERSION is not the highest stable version"
+          fi
+          if [ "$(grep -E "^v${minor//./\\.}\.[0-9]+$" <<<"$stable" | head -n 1)" = "v$VERSION" ]; then
+            docker buildx imagetools create -t "$IMAGE:$minor" "$IMAGE@$DIGEST"
+          else
+            echo "$minor stays: v$VERSION is not the highest patch of $minor"
+          fi
+      - name: (f) Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DIGEST: ${{ steps.index.outputs.digest }}
+        run: |
+          rc=0
+          out=$(gh release view "v$VERSION" 2>&1) || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            echo "release v$VERSION already exists"
+            exit 0
+          fi
+          if ! grep -qi 'release not found' <<<"$out"; then
+            echo "::error::gh release view failed: $out"
+            exit 1
+          fi
+          git fetch -q --tags --force origin
+          previous=$(git tag --list 'v[0-9]*' --sort=-v:refname | grep -vx "v$VERSION" | head -n 1 || true)
+          {
+            echo "Container image: \`$IMAGE:$VERSION\`"
+            echo
+            echo "Index digest: \`$DIGEST\`"
+            echo
+            echo "Source: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/tree/$SHA"
+            echo
+            echo "Verify the build provenance:"
+            echo
+            echo '```'
+            echo "gh attestation verify oci://$IMAGE:$VERSION --repo $GITHUB_REPOSITORY --signer-workflow $GITHUB_REPOSITORY/.github/workflows/release.yml"
+            echo '```'
+            if [ -n "$previous" ]; then
+              echo
+              echo "Changes since $previous: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/compare/$previous...v$VERSION"
+            fi
+          } > "$RUNNER_TEMP/notes.md"
+          flags=()
+          if [[ $VERSION == *-* ]]; then flags+=(--prerelease); fi
+          gh release create "v$VERSION" --verify-tag --title "v$VERSION" --notes-file "$RUNNER_TEMP/notes.md" "${flags[@]}"
