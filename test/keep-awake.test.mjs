@@ -153,6 +153,16 @@ test('keep-awake input never lands inside a tool call, and a stopped run sends n
   });
 });
 
+test('a stop while keep-awake reads the signal sends nothing', async () => {
+  await withClient({ routes: { 'GET /api/streamer': { delayMs: 150, status: 200, body: { ok: true, result: { streamer: null } } } } }, async ({ mock, client }) => {
+    client.keepAwake.start(options({ mode: 'keyboard' }), () => false);
+    await waitUntil(() => mock.calls.some((c) => c.path === '/api/streamer'));
+    client.keepAwake.stop();
+    await sleep(300);
+    assert.equal(keys(mock).length, 0);
+  });
+});
+
 test('without kvmd inactivity it acts once per interval; mixed mode still alternates the points', async () => {
   await withClient({ routes: { 'GET /api/hid/inactivity': { status: 404, body: { ok: false } } } }, async ({ mock, client }) => {
     client.keepAwake.start(options(), () => false);

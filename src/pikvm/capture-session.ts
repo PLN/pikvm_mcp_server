@@ -164,6 +164,7 @@ export class CaptureSession {
   private closing: Promise<void> | null = null;
   private users = 0;
   private linger: NodeJS.Timeout | null = null;
+  private lingerUntil = 0;
   private shutDown = false;
 
   constructor(private readonly options: CaptureSessionOptions) {}
@@ -171,6 +172,13 @@ export class CaptureSession {
   /** True while a session is open or opening. */
   get isOpen(): boolean {
     return this.ready !== null;
+  }
+
+  /** For status: open, how many captures hold it, and when an idle session closes. */
+  state(): { open: boolean; captures: number; closesAt?: string } {
+    const state: { open: boolean; captures: number; closesAt?: string } = { open: this.ready !== null, captures: this.users };
+    if (this.linger && this.lingerUntil > 0) state.closesAt = new Date(this.lingerUntil).toISOString();
+    return state;
   }
 
   /**
@@ -225,6 +233,7 @@ export class CaptureSession {
 
   private armLinger(): void {
     this.clearLinger();
+    this.lingerUntil = Date.now() + this.options.lingerMs();
     this.linger = setTimeout(() => {
       this.linger = null;
       void this.closeIdle();

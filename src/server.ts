@@ -34,6 +34,7 @@
 // Modified 2026-10 by PLN: serverInfo.version follows package.json (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: situation-first errors, coordinate wording, plain-text OCR (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: pikvm_keep_awake, suspended by other tool calls (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: pikvm_status (GPL-3.0; see NOTICE).
 
 /**
  * MCP server factory for PiKVM tools
@@ -53,6 +54,7 @@ import {
   Tool,
 } from '@modelcontextprotocol/sdk/types.js';
 import {
+  type DeviceStatusReading,
   type PiKVMClient,
   type FrameEcho,
   KvmdError,
@@ -398,7 +400,7 @@ export function kvmdErrorDetails(error: KvmdError, password = '', otherPasswords
 }
 
 /** Tool calls that do not suspend keep-awake: keep-awake itself and state reads. */
-const KEEP_AWAKE_NEUTRAL_TOOLS = new Set(['pikvm_keep_awake', 'pikvm_devices']);
+const KEEP_AWAKE_NEUTRAL_TOOLS = new Set(['pikvm_keep_awake', 'pikvm_devices', 'pikvm_status']);
 
 function requireIntegerIn(value: unknown, fieldName: string, range: { default: number; min: number; max: number }): number {
   if (value === undefined) return range.default;
@@ -419,6 +421,90 @@ function keepAwakeText(state: KeepAwakeState): string {
     + `${state.intervalSeconds} s. Other tool calls on this device pause it while they run and for `
     + `${state.suspendSeconds} s after; then it resumes. It stays on until pikvm_keep_awake is called with `
     + `enabled false, or the server restarts.\n${JSON.stringify(state)}`;
+}
+
+function durationText(seconds: number): string {
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 120) return `${s} s`;
+  if (s < 7200) return `${Math.round(s / 60)} min`;
+  if (s < 172_800) return `${Math.round(s / 3600)} h`;
+  return `${Math.round(s / 86_400)} days`;
+}
+
+function agoText(iso: string | null | undefined, now: number): string {
+  if (!iso) return 'never';
+  return `${durationText((now - Date.parse(iso)) / 1000)} ago`;
+}
+
+const PICTURE_TEXT: Record<string, string> = {
+  display_asleep: 'dark (the display is off or asleep)',
+  usb_offline: 'no picture (USB offline)',
+  no_signal: 'no picture (USB state unknown)',
+  capture_stopped: 'capture stopped',
+  unknown: 'unknown',
+};
+
+/** The device's situation in one phrase, and what to do about it. */
+function statusVerdict(reading: DeviceStatusReading): string {
+  if (!reading.reachable) return `unreachable: ${reading.error?.type ?? 'error'}`;
+  const usbOffline = reading.input.keyboardOnline === false && reading.input.mouseOnline === false;
+  switch (reading.picture.state) {
+    case 'visible':
+      return usbOffline ? 'picture visible, but its USB keyboard and mouse are offline: input will not reach it' : 'ready';
+    case 'no_signal': return 'no picture, and the USB state could not be read';
+    case 'capture_stopped': return 'ready; capture is stopped and starts on the next screenshot';
+    case 'display_asleep': return 'display asleep: press a key (pikvm_key ShiftLeft) to wake it';
+    case 'usb_offline': return 'no computer: its USB keyboard and mouse are offline (off, suspended or unplugged)';
+    default: return 'unknown picture state';
+  }
+}
+
+interface DeviceStatus extends DeviceStatusReading {
+  device: string;
+  verdict: string;
+  armed: { hid: boolean; msd: boolean };
+}
+
+function deviceStatusText(status: DeviceStatus, now: number): string {
+  const lines = [`${status.device}: ${status.verdict}.`];
+  if (!status.reachable) {
+    if (status.error) lines.push(`  ${status.error.message}`);
+    return lines.join('\n');
+  }
+  const picture = status.picture;
+  const screen = status.screen;
+  let screenLine = picture.state === 'visible'
+    ? `  Screen: on, ${picture.width}x${picture.height}${picture.fps !== undefined ? ` at ${picture.fps} fps` : ''}`
+    : `  Screen: ${PICTURE_TEXT[picture.state] ?? picture.state}`;
+  if (screen) {
+    screenLine += screen.since === screen.lastChecked
+      ? `; ${screen.state}, first seen just now by this server`
+      : `; ${screen.state} for ${durationText((now - Date.parse(screen.since)) / 1000)}, as seen by this server`;
+  }
+  lines.push(`${screenLine}.`);
+  const input = status.input;
+  const online = (value: boolean | null) => (value === null ? 'unknown' : value ? 'online' : 'offline');
+  lines.push(`  Input: keyboard ${online(input.keyboardOnline)}, mouse ${online(input.mouseOnline)}`
+    + `${input.mouse ? ` (${input.mouse})` : ''}; ${input.held.length ? `held: ${input.held.join(', ')}` : 'nothing held'}`
+    + `; HID ${status.armed.hid ? 'armed' : 'disarmed'}.`);
+  const idle = status.idle;
+  lines.push(`  Idle: ${idle.anyInputSeconds === null ? 'unknown' : durationText(idle.anyInputSeconds)} since any input (kvmd, all sources); `
+    + `this server's last keyboard input ${agoText(idle.lastToolKeyboardInput, now)}, last mouse input ${agoText(idle.lastToolMouseInput, now)}.`);
+  const keep = status.keepAwake;
+  lines.push(keep.enabled
+    ? `  Keep-awake: on, ${keep.mode}${keep.mode !== 'keyboard' ? ` in the ${keep.quadrant} quadrant` : ''}, after ${keep.intervalSeconds} s idle; `
+      + `${keep.suspendedUntil ? `paused (${keep.suspendedUntil === 'while a tool call runs' ? 'a tool call is running' : `until ${keep.suspendedUntil}`})` : 'active'}`
+      + `; ${keep.actions} input(s) sent, last ${keep.lastAction ? `${agoText(keep.lastAction.at, now)} (${keep.lastAction.input}${keep.lastAction.ok ? '' : ', failed'})` : 'none'}.`
+    : '  Keep-awake: off.');
+  const session = status.captureSession;
+  if (session.open) lines.push(`  Capture session: open${session.closesAt ? `, closes at ${session.closesAt}` : ', in use'}.`);
+  const media = status.media as { drive?: { image?: { name?: string } | null; connected?: boolean } | null; error?: string } | null;
+  if (media && 'error' in media && media.error) lines.push(`  Media: unknown (${media.error}).`);
+  else if (media?.drive) {
+    lines.push(`  Media: ${media.drive.image?.name ? media.drive.image.name : 'no image selected'}, `
+      + `${media.drive.connected ? 'connected' : 'not connected'}; MSD ${status.armed.msd ? 'armed' : 'disarmed'}.`);
+  }
+  return lines.join('\n');
 }
 
 function disarmedResult(tool: string) {
@@ -1023,6 +1109,16 @@ const tools: Tool[] = [
     },
   },
   {
+    name: 'pikvm_status',
+    description: 'What state each device is in, read-only: a one-line verdict (ready, display asleep, no computer, unreachable), the picture (visible, display asleep, capture stopped, resolution, fps), screen on-time as seen by this server, keyboard and mouse online and absolute or relative, held input, idle timers (kvmd\'s time since any input, and this server\'s last keyboard and mouse input), keep-awake state, the capture session and media. Starts no capture and sends no input. Omit device for every device.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        device: { type: 'string', description: 'One device. Omitted reports every device.' },
+      },
+    },
+  },
+  {
     name: 'pikvm_keep_awake',
     description: 'Keep the computer awake until stopped: a toggle. Whenever the computer has had no keyboard or mouse input from anyone for intervalSeconds, send one harmless input: mouse moves near the centre of a screen quadrant (never the screen centre or an edge), the F15 key (ignored by applications), or both in turn. Any other tool call on this device pauses it while the call runs and for suspendSeconds after, then it resumes by itself. Needs HID armed. State is in memory; a server restart stops it.',
     inputSchema: {
@@ -1147,6 +1243,44 @@ export function createMcpServer(deps: McpServerDeps): Server {
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args = {} } = request.params;
     let ctx: FleetDevice | undefined;
+    // Read-only and never blocked: it reports auto-calibration and keep-awake too.
+    if (name === 'pikvm_status') {
+      try {
+        const chosen = args.device === undefined
+          ? [...fleet.devices.values()].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+          : [resolveFleetDevice(args, fleet)];
+        const now = Date.now();
+        // Every device's password, so one device's error cannot carry another's.
+        const scrub = (value: string) => {
+          let text = redactUrl(value);
+          for (const password of fleet.passwords) text = redactSecrets(text, password);
+          return text;
+        };
+        const devices: DeviceStatus[] = await Promise.all(chosen.map(async (device) => {
+          const reading = await device.client.status();
+          if (reading.error) reading.error = { type: scrub(reading.error.type), message: scrub(reading.error.message) };
+          const mediaError = (reading.media as { error?: unknown } | null)?.error;
+          if (typeof mediaError === 'string') reading.media = { error: scrub(mediaError) };
+          return {
+            device: device.name,
+            verdict: statusVerdict(reading),
+            armed: { hid: device.armHid, msd: device.armMsd },
+            ...reading,
+            media: reading.media && typeof reading.media === 'object' && !('error' in (reading.media as object))
+              ? publicMsdState(reading.media as Parameters<typeof publicMsdState>[0])
+              : reading.media,
+          };
+        }));
+        const text = devices.map((device) => deviceStatusText(device, now)).join('\n\n');
+        const body = { devices };
+        return {
+          content: [{ type: 'text', text: `${text}\n${JSON.stringify(body)}` }],
+          structuredContent: body,
+        };
+      } catch (error) {
+        return { content: [{ type: 'text', text: redactToolText(error, fleet.passwords) }], isError: true };
+      }
+    }
     if (name !== 'pikvm_devices' && !isSkillTool(name)) {
       try {
         ctx = resolveFleetDevice(args, fleet);

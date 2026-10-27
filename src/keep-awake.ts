@@ -17,7 +17,9 @@
  * Any other tool call on the device suspends it while the call runs and
  * for `suspendSeconds` after the call ends; then it resumes by itself.
  * Input is also skipped while this server's own HID input is in flight,
- * draining or held, and while auto-calibration holds the device.
+ * draining or held, and while auto-calibration holds the device. Every
+ * poll also reads the video signal, which keeps the screen on-time in
+ * pikvm_status current.
  * State is in memory: a server restart stops it.
  */
 
@@ -58,6 +60,8 @@ export interface KeepAwakeTarget {
   hidInactivitySeconds(): Promise<number | null>;
   /** True while this client's HID input is in flight, draining or held. */
   hidBusy(): boolean;
+  /** Read the video signal, for the screen on-time in pikvm_status. Never throws. */
+  observeSignal(): Promise<void>;
   /**
    * Send one input. Mouse x and y are shares of the screen, 0 to 1.
    * `mayPost` is checked synchronously right before every POST; when it
@@ -211,15 +215,19 @@ export class KeepAwake {
   private async poll(): Promise<void> {
     const options = this.options;
     if (!options || this.polling) return;
+    // Captured before the first await: a stop or restart during a read ends this poll.
+    const generation = this.generation;
     this.polling = true;
     try {
+      await this.target.observeSignal();
+      if (generation !== this.generation) return;
       const skip = this.skipReason();
       if (skip) {
         this.lastSkip = skip;
         return;
       }
-      const generation = this.generation;
       const kvmdIdle = await this.target.hidInactivitySeconds();
+      if (generation !== this.generation) return;
       // Without kvmd's timer, fall back to the input this server knows of:
       // at most one input per interval, though a web viewer's input is unseen.
       const idle = kvmdIdle ?? (Date.now() - this.lastKnownInput) / this.timing().secondMs;
