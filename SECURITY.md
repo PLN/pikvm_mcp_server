@@ -1,4 +1,5 @@
 <!-- Modified 2026-10 by PLN: private vulnerability reporting (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: supported versions after the first release (GPL-3.0; see NOTICE) -->
 
 # Security
 
@@ -10,9 +11,7 @@ Do not open a public issue for a vulnerability.
 
 ## Supported versions
 
-Only the latest release and the main branch are supported.
-
-This project has not published a stable release yet. Until one exists, the supported line is the main branch.
+Only the latest release and the main branch are supported. Releases are container images at `ghcr.io/pln/pikvm_mcp_server` with a matching `vX.Y.Z` git tag. The first stable release is 0.3.0.
 
 ## What to include
 

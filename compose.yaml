@@ -1,6 +1,5 @@
 # Modified 2026-10 by PLN: Docker image (GPL-3.0; see NOTICE).
-#
-# Not yet published: the first image release is still to come.
+# Modified 2026-10 by PLN: the image is published (GPL-3.0; see NOTICE).
 #
 # Quick start: write secrets into the volume (umask 077; at least 32
 # random bytes for the bearer, e.g. openssl rand -hex 32), then

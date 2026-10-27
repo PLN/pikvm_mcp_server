@@ -1,4 +1,5 @@
 # Modified 2026-10 by PLN: manual image release (GPL-3.0; see NOTICE).
+# Modified 2026-10 by PLN: no approval wait in the release environment (GPL-3.0; see NOTICE).
 #
 # Dispatch from main with a version, X.Y.Z or X.Y.Z-rc.N, whose core
 # matches package.json. Normal mode builds each architecture by digest,
@@ -246,8 +247,8 @@ jobs:
           fi
           mkdir -p digests
           printf '%s\n' "$DIGEST" > "digests/$ARCH"
-      # A few bytes. publish may wait days for approval; past this window
-      # it fails closed and a fresh dispatch is safe.
+      # A few bytes, kept for a "re-run failed jobs" of publish. Past this
+      # window publish fails closed and a fresh dispatch is safe.
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: digest-${{ matrix.arch }}
@@ -394,8 +395,8 @@ jobs:
           path: digests
           merge-multiple: true
 
-      # The real immutability guard: approval may have taken days, and
-      # anyone with package write could have created the tag since verify.
+      # The real immutability guard: anyone with package write could have
+      # created the tag since verify.
       # A tag made from these same digests (a re-run) is left alone.
       - name: (a) Create the image tag
         if: needs.verify.outputs.resume != 'true'
