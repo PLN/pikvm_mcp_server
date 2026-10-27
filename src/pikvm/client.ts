@@ -1990,12 +1990,12 @@ export class PiKVMClient {
    * was sent, so HTTP failures are not retried either. Only a pre-send
    * PIKVM_UNREACHABLE is tried once more.
    */
-  private async requestOcr<T>(path: string): Promise<T> {
+  private async requestOcr<T>(path: string, timeoutMs = this.config.ocrTimeoutMs): Promise<T> {
     try {
-      return await this.requestOnce<T>('GET', path, undefined, undefined, this.config.ocrTimeoutMs);
+      return await this.requestOnce<T>('GET', path, undefined, undefined, timeoutMs);
     } catch (err) {
       if (err instanceof KvmdError && err.preSend && err.type === 'PIKVM_UNREACHABLE') {
-        return this.requestOnce<T>('GET', path, undefined, undefined, this.config.ocrTimeoutMs);
+        return this.requestOnce<T>('GET', path, undefined, undefined, timeoutMs);
       }
       throw err;
     }
@@ -2033,7 +2033,8 @@ export class PiKVMClient {
    * text/plain. This does not send preview parameters. A timeout is not
    * retried. Callers check OCR state before calling.
    */
-  async readText(options?: { langs?: string[]; box?: OcrBox; frameId?: string }): Promise<string> {
+  async readText(options?: { langs?: string[]; box?: OcrBox; frameId?: string; budgetMs?: number }): Promise<string> {
+    const budgetMs = options?.budgetMs;
     const described = this.describeFrame(options?.frameId);
     const body = await this.withCapture(async (source) => {
       const box = options?.box ? ocrBoxToSource(options.box, described.frame, source) : undefined;
@@ -2046,8 +2047,11 @@ export class PiKVMClient {
         params.set('ocr_right', String(box.right));
         params.set('ocr_bottom', String(box.bottom));
       }
-      return this.requestOcr<unknown>(`/streamer/snapshot?${params}`);
-    });
+      return this.requestOcr<unknown>(
+        `/streamer/snapshot?${params}`,
+        budgetMs === undefined ? undefined : Math.max(1, Math.min(this.config.ocrTimeoutMs, Math.round(budgetMs))),
+      );
+    }, budgetMs === undefined ? undefined : Math.min(CAPTURE_SIGNAL_WAIT_MS, budgetMs));
     let text: string;
     if (typeof body === 'string') text = body;
     else if (body !== null && typeof body === 'object' && typeof (body as { result?: unknown }).result === 'string') {
@@ -2069,7 +2073,7 @@ export class PiKVMClient {
       undefined,
       undefined,
       timeoutMs,
-    ));
+    ), Math.min(CAPTURE_SIGNAL_WAIT_MS, timeoutMs));
     if (body instanceof ArrayBuffer) return Buffer.from(body);
     throw new Error('snapshot response was not an image');
   }
@@ -2079,11 +2083,11 @@ export class PiKVMClient {
    * like a screenshot does. PIKVM_NO_SIGNAL when there is no video signal:
    * the 640x480 that ustreamer reports then is not the screen.
    */
-  async getResolution(forceRefresh = false): Promise<ScreenResolution> {
+  async getResolution(forceRefresh = false, signalWaitMs?: number): Promise<ScreenResolution> {
     if (this.cachedResolution && !forceRefresh) {
       return this.cachedResolution;
     }
-    return this.withCapture(async (source) => source);
+    return this.withCapture(async (source) => source, signalWaitMs);
   }
 
   /** GET /streamer. Null while ustreamer is not running: kvmd reports `streamer: null`. */

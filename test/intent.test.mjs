@@ -180,6 +180,34 @@ test('wait_for keeps to its timeout, looks more than once, and keeps waiting aft
   });
 });
 
+test('a text wait keeps to its deadline through capture start and slow OCR', async () => {
+  // Cold, dark capture: OCR's own resolution read must not wait 10 s.
+  await withServer({
+    mockOptions: { capture: { running: false, signal: false } },
+    recognize: async () => ({ words: [] }),
+  }, async ({ call }) => {
+    const started = Date.now();
+    const result = await call('pikvm_wait_for', { text: 'ready', timeoutSeconds: 1 });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /PIKVM_WAIT_TIMEOUT/);
+    assert.ok(Date.now() - started < 3000, `took ${Date.now() - started} ms`);
+  });
+
+  // OCR slower than the time left: the wait ends with its own timeout and the last text.
+  await withServer({
+    recognize: async () => {
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+      return { words: [word('Installing', 100, 200)] };
+    },
+  }, async ({ call }) => {
+    const result = await call('pikvm_wait_for', { text: 'complete', timeoutSeconds: 2 });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /^Error \[PIKVM_WAIT_TIMEOUT\]: "complete" did not appear within 2 s/);
+    const details = JSON.parse(result.content[0].text.split('\n').at(-1));
+    assert.equal(details.lastText, 'Installing');
+  });
+});
+
 test('click_text: a phrase over two lines, ambiguous text, nth, and text that is not there', async () => {
   const words = [
     word('Recycle', 88, 61, 38, 12),

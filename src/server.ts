@@ -466,6 +466,8 @@ export class IntentError extends Error {
 const WAKE_SIGNAL_WAIT_MS = 7000;
 /** With wake, a capture the screenshot starts waits this long before the key. */
 const WAKE_FIRST_WAIT_MS = 3000;
+/** The client's default wait for a signal after starting capture; a wait's looks use less. */
+const CAPTURE_SIGNAL_WAIT_DEFAULT_MS = 10_000;
 /** Default settle time before an observe screenshot. */
 const OBSERVE_DELAY_MS = 500;
 /** The longest an observe screenshot waits for typing to finish. */
@@ -1568,10 +1570,13 @@ export function createMcpServer(deps: McpServerDeps): Server {
           frame: described.frame,
           frameId: described.echo.frameId,
           fullFrame: box === undefined,
-          getSource: () => deviceClient.getResolution(true),
+          getSource: () => deviceClient.getResolution(
+            true,
+            budgetMs === undefined ? undefined : Math.min(CAPTURE_SIGNAL_WAIT_DEFAULT_MS, Math.max(250, Math.round(budgetMs))),
+          ),
           calibration: calibration ? { factorX: calibration.factorX, factorY: calibration.factorY } : null,
           fetchSnapshot: (timeoutMs) => deviceClient.fetchFullSnapshot(timeoutMs),
-          readKvmd: (langs) => deviceClient.readText({ langs, box }),
+          readKvmd: (langs) => deviceClient.readText({ langs, box, ...(budgetMs === undefined ? {} : { budgetMs }) }),
           ensureKvmd: async () => {
             let state = deviceClient.ocrState();
             if (state.status === 'unknown') state = await deviceClient.probeOcr(active.name);
@@ -1668,15 +1673,18 @@ export function createMcpServer(deps: McpServerDeps): Server {
           let baseline: Buffer | null = null;
           let lastShot: ScreenshotResult | null = null;
           let lastText = '';
+          let lookBudget = 0;
           // Each look gets only the time left, so the wait ends near its deadline.
           // A look that started in time and matched still counts.
           for (;;) {
             checks += 1;
+            lookBudget = 0;
             let matched = false;
             let at: { x: number; y: number } | undefined;
             try {
               if (condition === 'text' || condition === 'gone') {
-                const ocr = await runOcr(box, Math.max(1000, left()));
+                lookBudget = Math.max(1000, left());
+                const ocr = await runOcr(box, lookBudget);
                 lastText = ocr.text;
                 const present = normalizeText(ocr.text).includes(normalizeText(wanted));
                 matched = condition === 'text' ? present : !present;
@@ -1691,6 +1699,16 @@ export function createMcpServer(deps: McpServerDeps): Server {
                 else matched = (await changedShare(baseline, lastShot.buffer)) >= CHANGED_SHARE;
               }
             } catch (error) {
+              // A timeout from the wait's own shortened budget is a look without
+              // an answer; the wait then ends with its own timeout result.
+              const ownBudget = lookBudget > 0 && lookBudget < ocrRuntime.timeoutMs;
+              const timedOut = (error instanceof OcrError && error.type === 'PIKVM_OCR_TIMEOUT')
+                || (error instanceof KvmdError && error.type === 'PIKVM_TIMEOUT');
+              if (ownBudget && timedOut) {
+                lookBudget = 0;
+                if (left() <= 0) break;
+                continue;
+              }
               // A dark screen is a look without an answer. With wake, one key
               // press at most; a wake that brings no picture does not end the wait.
               if (!(error instanceof KvmdError && error.type === 'PIKVM_NO_SIGNAL')) throw error;
