@@ -80,6 +80,7 @@ Modified 2026-10 by PLN: docs after the first image release (GPL-3.0; see below)
 Modified 2026-10 by PLN: start idle capture, report no signal, refuse dropped relative moves (GPL-3.0; see below).
 Modified 2026-10 by PLN: version 0.3.1 (GPL-3.0; see below).
 Modified 2026-10 by PLN: situation-first errors, no-signal cause, plain-text OCR (GPL-3.0; see below).
+Modified 2026-10 by PLN: pikvm_keep_awake (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -1402,4 +1403,21 @@ No code from another pikvm_mcp_server fork was added for these methods.
   registry, a next step names its device. Every device password is now
   removed from each error field before the JSON line is serialized; a
   password with a quote or backslash used to survive there, escaped.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  pikvm_keep_awake keeps the computer behind a PiKVM awake until it is
+  stopped. It reads kvmd's HID inactivity, and once nobody has given
+  input for intervalSeconds, it sends one harmless input. mouse moves
+  near the centre of a chosen quadrant, default bottom-right, in kvmd's
+  normalized coordinates; keyboard sends F15; mixed alternates the two.
+  Any other tool call on the device pauses it while the call runs and
+  for suspendSeconds after it ends, and then it resumes. It skips while
+  this server's input is in flight, draining or held, and during
+  auto-calibration. Its input goes out only when no tool call has
+  started, checked right before each send, and a tool's input waits for
+  a keep-awake input that has started. Without kvmd's inactivity it
+  falls back to this server's own input times. HID arm-gated, and kept
+  in memory. The modes, the quadrant and the suspension follow the
+  owner's design.
   No code from another pikvm_mcp_server fork was copied.

@@ -102,6 +102,11 @@ export class HidGate {
     return Math.max(0, this.backlogEnd - performance.now());
   }
 
+  /** HID input in flight, its reports still draining, input held, or a session opening or closing. */
+  busy(): boolean {
+    return this.inFlight > 0 || performance.now() < this.quietAt || this.held.size > 0 || this.transition !== null;
+  }
+
   /**
    * Run `fn` once HID is idle. HID calls that start meanwhile wait until
    * it settles. Throws HidBusyError when HID is not idle within `maxWaitMs`.

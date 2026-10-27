@@ -19,6 +19,7 @@
 // Modified 2026-10 by PLN: a reply cut short after Connection: close (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: idle capture, /api/ws stream sessions, GET /api/hid (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: USB keyboard and mouse online state (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: GET /api/hid/inactivity (GPL-3.0; see NOTICE).
 
 /**
  * Minimal KVMD REST mock implementing exactly the routes src/pikvm/client.ts
@@ -86,7 +87,9 @@
  * status. `wsEvents` records opens and closes, `setSignal()` changes the
  * signal. GET /api/hid reports an absolute mouse unless `mouseAbsolute`
  * is false, and an online USB keyboard and mouse unless `hidOnline` is
- * false (a host that is off or unplugged).
+ * false (a host that is off or unplugged). GET /api/hid/inactivity counts
+ * seconds since the last HID POST, starting long idle; `inactivitySecondMs`
+ * shortens a second for tests.
  */
 
 import crypto from 'node:crypto';
@@ -405,6 +408,8 @@ export async function startKvmdMock(options = {}) {
   const catalogFresh = new Set();
   let streamerHolds = 0;
   let imageSnapshots = 0;
+  const inactivitySecondMs = options.inactivitySecondMs ?? 1000;
+  let lastHidAt = Date.now() - 3600 * inactivitySecondMs;
   const capture = options.capture
     ? { running: false, signal: true, startMs: 50, stopMs: 0, ...options.capture }
     : null;
@@ -970,6 +975,14 @@ export async function startKvmdMock(options = {}) {
       res.end(JSON.stringify({ ok: true, result: { streamer } }));
       return;
     }
+    if (req.method === 'GET' && u.pathname === '/api/hid/inactivity') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true,
+        result: { inactivity: Math.floor((Date.now() - lastHidAt) / inactivitySecondMs) },
+      }));
+      return;
+    }
     if (req.method === 'GET' && u.pathname === '/api/hid') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
@@ -1045,6 +1058,7 @@ export async function startKvmdMock(options = {}) {
     }
     if (await handleMsd(req, res, u)) return;
     if (req.method === 'POST') {
+      if (u.pathname.startsWith('/api/hid')) lastHidAt = Date.now();
       // HID/event endpoints land here (send_mouse_button, send_mouse_move,
       // send_key, print, send_shortcut, ...). 204 = accepted, no body.
       res.writeHead(204);

@@ -45,6 +45,7 @@
 <!-- Modified 2026-10 by PLN: the image is published (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: capture start, no signal, and relative moves on an absolute mouse (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: situation-first errors, no-signal cause, coordinate wording, plain-text OCR (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: pikvm_keep_awake (GPL-3.0; see NOTICE) -->
 
 # PiKVM MCP Server
 
@@ -538,6 +539,17 @@ kvmd is available when `PIKVM_OCR_ENGINE=kvmd`, when a device `ocr.engine` is `k
 - **`pikvm_mouse_move`** - Move cursor in the default click frame, or in `frameId` (required: x, y; optional: relative, frameId). kvmd drops a relative move while its mouse output is absolute (the usual `usb` output), so that case is refused as `PIKVM_MOUSE_ABSOLUTE`
 - **`pikvm_mouse_click`** - Click a mouse button, optionally at a position in that frame (optional: button, x, y, state, frameId)
 - **`pikvm_mouse_scroll`** - Scroll the mouse wheel (required: deltaY; optional: deltaX, frameId)
+
+### Keep awake
+- **`pikvm_keep_awake`** - Keep the computer awake until stopped (required: enabled; optional: mode, quadrant, intervalSeconds, suspendSeconds). Needs HID armed.
+
+`pikvm_keep_awake` is a toggle. `enabled: true` starts it, or restarts it with new options; `enabled: false` stops it. While it is on, the server reads kvmd's HID inactivity (`GET /api/hid/inactivity`) every 5 seconds. That timer counts input from every source: people in the web viewer, this server and kvmd's own jiggler. Once nobody has given input for `intervalSeconds` (10 to 3600, default 60), keep-awake sends one harmless input:
+
+- **`mouse`** (the default): an absolute move near the centre of a screen quadrant, never the screen centre and never near an edge. The move alternates between two points 2% of the screen apart, so the pointer really moves. `quadrant` is `bottom-right` by default, or `top-left`, `top-right` or `bottom-left`. The move uses kvmd's normalized coordinates, so it needs no screenshot and works while the display is dark. With a relative mouse it is a 5-pixel move there and back.
+- **`keyboard`**: F15, which kvmd supports and normal applications ignore.
+- **`mixed`**: the two in turn.
+
+Any other tool call on that device pauses keep-awake while the call runs and for `suspendSeconds` (5 to 600, default 30) after it ends. Then it resumes by itself. `pikvm_devices` does not pause it. Its input is sent only when no tool call has started by then, checked right before each send; once it has started, a tool's input waits until it is done, so a relative move and its way back stay together. An older kvmd without `GET /api/hid/inactivity` falls back to this server's own input times: at most one input per interval, though a web viewer's input is not seen. It also skips while this server's own input is in flight, still draining or held, and while auto-calibration holds the device. Keep-awake belongs to the device, so every MCP session sees and controls the same one. It lives in memory: a server restart stops it. Keep `intervalSeconds` below the computer's screen timeout. A client that calls tools on the device more often than `suspendSeconds` keeps it paused; that client's own input usually keeps the computer awake anyway.
 
 ### Calibration
 - **`pikvm_auto_calibrate`** - Automatically detect cursor and compute calibration factors *(preferred)*
