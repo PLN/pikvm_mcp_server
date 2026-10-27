@@ -34,6 +34,7 @@
 // Modified 2026-10 by PLN: start idle capture and report no signal (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: refuse a relative move that kvmd would drop (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: no-signal cause, error hints, typing drain estimate (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: keep-awake input and HID inactivity (GPL-3.0; see NOTICE).
 // AbortSignal.timeout and PIKVM_UNREACHABLE / PIKVM_AUTH_FAILED no-retry codes
 // adapted from dtrukr/pikvm_mcp_server src/pikvm/client.ts @ d120243 (GPL-3.0).
 // Snapshot HTTP 503 retry-once adapted from dvaerum/pikvm_mcp_server
@@ -162,6 +163,7 @@ import {
   hidDelayQueryValue,
 } from '../hid-deadline.js';
 import { CaptureSession, HeldInputError, HidBusyError, HidGate } from './capture-session.js';
+import { KeepAwake, type KeepAwakeInput } from '../keep-awake.js';
 import { capKvmdField, redactSecrets } from '../redact.js';
 import { redactError, redactUrl } from '../url-policy.js';
 import {
@@ -1328,6 +1330,13 @@ interface CaptureTiming {
 
 const captureTimings = new WeakMap<PiKVMClient, CaptureTiming>();
 
+const keepAwakeTimings = new WeakMap<PiKVMClient, { pollMs: number; secondMs: number }>();
+
+/** Test-only. Keep-awake polls every `pollMs`; a configured second lasts `secondMs`. */
+export function setKeepAwakeTimingForTests(client: PiKVMClient, timing: { pollMs: number; secondMs: number }): void {
+  keepAwakeTimings.set(client, timing);
+}
+
 /** Test-only. Shorter capture linger, signal wait, and poll interval. */
 export function setCaptureTimingForTests(client: PiKVMClient, timing: CaptureTiming): void {
   captureTimings.set(client, timing);
@@ -1411,6 +1420,8 @@ export class PiKVMClient {
   private calibration: CalibrationState | null = null;
   private readonly hidGate = new HidGate();
   private readonly capture: CaptureSession;
+  /** Keeps the attached computer awake until stopped. Shared by every MCP session. */
+  readonly keepAwake: KeepAwake;
 
   constructor(config: PiKVMConfig) {
     const base = {
@@ -1461,12 +1472,18 @@ export class PiKVMClient {
       lingerMs: () => captureTimings.get(this)?.lingerMs ?? CAPTURE_LINGER_MS,
       hidWaitMs: CAPTURE_HID_WAIT_MS,
     });
+    this.keepAwake = new KeepAwake({
+      hidInactivitySeconds: () => this.hidInactivitySeconds(),
+      hidBusy: () => this.hidGate.busy(),
+      sendKeepAwake: (input) => this.sendKeepAwake(input),
+    }, () => keepAwakeTimings.get(this) ?? { pollMs: 5_000, secondMs: 1000 });
   }
 
   /**
    * Close the stream session and the kvmd dispatcher. Waits for in-flight calls.
    */
   async close(): Promise<void> {
+    this.keepAwake.stop();
     this.capture.close();
     await this.dispatcher.close();
   }
@@ -1477,6 +1494,7 @@ export class PiKVMClient {
    * installed for tests when that is a different object.
    */
   destroyDispatcher(): void {
+    this.keepAwake.stop();
     this.capture.close();
     const extra = testDispatchers.get(this);
     dropDispatcher(this.dispatcher);
@@ -2050,6 +2068,44 @@ export class PiKVMClient {
     } finally {
       release?.();
     }
+  }
+
+  /**
+   * Seconds since any HID input on this PiKVM (GET /api/hid/inactivity,
+   * kvmd 4.x). Null when kvmd does not answer it, such as an older kvmd.
+   */
+  async hidInactivitySeconds(): Promise<number | null> {
+    try {
+      const body = await this.request<{ result?: { inactivity?: unknown } }>('GET', '/hid/inactivity');
+      const value = body?.result?.inactivity;
+      return typeof value === 'number' && Number.isFinite(value) ? value : null;
+    } catch (err) {
+      if (err instanceof KvmdError && err.status === 404) return null;
+      throw err;
+    }
+  }
+
+  /**
+   * One keep-awake input. Mouse x and y are shares of the screen. An
+   * absolute mouse gets a move in kvmd's normalized range, which needs no
+   * resolution and works while the display is dark. A relative mouse gets
+   * a small move there and back.
+   */
+  private async sendKeepAwake(input: KeepAwakeInput): Promise<'absolute' | 'relative' | 'key'> {
+    if (input.kind === 'key') {
+      await this.request('POST', `/hid/events/send_key?${new URLSearchParams({ key: input.key })}`);
+      return 'key';
+    }
+    const hid = await this.request<{ result?: { mouse?: { absolute?: unknown } } }>('GET', '/hid');
+    if (hid?.result?.mouse?.absolute === false) {
+      for (const delta of ['5', '-5']) {
+        await this.request('POST', `/hid/events/send_mouse_relative?${new URLSearchParams({ delta_x: delta, delta_y: delta })}`);
+      }
+      return 'relative';
+    }
+    const toHid = (share: number) => String(Math.round(HID_MOUSE_MIN + Math.min(1, Math.max(0, share)) * (HID_MOUSE_MAX - HID_MOUSE_MIN)));
+    await this.request('POST', `/hid/events/send_mouse_move?${new URLSearchParams({ to_x: toHid(input.x), to_y: toHid(input.y) })}`);
+    return 'absolute';
   }
 
   /** PIKVM_NO_SIGNAL with its cause, read from kvmd's USB HID state. */

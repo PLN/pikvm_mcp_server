@@ -33,6 +33,7 @@
 // Modified 2026-10 by PLN: the upload response read is phase job_timeout (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: serverInfo.version follows package.json (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: situation-first errors, coordinate wording, plain-text OCR (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: pikvm_keep_awake, suspended by other tool calls (GPL-3.0; see NOTICE).
 
 /**
  * MCP server factory for PiKVM tools
@@ -104,6 +105,15 @@ import {
   type ResolvedOcr,
 } from './ocr.js';
 import { createRequire } from 'node:module';
+import {
+  KEEP_AWAKE_INTERVAL,
+  KEEP_AWAKE_KEY,
+  KEEP_AWAKE_MODES,
+  KEEP_AWAKE_QUADRANTS,
+  KEEP_AWAKE_SUSPEND,
+  type KeepAwakeOptions,
+  type KeepAwakeState,
+} from './keep-awake.js';
 
 /** package.json sits one level above dist/ (and src/), including in the image. */
 const SERVER_VERSION = (createRequire(import.meta.url)('../package.json') as { version: string }).version;
@@ -289,6 +299,7 @@ const VALID_KEY_STATES = ['press', 'release', 'click'] as const;
  * as do the skill_* guidance tools.
  */
 export const ARM_GATED_TOOLS = new Set([
+  'pikvm_keep_awake',
   'pikvm_type',
   'pikvm_key',
   'pikvm_shortcut',
@@ -384,6 +395,30 @@ export function kvmdErrorDetails(error: KvmdError, password = '', otherPasswords
     ...(error.reason !== undefined ? { cause: error.reason } : {}),
     ...(error.next !== undefined ? { next: error.next } : {}),
   };
+}
+
+/** Tool calls that do not suspend keep-awake: keep-awake itself and state reads. */
+const KEEP_AWAKE_NEUTRAL_TOOLS = new Set(['pikvm_keep_awake', 'pikvm_devices']);
+
+function requireIntegerIn(value: unknown, fieldName: string, range: { default: number; min: number; max: number }): number {
+  if (value === undefined) return range.default;
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < range.min || value > range.max) {
+    throw new Error(`${fieldName} must be an integer from ${range.min} to ${range.max}`);
+  }
+  return value;
+}
+
+function keepAwakeText(state: KeepAwakeState): string {
+  if (!state.enabled) {
+    return `Keep-awake is off. It sent ${state.actions} input(s).\n${JSON.stringify(state)}`;
+  }
+  const mouse = `a small mouse move near the centre of the ${state.quadrant} quadrant`;
+  const key = `the ${KEEP_AWAKE_KEY} key, which applications ignore`;
+  const input = state.mode === 'mouse' ? mouse : state.mode === 'keyboard' ? key : `${mouse} and ${key}, in turn`;
+  return `Keep-awake is on: ${input}, whenever the computer has had no keyboard or mouse input for `
+    + `${state.intervalSeconds} s. Other tool calls on this device pause it while they run and for `
+    + `${state.suspendSeconds} s after; then it resumes. It stays on until pikvm_keep_awake is called with `
+    + `enabled false, or the server restarts.\n${JSON.stringify(state)}`;
 }
 
 function disarmedResult(tool: string) {
@@ -988,6 +1023,35 @@ const tools: Tool[] = [
     },
   },
   {
+    name: 'pikvm_keep_awake',
+    description: 'Keep the computer awake until stopped: a toggle. Whenever the computer has had no keyboard or mouse input from anyone for intervalSeconds, send one harmless input: mouse moves near the centre of a screen quadrant (never the screen centre or an edge), the F15 key (ignored by applications), or both in turn. Any other tool call on this device pauses it while the call runs and for suspendSeconds after, then it resumes by itself. Needs HID armed. State is in memory; a server restart stops it.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        enabled: { type: 'boolean', description: 'true starts (or restarts with new options), false stops.' },
+        mode: {
+          type: 'string',
+          enum: [...KEEP_AWAKE_MODES],
+          description: 'mouse (default), keyboard (F15), or mixed (both in turn).',
+        },
+        quadrant: {
+          type: 'string',
+          enum: [...KEEP_AWAKE_QUADRANTS],
+          description: 'Where mouse moves happen: near the centre of this quadrant. Default bottom-right.',
+        },
+        intervalSeconds: {
+          type: 'number',
+          description: `Act after this many seconds without any input (${KEEP_AWAKE_INTERVAL.min}-${KEEP_AWAKE_INTERVAL.max}, default ${KEEP_AWAKE_INTERVAL.default}). Keep it below the computer's screen timeout.`,
+        },
+        suspendSeconds: {
+          type: 'number',
+          description: `Pause after another tool call on this device (${KEEP_AWAKE_SUSPEND.min}-${KEEP_AWAKE_SUSPEND.max}, default ${KEEP_AWAKE_SUSPEND.default}).`,
+        },
+      },
+      required: ['enabled'],
+    },
+  },
+  {
     name: 'pikvm_devices',
     description: 'List devices: name, normalised origin, TLS mode, and arm state. Passwords and secret file paths are not included.',
     inputSchema: {
@@ -1124,8 +1188,30 @@ export function createMcpServer(deps: McpServerDeps): Server {
       if (!ctx) throw new Error(`Unknown tool: ${name}`);
       const active = ctx;
 
+      // Every other tool call on this device pauses keep-awake while it runs
+      // and for its suspendSeconds after.
+      const suspends = !KEEP_AWAKE_NEUTRAL_TOOLS.has(name);
+      if (suspends) active.client.keepAwake.callStarted();
       const produced = await (async () => {
       switch (name) {
+        case 'pikvm_keep_awake': {
+          const enabled = requireBoolean(args.enabled, 'enabled');
+          if (!enabled) {
+            const state = deviceClient.keepAwake.stop();
+            return { content: [{ type: 'text', text: keepAwakeText(state) }], structuredContent: { ...state } };
+          }
+          const options: KeepAwakeOptions = {
+            mode: args.mode === undefined ? 'mouse' : requireEnum(args.mode, KEEP_AWAKE_MODES, 'mode'),
+            quadrant: args.quadrant === undefined
+              ? 'bottom-right'
+              : requireEnum(args.quadrant, KEEP_AWAKE_QUADRANTS, 'quadrant'),
+            intervalSeconds: requireIntegerIn(args.intervalSeconds, 'intervalSeconds', KEEP_AWAKE_INTERVAL),
+            suspendSeconds: requireIntegerIn(args.suspendSeconds, 'suspendSeconds', KEEP_AWAKE_SUSPEND),
+          };
+          const state = deviceClient.keepAwake.start(options, () => deviceLock.isBusy);
+          return { content: [{ type: 'text', text: keepAwakeText(state) }], structuredContent: { ...state } };
+        }
+
         case 'pikvm_screenshot': {
           const settings = active.screenshot;
           const maxWidth = args.maxWidth === undefined
@@ -1600,7 +1686,9 @@ export function createMcpServer(deps: McpServerDeps): Server {
         default:
           throw new Error(`Unknown tool: ${name}`);
       }
-      })();
+      })().finally(() => {
+        if (suspends) active.client.keepAwake.callEnded();
+      });
       return tagFleetResult(produced, active, fleet.registryActive);
     } catch (error) {
       // A next step must act on the device that failed, not the default one.
