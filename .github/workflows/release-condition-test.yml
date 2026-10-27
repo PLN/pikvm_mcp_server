@@ -3,10 +3,14 @@
 # The publish job in release.yml runs only when verify succeeded and
 # either (normal) build, smoke and scan all succeeded or (resume) all
 # three were skipped. Its if: replaces the implicit success(), so each
-# result is compared explicitly. This runs that exact line against the
-# cases below in release-condition-stub.yml. C9 (a cancelled run) cannot
-# be produced by a stub; !cancelled() is the first term of the line.
-# Path-filtered, so it is not a required check.
+# result is compared explicitly. test/release-condition.mjs checks that
+# release.yml carries the committed line and evaluates it for every
+# combination, C1-C9 included. The cases below run the same line in a
+# stub job graph on GitHub, so skipped jobs, outputs and the status
+# function behave as they will in a release: C6 is the resume path.
+# A failing stub would fail this run, so the failure cases (C2, C3, C4,
+# C7) are covered by the evaluation only. Path-filtered, so it is not a
+# required check.
 name: release-condition-test
 
 on:
@@ -16,6 +20,7 @@ on:
       - .github/workflows/release-condition-test.yml
       - .github/workflows/release-condition-stub.yml
       - test/fixtures/release-publish-if.txt
+      - test/release-condition.mjs
   workflow_dispatch:
 
 permissions:
@@ -29,18 +34,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # Whole-line, fixed-string match after stripping indentation, so a
-      # commented-out or folded copy does not count.
-      - name: release.yml and the stub carry the committed condition
-        run: |
-          fixture=test/fixtures/release-publish-if.txt
-          [ "$(wc -l < "$fixture")" -eq 1 ]
-          for f in .github/workflows/release.yml .github/workflows/release-condition-stub.yml; do
-            if ! sed 's/^[[:space:]]*//' "$f" | grep -qxF -- "$(cat "$fixture")"; then
-              echo "::error file=$f::the publish condition does not match $fixture"
-              exit 1
-            fi
-          done
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 24.22.0
+      - name: The committed condition, evaluated for every combination
+        run: node test/release-condition.mjs
 
   case:
     needs: fixture
@@ -49,12 +47,8 @@ jobs:
       matrix:
         include:
           - { id: C1, verify: success, resume: 'false', build: success, smoke: success, scan: success, expect: run }
-          - { id: C2, verify: success, resume: 'false', build: success, smoke: success, scan: failure, expect: skip }
-          - { id: C3, verify: success, resume: 'false', build: success, smoke: failure, scan: success, expect: skip }
-          - { id: C4, verify: success, resume: 'false', build: failure, smoke: skipped, scan: skipped, expect: skip }
           - { id: C5, verify: success, resume: '', build: skipped, smoke: skipped, scan: skipped, expect: skip }
           - { id: C6, verify: success, resume: 'true', build: skipped, smoke: skipped, scan: skipped, expect: run }
-          - { id: C7, verify: failure, resume: 'true', build: skipped, smoke: skipped, scan: skipped, expect: skip }
           - { id: C8, verify: success, resume: 'true', build: success, smoke: success, scan: success, expect: skip }
     name: ${{ matrix.id }}
     uses: ./.github/workflows/release-condition-stub.yml

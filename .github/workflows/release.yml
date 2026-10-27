@@ -358,7 +358,7 @@ jobs:
 
   publish:
     needs: [verify, build, smoke, scan]
-    # One line, no folding: release-condition-test.yml matches it against test/fixtures/release-publish-if.txt.
+    # One line, no folding: test/release-condition.mjs matches it against test/fixtures/release-publish-if.txt.
     if: ${{ !cancelled() && needs.verify.result == 'success' && ( (needs.verify.outputs.resume != 'true' && needs.build.result == 'success' && needs.smoke.result == 'success' && needs.scan.result == 'success') || (needs.verify.outputs.resume == 'true' && needs.build.result == 'skipped' && needs.smoke.result == 'skipped' && needs.scan.result == 'skipped') ) }}
     runs-on: ubuntu-24.04
     environment: release

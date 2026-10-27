@@ -3,16 +3,17 @@
 # Called by release-condition-test.yml. The release job graph (verify,
 # build, smoke, scan) with results taken from inputs, a probe job that
 # carries the exact publish condition, and an assert job. Builds and
-# publishes nothing. A stub that fails on purpose sets continue-on-error,
-# so the run stays green while dependants still see the failure; assert
-# checks that each stub produced the requested result.
+# publishes nothing. Only success and skipped are offered: a job that
+# fails on purpose fails the run, and continue-on-error reports success
+# to the jobs that need it (observed on GitHub). test/release-condition.mjs
+# covers the failure cases by evaluating the condition.
 name: release-condition-stub
 
 on:
   workflow_call:
     inputs:
       verify:
-        description: success or failure
+        description: success
         type: string
         required: true
       resume:
@@ -21,15 +22,15 @@ on:
         required: false
         default: ''
       build:
-        description: success, failure or skipped
+        description: success or skipped
         type: string
         required: true
       smoke:
-        description: success, failure or skipped
+        description: success or skipped
         type: string
         required: true
       scan:
-        description: success, failure or skipped
+        description: success or skipped
         type: string
         required: true
       expect:
@@ -43,7 +44,6 @@ jobs:
   verify:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
-    continue-on-error: ${{ inputs.verify == 'failure' }}
     outputs:
       resume: ${{ steps.out.outputs.resume }}
     steps:
@@ -60,7 +60,6 @@ jobs:
     if: inputs.build != 'skipped'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
-    continue-on-error: ${{ inputs.build == 'failure' }}
     steps:
       - env:
           RESULT: ${{ inputs.build }}
@@ -71,7 +70,6 @@ jobs:
     if: inputs.smoke != 'skipped'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
-    continue-on-error: ${{ inputs.smoke == 'failure' }}
     steps:
       - env:
           RESULT: ${{ inputs.smoke }}
@@ -82,7 +80,6 @@ jobs:
     if: inputs.scan != 'skipped'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
-    continue-on-error: ${{ inputs.scan == 'failure' }}
     steps:
       - env:
           RESULT: ${{ inputs.scan }}
@@ -90,7 +87,7 @@ jobs:
 
   probe:
     needs: [verify, build, smoke, scan]
-    # One line: release-condition-test.yml matches it against test/fixtures/release-publish-if.txt.
+    # One line: test/release-condition.mjs matches it against test/fixtures/release-publish-if.txt.
     if: ${{ !cancelled() && needs.verify.result == 'success' && ( (needs.verify.outputs.resume != 'true' && needs.build.result == 'success' && needs.smoke.result == 'success' && needs.scan.result == 'success') || (needs.verify.outputs.resume == 'true' && needs.build.result == 'skipped' && needs.smoke.result == 'skipped' && needs.scan.result == 'skipped') ) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5

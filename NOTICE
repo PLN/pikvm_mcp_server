@@ -1329,6 +1329,8 @@ No code from another pikvm_mcp_server fork was added for these methods.
   statement and an expiry at most 90 days out for each waiver.
   scripts/gate-selftest.sh requires a lockfile with a known fixable
   advisory to fail and a clean one to pass with a scanned target.
-  gate-selftest.yml runs them in PR CI. release-condition-test.yml runs
-  the publish condition against cases C1 to C8 in a stub job graph.
+  gate-selftest.yml runs them in PR CI. test/release-condition.mjs
+  evaluates the publish condition for every combination of upstream
+  results, and release-condition-test.yml also runs it in a stub job
+  graph for the cases that need no failing job.
   No code from another pikvm_mcp_server fork was copied.
