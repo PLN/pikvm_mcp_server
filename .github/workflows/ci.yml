@@ -5,6 +5,7 @@
 # Modified 2026-10 by PLN: test job covers Node 24 and Windows (GPL-3.0; see NOTICE).
 # Modified 2026-10 by PLN: Node 24.22.0 and windows-2025 are pinned (GPL-3.0; see NOTICE).
 # Modified 2026-10 by PLN: production npm audit is a warning (GPL-3.0; see NOTICE).
+# Modified 2026-10 by PLN: Docker image build and smoke test (GPL-3.0; see NOTICE).
 # Test-job idea adapted from dvaerum/pikvm_mcp_server
 # .github/workflows/ci.yml @ 00cbfc0207c1be2b28b25679019e7fe9bd9d9654
 # (GPL-3.0, test job only).
@@ -86,3 +87,48 @@ jobs:
           fi
           echo "::warning::npm audit --omit=dev reported production advisories (exit ${status}). This step is a warning, not a gate."
           exit 0
+
+  # Builds the image natively on amd64 and arm64 and runs the smoke test.
+  # It runs on every change: each pull request edits NOTICE, which the
+  # image carries. Nothing is pushed.
+  docker:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux/amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/pln/pikvm_mcp_server
+          labels: |
+            org.opencontainers.image.licenses=GPL-3.0-only
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          load: true
+          push: false
+          provenance: false
+          tags: pikvm-mcp:ci
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=docker-${{ matrix.runner }}
+          cache-to: type=gha,mode=max,scope=docker-${{ matrix.runner }}
+      # The smoke helpers use node:crypto only; no npm install is needed.
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 24.22.0
+      - name: Smoke test
+        env:
+          EXPECT_REVISION: ${{ github.sha }}
+        run: bash test/docker/smoke.sh pikvm-mcp:ci

@@ -71,6 +71,7 @@ Modified 2026-10 by PLN: private vulnerability reporting (GPL-3.0; see below).
 Modified 2026-10 by PLN: public-file privacy guard (GPL-3.0; see below).
 Modified 2026-10 by PLN: privacy guard review fixes (GPL-3.0; see below).
 Modified 2026-10 by PLN: graceful shutdown and an external upload abort (GPL-3.0; see below).
+Modified 2026-10 by PLN: Docker image, entrypoint, compose file, and image smoke test (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -1241,4 +1242,26 @@ No code from another pikvm_mcp_server fork was added for these methods.
   exit code is 1 if any step threw.
   The process starts from a direct launch and from a symlink. No
   startup-hold environment variable is read.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  A Dockerfile builds a two-stage image on node:24.22.1-trixie-slim,
+  pinned by digest in both stages. The runtime stage removes npm and
+  corepack, installs tini, tesseract and its English data, and runs the
+  server as uid 10001 with /data as the volume. The image sets
+  PIKVM_MCP_NO_DOTENV=1 and PIKVM_MCP_HOST=0.0.0.0. HTTP mode still
+  requires a bearer, and HID and MSD stay disarmed unless armed.
+  docker/entrypoint.sh fills /data defaults only for unset or empty
+  variables and logs each default by name and path, never a value. It
+  exits 78 when /data is not readable or pin mode has no pin file, and
+  exits 64 for a port that is not 1 to 65535. It exports
+  NODE_EXTRA_CA_CERTS for /data/tls/ca.pem only when the file holds a
+  certificate. It never changes, copies or chmods a file.
+  docker/healthcheck.mjs probes GET /healthz in HTTP mode and passes in
+  stdio mode. docker/gen-notices.mjs writes THIRD-PARTY-NOTICES.txt for
+  the npm packages in the image. compose.yaml runs the image read-only
+  with all capabilities dropped and publishes on loopback only.
+  test/docker/smoke.sh checks the image without a real PiKVM, and CI
+  runs it on amd64 and arm64. Dependabot proposes base image updates
+  weekly, except a new Node major.
   No code from another pikvm_mcp_server fork was copied.

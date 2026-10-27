@@ -1,5 +1,5 @@
 # Modified 2026-10 by PLN: weekly npm and actions updates (GPL-3.0; see NOTICE).
-# Docker is not configured here. It joins in a separate change.
+# Modified 2026-10 by PLN: weekly Docker base image updates (GPL-3.0; see NOTICE).
 #
 # Each group sets applies-to: version-updates. Dependabot security
 # updates are turned on in the repository settings, not by this file.
@@ -33,6 +33,27 @@ updates:
       prefix: chore(ci)
     groups:
       actions-minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - minor
+          - patch
+
+  # Both FROM lines in the Dockerfile name the same base, so one pull
+  # request moves both. A new Node major is a deliberate change.
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: chore(docker)
+    ignore:
+      - dependency-name: node
+        update-types:
+          - version-update:semver-major
+    groups:
+      docker-minor-and-patch:
         applies-to: version-updates
         update-types:
           - minor
