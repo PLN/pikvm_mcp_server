@@ -31,6 +31,8 @@
 // Modified 2026-10 by PLN: the upload response read is phase job_timeout (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: external abort on msd write and write_remote (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a cut-short reply to a POST is state unknown (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: start idle capture and report no signal (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: refuse a relative move that kvmd would drop (GPL-3.0; see NOTICE).
 // AbortSignal.timeout and PIKVM_UNREACHABLE / PIKVM_AUTH_FAILED no-retry codes
 // adapted from dtrukr/pikvm_mcp_server src/pikvm/client.ts @ d120243 (GPL-3.0).
 // Snapshot HTTP 503 retry-once adapted from dvaerum/pikvm_mcp_server
@@ -138,8 +140,9 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import { Readable } from 'node:stream';
-import { fetch, request as undiciRequest } from 'undici';
+import { fetch, request as undiciRequest, WebSocket } from 'undici';
 import type { Agent, Dispatcher } from 'undici';
 import {
   TLS_PIN_MISMATCH,
@@ -154,8 +157,10 @@ import {
   HID_PRINT_REFUSE_MS,
   HID_STATE_UNKNOWN_MESSAGE,
   hidPrintCeilingMs,
+  hidPrintPerEventSec,
   hidDelayQueryValue,
 } from '../hid-deadline.js';
+import { CaptureSession, HeldInputError, HidBusyError, HidGate } from './capture-session.js';
 import { capKvmdField, redactSecrets } from '../redact.js';
 import { redactError, redactUrl } from '../url-policy.js';
 import {
@@ -701,6 +706,64 @@ function printIsSlow(path: string): boolean {
   return slow === '1' || slow === 'true';
 }
 
+/**
+ * Starting idle capture (capture-session.ts). The stream session stays
+ * open this long after the last capture; kvmd keeps capture running
+ * about 10 s more.
+ */
+const CAPTURE_LINGER_MS = 60_000;
+
+/** After the session opens, how long to wait for ustreamer to report a signal. */
+const CAPTURE_SIGNAL_WAIT_MS = 10_000;
+
+const CAPTURE_POLL_MS = 250;
+
+/** A print ceiling is at most 50 s; a fast print drains for up to about 10 s after it. */
+const CAPTURE_HID_WAIT_MS = 70_000;
+
+/** kvmd may still be writing queued HID reports after a POST returns. */
+const HID_DRAIN_BASE_MS = 250;
+
+/**
+ * A print with no per-event delay queues every event before kvmd answers.
+ * hid-deadline.ts counts 4 events per character. 2.5 ms per event leaves
+ * margin over a host that polls the keyboard every millisecond.
+ */
+const HID_DRAIN_PER_EVENT_MS = 2.5;
+
+export const PIKVM_NO_SIGNAL = 'PIKVM_NO_SIGNAL';
+export const PIKVM_CAPTURE_START_FAILED = 'PIKVM_CAPTURE_START_FAILED';
+export const PIKVM_CAPTURE_HELD_INPUT = 'PIKVM_CAPTURE_HELD_INPUT';
+export const PIKVM_MOUSE_ABSOLUTE = 'PIKVM_MOUSE_ABSOLUTE';
+
+const NO_SIGNAL_MESSAGE = 'capture is running but reports no video signal. The computer may be off or asleep, '
+  + 'or its display blanked; a key press such as ShiftLeft wakes a blanked display';
+
+/** How long kvmd may still be writing this call's HID reports after it returns. */
+function hidDrainMs(path: string, body: string | object | undefined): number {
+  if (path.split('?')[0] !== '/hid/print') return HID_DRAIN_BASE_MS;
+  if (hidPrintPerEventSec(printDelaySent(path), printIsSlow(path)) > 0) return HID_DRAIN_BASE_MS;
+  const len = typeof body === 'string' ? Math.min(body.length, 1024) : 0;
+  return HID_DRAIN_BASE_MS + Math.ceil((4 * len + 2) * HID_DRAIN_PER_EVENT_MS);
+}
+
+/** Keys and buttons sent with state=true are held until state=false. */
+function noteHeldInput(gate: HidGate, path: string): void {
+  const [pathname, query = ''] = path.split('?');
+  const params = new URLSearchParams(query);
+  const state = params.get('state');
+  let id: string | null = null;
+  if (pathname === '/hid/events/send_key') id = `key ${params.get('key')}`;
+  else if (pathname === '/hid/events/send_mouse_button') id = `mouse button ${params.get('button')}`;
+  if (id === null || state === null) return;
+  if (state === 'true') gate.press(id);
+  else gate.release(id);
+}
+
+interface StreamerSource extends ScreenResolution {
+  online: boolean;
+}
+
 function delay(ms: number, signal?: AbortSignal): Promise<void> {
   if (signal?.aborted || ms <= 0) return Promise.resolve();
   return new Promise((resolve) => {
@@ -1213,6 +1276,19 @@ const msdJobTimeouts = new WeakMap<PiKVMClient, number>();
 /** Resolved MSD idle gap. Hashing reads this. Not a client method. */
 const msdIdleTimeouts = new WeakMap<PiKVMClient, number>();
 
+interface CaptureTiming {
+  lingerMs?: number;
+  signalWaitMs?: number;
+  pollMs?: number;
+}
+
+const captureTimings = new WeakMap<PiKVMClient, CaptureTiming>();
+
+/** Test-only. Shorter capture linger, signal wait, and poll interval. */
+export function setCaptureTimingForTests(client: PiKVMClient, timing: CaptureTiming): void {
+  captureTimings.set(client, timing);
+}
+
 /** Test-only. Shrinks HID abort timers without putting a scale on PiKVMConfig. */
 export function setHidDeadlineScaleForTests(client: PiKVMClient, scale: number): void {
   if (!Number.isFinite(scale) || scale <= 0) return;
@@ -1289,6 +1365,8 @@ export class PiKVMClient {
   private appliedFullSeq = -1;
   private ocr: OcrState = { status: 'unknown', langs: [] };
   private calibration: CalibrationState | null = null;
+  private readonly hidGate = new HidGate();
+  private readonly capture: CaptureSession;
 
   constructor(config: PiKVMConfig) {
     const base = {
@@ -1333,12 +1411,19 @@ export class PiKVMClient {
     // Each call sets its own AbortSignal, including HID ceilings.
     // The same agent is used for GET, POST, HID, and both MSD upload paths.
     this.dispatcher = createKvmdAgent(this.config, { headersTimeout: 0, bodyTimeout: 0 });
+    this.capture = new CaptureSession({
+      open: () => this.openStreamSocket(),
+      gate: this.hidGate,
+      lingerMs: () => captureTimings.get(this)?.lingerMs ?? CAPTURE_LINGER_MS,
+      hidWaitMs: CAPTURE_HID_WAIT_MS,
+    });
   }
 
   /**
-   * Close the kvmd dispatcher. Waits for in-flight calls.
+   * Close the stream session and the kvmd dispatcher. Waits for in-flight calls.
    */
   async close(): Promise<void> {
+    this.capture.close();
     await this.dispatcher.close();
   }
 
@@ -1348,6 +1433,7 @@ export class PiKVMClient {
    * installed for tests when that is a different object.
    */
   destroyDispatcher(): void {
+    this.capture.close();
     const extra = testDispatchers.get(this);
     dropDispatcher(this.dispatcher);
     if (extra && extra !== this.dispatcher) dropDispatcher(extra);
@@ -1377,8 +1463,29 @@ export class PiKVMClient {
    * timeout, or DNS ENOTFOUND / EAI_AGAIN stays PIKVM_UNREACHABLE.
    * GET retries those the same way it retries connection refused.
    * POST, including HID, does not.
+   *
+   * HID POSTs pass through the HID gate, so the stream session does not
+   * open or close while one is in flight or its reports may be draining.
    */
   private async request<T = unknown>(
+    method: string,
+    path: string,
+    body?: string | object,
+    contentType?: string,
+    timeoutMs?: number,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    if (!isHidPost(method, path)) return this.requestRetrying<T>(method, path, body, contentType, timeoutMs, signal);
+    await this.hidGate.enter();
+    noteHeldInput(this.hidGate, path);
+    try {
+      return await this.requestRetrying<T>(method, path, body, contentType, timeoutMs, signal);
+    } finally {
+      this.hidGate.leave(hidDrainMs(path, body));
+    }
+  }
+
+  private async requestRetrying<T>(
     method: string,
     path: string,
     body?: string | object,
@@ -1624,10 +1731,10 @@ export class PiKVMClient {
     }
 
     const path = `/streamer/snapshot${params.toString() ? '?' + params : ''}`;
-    const arrayBuffer = await this.request<ArrayBuffer>('GET', path);
-    const buffer = Buffer.from(arrayBuffer);
-
-    const actualResolution = await this.getResolution(true);
+    const { buffer, actualResolution } = await this.withCapture(async (source) => ({
+      buffer: Buffer.from(await this.request<ArrayBuffer>('GET', path)),
+      actualResolution: source,
+    }));
     const metadata = await limitedSharp(buffer).metadata();
     if (!metadata.width || !metadata.height) {
       throw new Error('Failed to read screenshot dimensions');
@@ -1790,21 +1897,19 @@ export class PiKVMClient {
    */
   async readText(options?: { langs?: string[]; box?: OcrBox; frameId?: string }): Promise<string> {
     const described = this.describeFrame(options?.frameId);
-    let box = options?.box;
-    if (box) {
-      const source = await this.getResolution(true);
-      box = ocrBoxToSource(box, described.frame, source);
-    }
-    const params = new URLSearchParams();
-    params.set('ocr', '1');
-    if (options?.langs && options.langs.length > 0) params.set('ocr_langs', options.langs.join(','));
-    if (box) {
-      params.set('ocr_left', String(box.left));
-      params.set('ocr_top', String(box.top));
-      params.set('ocr_right', String(box.right));
-      params.set('ocr_bottom', String(box.bottom));
-    }
-    const body = await this.requestOcr<unknown>(`/streamer/snapshot?${params}`);
+    const body = await this.withCapture(async (source) => {
+      const box = options?.box ? ocrBoxToSource(options.box, described.frame, source) : undefined;
+      const params = new URLSearchParams();
+      params.set('ocr', '1');
+      if (options?.langs && options.langs.length > 0) params.set('ocr_langs', options.langs.join(','));
+      if (box) {
+        params.set('ocr_left', String(box.left));
+        params.set('ocr_top', String(box.top));
+        params.set('ocr_right', String(box.right));
+        params.set('ocr_bottom', String(box.bottom));
+      }
+      return this.requestOcr<unknown>(`/streamer/snapshot?${params}`);
+    });
     let text: string;
     if (typeof body === 'string') text = body;
     else if (body !== null && typeof body === 'object' && typeof (body as { result?: unknown }).result === 'string') {
@@ -1820,52 +1925,140 @@ export class PiKVMClient {
    * The deadline is the caller's remaining OCR budget. A timeout is not retried.
    */
   async fetchFullSnapshot(timeoutMs: number): Promise<Buffer> {
-    const body = await this.requestOnce<ArrayBuffer>(
+    const body = await this.withCapture(() => this.requestOnce<ArrayBuffer>(
       'GET',
       '/streamer/snapshot',
       undefined,
       undefined,
       timeoutMs,
-    );
+    ));
     if (body instanceof ArrayBuffer) return Buffer.from(body);
     throw new Error('snapshot response was not an image');
   }
 
   /**
-   * Get current screen resolution from the video streamer
+   * Current screen resolution from the video streamer. Starts idle capture
+   * like a screenshot does. PIKVM_NO_SIGNAL when there is no video signal:
+   * the 640x480 that ustreamer reports then is not the screen.
    */
   async getResolution(forceRefresh = false): Promise<ScreenResolution> {
     if (this.cachedResolution && !forceRefresh) {
       return this.cachedResolution;
     }
+    return this.withCapture(async (source) => source);
+  }
 
+  /** GET /streamer. Null while ustreamer is not running: kvmd reports `streamer: null`. */
+  private async streamerSource(): Promise<StreamerSource | null> {
     interface StreamerResponse {
-      ok: boolean;
-      result: {
-        streamer: {
-          source: {
-            resolution: {
-              width: number;
-              height: number;
-            };
+      result?: {
+        streamer?: {
+          source?: {
+            online?: unknown;
+            resolution?: { width?: unknown; height?: unknown };
           };
-        };
+        } | null;
       };
     }
 
     const response = await this.request<StreamerResponse>('GET', '/streamer');
+    const streamer = response?.result?.streamer;
+    if (streamer === null) return null;
 
     // Defensive null checks for nested API response structure
-    const resolution = response?.result?.streamer?.source?.resolution;
+    const resolution = streamer?.source?.resolution;
     if (!resolution || typeof resolution.width !== 'number' || typeof resolution.height !== 'number') {
       throw new Error('Invalid or missing resolution data from PiKVM streamer API');
     }
-
-    this.cachedResolution = {
+    return {
       width: resolution.width,
       height: resolution.height,
+      online: streamer.source?.online !== false,
     };
-    return this.cachedResolution;
+  }
+
+  /**
+   * Run a capture while ustreamer runs with a video signal. When capture
+   * is stopped, this client's stream session starts it (capture-session.ts)
+   * and the signal gets CAPTURE_SIGNAL_WAIT_MS to appear. Capture that was
+   * already running without a signal fails at once with PIKVM_NO_SIGNAL.
+   */
+  private async withCapture<T>(capture: (source: ScreenResolution) => Promise<T>): Promise<T> {
+    let release: (() => void) | undefined;
+    try {
+      // Keep an open session through this capture. Holding it opens nothing.
+      if (this.capture.isOpen) release = await this.acquireCapture();
+      let source = await this.streamerSource();
+      if (source === null) {
+        release ??= await this.acquireCapture();
+        source = await this.awaitSignal();
+      }
+      if (!source.online) throw new KvmdError(503, PIKVM_NO_SIGNAL, NO_SIGNAL_MESSAGE, 'GET /api/streamer');
+      this.cachedResolution = { width: source.width, height: source.height };
+      return await capture(this.cachedResolution);
+    } finally {
+      release?.();
+    }
+  }
+
+  private async acquireCapture(): Promise<() => void> {
+    try {
+      return await this.capture.acquire();
+    } catch (err) {
+      if (err instanceof HeldInputError) {
+        throw new KvmdError(
+          409,
+          PIKVM_CAPTURE_HELD_INPUT,
+          `capture is stopped, and starting it would make kvmd release the held input (${err.held.join(', ')}). `
+            + 'Release it first, or capture before pressing.',
+          'GET /api/ws',
+        );
+      }
+      const reason = err instanceof HidBusyError
+        ? err.message
+        : `kvmd refused the stream session: ${err instanceof Error ? err.message : String(err)}`;
+      throw new KvmdError(
+        503,
+        PIKVM_CAPTURE_START_FAILED,
+        this.redact(`capture is stopped and could not be started: ${reason}`),
+        'GET /api/ws',
+      );
+    }
+  }
+
+  /** After the session opened: poll until ustreamer reports a signal or the wait ends. */
+  private async awaitSignal(): Promise<StreamerSource> {
+    const timing = captureTimings.get(this);
+    const waitMs = timing?.signalWaitMs ?? CAPTURE_SIGNAL_WAIT_MS;
+    const pollMs = timing?.pollMs ?? CAPTURE_POLL_MS;
+    const deadline = performance.now() + waitMs;
+    let source = await this.streamerSource();
+    while (!source?.online && performance.now() < deadline) {
+      await delay(pollMs);
+      source = await this.streamerSource();
+    }
+    if (source === null) {
+      throw new KvmdError(
+        503,
+        PIKVM_CAPTURE_START_FAILED,
+        `capture is stopped, and kvmd did not start it within ${Math.round(waitMs / 1000)}s of a stream session`,
+        'GET /api/streamer',
+      );
+    }
+    return source;
+  }
+
+  /** /api/ws?stream=1 with this client's dispatcher (and TLS mode) and credentials. */
+  private openStreamSocket(): WebSocket {
+    const url = new URL('/api/ws?stream=1', this.config.host);
+    url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+    return new WebSocket(url, {
+      dispatcher: testDispatchers.get(this) ?? this.dispatcher,
+      headers: {
+        'X-KVMD-User': this.config.username,
+        'X-KVMD-Passwd': this.config.password,
+      },
+    });
   }
 
   /**
@@ -2060,6 +2253,19 @@ export class PiKVMClient {
    * @param deltaY - Vertical movement (negative = up, positive = down)
    */
   async mouseMoveRelative(deltaX: number, deltaY: number): Promise<void> {
+    // kvmd answers ok and drops the move while the mouse is absolute
+    // (kvmd v4.227 plugins/hid/otg/mouse.py send_relative_event).
+    const hid = await this.request<{ result?: { mouse?: { absolute?: unknown } } }>('GET', '/hid');
+    if (hid?.result?.mouse?.absolute === true) {
+      throw new KvmdError(
+        409,
+        PIKVM_MOUSE_ABSOLUTE,
+        'kvmd ignores relative mouse moves while the active mouse output is absolute. '
+          + 'Use an absolute move; a key press such as ShiftLeft wakes a blanked display.',
+        'POST /api/hid/events/send_mouse_relative',
+      );
+    }
+
     // Clamp deltas to valid range (-127 to 127)
     const clampedX = clamp(Math.round(deltaX), MOUSE_DELTA_MIN, MOUSE_DELTA_MAX);
     const clampedY = clamp(Math.round(deltaY), MOUSE_DELTA_MIN, MOUSE_DELTA_MAX);

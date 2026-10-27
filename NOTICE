@@ -77,6 +77,7 @@ Modified 2026-10 by PLN: Docker and systemd guides, README and package metadata 
 Modified 2026-10 by PLN: manual image release workflow and image scan gate (GPL-3.0; see below).
 Modified 2026-10 by PLN: version 0.3.0, reported in serverInfo (GPL-3.0; see below).
 Modified 2026-10 by PLN: docs after the first image release (GPL-3.0; see below).
+Modified 2026-10 by PLN: start idle capture, report no signal, refuse dropped relative moves (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -1356,4 +1357,22 @@ No code from another pikvm_mcp_server fork was added for these methods.
   a matching vX.Y.Z tag. The release environment has no required
   reviewer, so two release.yml comments no longer mention an approval
   wait.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  kvmd runs capture only while a stream-enabled WebSocket client, such
+  as a web viewer, is connected. Without one, every screenshot and OCR
+  capture failed with HTTP 503. A screenshot, OCR capture or resolution
+  read now starts stopped capture through one authenticated
+  /api/ws?stream=1 session per device, waits up to 10 s for a video
+  signal, and closes the session 60 s after the last capture. Capture
+  that runs without a signal is PIKVM_NO_SIGNAL, including for the
+  resolution read. kvmd clears HID whenever a WebSocket session opens or
+  closes, so the session opens and closes only while this server's own
+  HID input is idle, drained and not held; with input held, starting
+  capture is refused as PIKVM_CAPTURE_HELD_INPUT. A relative mouse move
+  is refused as PIKVM_MOUSE_ABSOLUTE while kvmd reports an absolute
+  mouse: kvmd answers such a move ok and drops it. The kvmd behaviour is
+  from kvmd v4.227 (server.py, plugins/hid/otg) and was checked on a
+  PiKVM V4 Mini.
   No code from another pikvm_mcp_server fork was copied.
