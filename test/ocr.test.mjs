@@ -1,4 +1,5 @@
 // Modified 2026-10 by PLN: host OCR tests (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: read_text returns plain text unless detail is words (GPL-3.0; see NOTICE).
 
 /**
  * Host OCR with a fake recognizer and fake tesseract binaries.
@@ -572,7 +573,8 @@ test('a click on a host word uses that frame', async (t) => {
       const tool = listed.result.tools.find((item) => item.name === 'pikvm_read_text');
       assert.ok(tool);
       assert.match(tool.description, /JSON/);
-      assert.match(tool.description, /not plain text/);
+      assert.match(tool.description, /The result is the plain text/);
+      assert.match(tool.description, /detail "words"/);
       const preview = await rpc(srv.base, sessionId, 'tools/call', {
         name: 'pikvm_screenshot',
         arguments: {},
@@ -584,7 +586,7 @@ test('a click on a host word uses that frame', async (t) => {
       const before = imageSnapshots(mock).length;
       const logged = await captureOcrLogs(() => rpc(srv.base, sessionId, 'tools/call', {
         name: 'pikvm_read_text',
-        arguments: { left: 0, top: 0, right: 4, bottom: 4, frameId: meta.frameId },
+        arguments: { detail: 'words', left: 0, top: 0, right: 4, bottom: 4, frameId: meta.frameId },
       }));
       const read = logged.value;
       assert.notEqual(read.result.isError, true, read.result.content[0].text);
@@ -839,7 +841,7 @@ test('kvmd OCR is wrapped JSON and is not the unset default', async (t) => {
       const sessionId = await openSession(srv.base);
       const read = await rpc(srv.base, sessionId, 'tools/call', {
         name: 'pikvm_read_text',
-        arguments: { langs: 'eng', left: 1, top: 2, right: 3, bottom: 4, engine: 'kvmd' },
+        arguments: { detail: 'words', langs: 'eng', left: 1, top: 2, right: 3, bottom: 4, engine: 'kvmd' },
       });
       assert.notEqual(read.result.isError, true, read.result.content[0].text);
       const body = JSON.parse(read.result.content[0].text);
@@ -851,6 +853,16 @@ test('kvmd OCR is wrapped JSON and is not the unset default', async (t) => {
         ocrSnapshots(mock).at(-1).query,
         '?ocr=1&ocr_langs=eng&ocr_left=1&ocr_top=2&ocr_right=3&ocr_bottom=4',
       );
+
+      // The default is the plain text; the rest is structured, without words.
+      const plain = await rpc(srv.base, sessionId, 'tools/call', {
+        name: 'pikvm_read_text',
+        arguments: { langs: 'eng', left: 1, top: 2, right: 3, bottom: 4, engine: 'kvmd' },
+      });
+      assert.equal(plain.result.content[0].text, 'screen text');
+      assert.equal(plain.result.structuredContent.engine, 'kvmd');
+      assert.equal(plain.result.structuredContent.text, 'screen text');
+      assert.equal('words' in plain.result.structuredContent, false);
     } finally {
       await srv.close();
       await pikvm.close();

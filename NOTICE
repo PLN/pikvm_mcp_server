@@ -79,6 +79,7 @@ Modified 2026-10 by PLN: version 0.3.0, reported in serverInfo (GPL-3.0; see bel
 Modified 2026-10 by PLN: docs after the first image release (GPL-3.0; see below).
 Modified 2026-10 by PLN: start idle capture, report no signal, refuse dropped relative moves (GPL-3.0; see below).
 Modified 2026-10 by PLN: version 0.3.1 (GPL-3.0; see below).
+Modified 2026-10 by PLN: situation-first errors, no-signal cause, plain-text OCR (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -1383,4 +1384,19 @@ No code from another pikvm_mcp_server fork was added for these methods.
   compose.tailscale.yaml and docs/docker.md name the 0.3.1 image.
   docs/docker.md says gh attestation verify needs a GitHub login even
   for the public image; an unauthenticated run stops at gh auth login.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  Tool output says what it means. Errors this server raises lead with
+  the situation instead of an endpoint and HTTP status. Errors carry
+  cause and next fields in the JSON line and in structuredContent, plus
+  a Next line when there is an obvious next step. PIKVM_NO_SIGNAL reads
+  kvmd's USB HID state to tell a dark display (keyboard online) from a
+  computer that is off, suspended or unplugged (keyboard and mouse
+  offline). Screenshot text and the mouse tool descriptions state that
+  mouse x and y are pixels of the screenshot image, and
+  pikvm_get_resolution no longer calls screen pixels mouse coordinates.
+  pikvm_read_text returns plain text by default; detail "words" returns
+  the earlier JSON. pikvm_type says when kvmd is still typing a long
+  fast print.
   No code from another pikvm_mcp_server fork was copied.

@@ -33,6 +33,7 @@
 // Modified 2026-10 by PLN: a cut-short reply to a POST is state unknown (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: start idle capture and report no signal (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: refuse a relative move that kvmd would drop (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: no-signal cause, error hints, typing drain estimate (GPL-3.0; see NOTICE).
 // AbortSignal.timeout and PIKVM_UNREACHABLE / PIKVM_AUTH_FAILED no-retry codes
 // adapted from dtrukr/pikvm_mcp_server src/pikvm/client.ts @ d120243 (GPL-3.0).
 // Snapshot HTTP 503 retry-once adapted from dvaerum/pikvm_mcp_server
@@ -372,6 +373,12 @@ export interface CalibrationResult {
  */
 export type MsdWindowPhase = 'finalise' | 'write_remote_headers' | 'job_timeout';
 
+/** The obvious next tool call for an error, when there is one. */
+export interface ToolHint {
+  tool: string;
+  args: Record<string, unknown>;
+}
+
 export class KvmdError extends Error {
   readonly status: number;
   readonly type: string;
@@ -389,6 +396,16 @@ export class KvmdError extends Error {
    * An idle abort leaves this unset.
    */
   readonly phase?: MsdWindowPhase;
+
+  /**
+   * Why, when one type covers several situations (PIKVM_NO_SIGNAL). Tool
+   * output calls it `cause`; the property is not Error.cause, which other
+   * code walks as an error chain.
+   */
+  reason?: string;
+
+  /** The obvious next tool call, when there is one. */
+  next?: ToolHint;
 
   constructor(
     status: number,
@@ -736,8 +753,32 @@ export const PIKVM_CAPTURE_START_FAILED = 'PIKVM_CAPTURE_START_FAILED';
 export const PIKVM_CAPTURE_HELD_INPUT = 'PIKVM_CAPTURE_HELD_INPUT';
 export const PIKVM_MOUSE_ABSOLUTE = 'PIKVM_MOUSE_ABSOLUTE';
 
-const NO_SIGNAL_MESSAGE = 'capture is running but reports no video signal. The computer may be off or asleep, '
-  + 'or its display blanked; a key press such as ShiftLeft wakes a blanked display';
+/**
+ * Types this server raises itself. Their endpoint and HTTP status say
+ * nothing about the situation, so tool text leads with the message.
+ */
+export const SERVER_ERROR_TYPES: ReadonlySet<string> = new Set([
+  'PIKVM_NO_SIGNAL',
+  'PIKVM_CAPTURE_START_FAILED',
+  'PIKVM_CAPTURE_HELD_INPUT',
+  'PIKVM_MOUSE_ABSOLUTE',
+]);
+
+/**
+ * PIKVM_NO_SIGNAL causes. kvmd's USB keyboard and mouse are offline when
+ * the host does not run the USB port (on KVM1, unplugged); online when it
+ * is attached and only the display is dark.
+ */
+export type NoSignalCause = 'display_asleep' | 'usb_offline' | 'unknown';
+
+const NO_SIGNAL_MESSAGES: Record<NoSignalCause, string> = {
+  display_asleep: 'no picture: the display is off or asleep. The computer is connected (its USB keyboard is online); '
+    + 'a key press such as ShiftLeft wakes the display',
+  usb_offline: 'no picture, and the computer\'s USB keyboard and mouse are offline: it is off, suspended or '
+    + 'unplugged. A key press can only wake a suspended computer that allows USB wake-up',
+  unknown: 'capture is running but reports no video signal. The computer may be off or asleep, '
+    + 'or its display blanked; a key press such as ShiftLeft wakes a blanked display',
+};
 
 /**
  * How long kvmd may still be writing the reports this call queued after
@@ -2003,12 +2044,32 @@ export class PiKVMClient {
         release ??= await this.acquireCapture();
         source = await this.awaitSignal();
       }
-      if (!source.online) throw new KvmdError(503, PIKVM_NO_SIGNAL, NO_SIGNAL_MESSAGE, 'GET /api/streamer');
+      if (!source.online) throw await this.noSignalError();
       this.cachedResolution = { width: source.width, height: source.height };
       return await capture(this.cachedResolution);
     } finally {
       release?.();
     }
+  }
+
+  /** PIKVM_NO_SIGNAL with its cause, read from kvmd's USB HID state. */
+  private async noSignalError(): Promise<KvmdError> {
+    let cause: NoSignalCause = 'unknown';
+    try {
+      const hid = await this.request<{
+        result?: { keyboard?: { online?: unknown }; mouse?: { online?: unknown } };
+      }>('GET', '/hid');
+      const keyboard = hid?.result?.keyboard?.online;
+      const mouse = hid?.result?.mouse?.online;
+      if (keyboard === true || mouse === true) cause = 'display_asleep';
+      else if (keyboard === false && mouse === false) cause = 'usb_offline';
+    } catch {
+      // The picture state stands; the cause stays unknown.
+    }
+    const err = new KvmdError(503, PIKVM_NO_SIGNAL, NO_SIGNAL_MESSAGES[cause], 'GET /api/streamer');
+    err.reason = cause;
+    if (cause !== 'usb_offline') err.next = { tool: 'pikvm_key', args: { key: 'ShiftLeft' } };
+    return err;
   }
 
   private async acquireCapture(): Promise<() => void> {
@@ -2199,13 +2260,16 @@ export class PiKVMClient {
   /**
    * Type text using paste-as-keys (handles special characters correctly)
    */
-  async type(text: string, options?: TypeOptions): Promise<void> {
+  async type(text: string, options?: TypeOptions): Promise<{ queuedMs: number }> {
     const params = new URLSearchParams();
     params.set('keymap', options?.keymap || this.config.defaultKeymap);
     if (options?.slow) params.set('slow', '1');
     if (options?.delay !== undefined) params.set('delay', hidDelayQueryValue(options.delay));
 
-    await this.request('POST', `/hid/print?${params}`, text, 'text/plain');
+    const path = `/hid/print?${params}`;
+    await this.request('POST', path, text, 'text/plain');
+    // kvmd answers a print with no delay before it has typed it.
+    return { queuedMs: hidQueuedMs(path, text) };
   }
 
   /**

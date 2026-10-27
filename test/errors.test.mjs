@@ -4,6 +4,7 @@
 // Modified 2026-10 by PLN: header and body timeouts stay timeouts (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a reply cut short after Connection: close (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: capture state is read before the snapshot (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: situation-first errors with cause and next (GPL-3.0; see NOTICE).
 
 /**
  * KvmdError, request timeout, and bounded GET retry.
@@ -136,6 +137,25 @@ async function withSession(routes, armGateEnforced, fn, options) {
     await mock.close();
   }
 }
+
+test('an error this server raises leads with the situation, cause and next step', async () => {
+  await withSession({
+    'GET /api/streamer': {
+      status: 200,
+      body: { ok: true, result: { streamer: { source: { online: false, resolution: { width: 640, height: 480 } } } } },
+    },
+  }, true, async ({ srv, sessionId }) => {
+    const result = await callTool(srv.base, sessionId, 'pikvm_get_resolution');
+    const { text, details } = parseKvmdToolError(result);
+    const lines = text.split('\n');
+    assert.match(lines[0], /^Error \[PIKVM_NO_SIGNAL\]: no picture: the display is off or asleep/);
+    assert.equal(lines[1], 'Next: pikvm_key {"key":"ShiftLeft"}');
+    assert.equal(details.cause, 'display_asleep');
+    assert.deepEqual(details.next, { tool: 'pikvm_key', args: { key: 'ShiftLeft' } });
+    assert.equal(details.endpoint, 'GET /api/streamer');
+    assert.deepEqual(result.structuredContent.error, details);
+  });
+});
 
 test('kvmd error type and status pass through on a GET, and 400 is not retried', async () => {
   await withSession({

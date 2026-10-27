@@ -32,6 +32,7 @@
 // Modified 2026-10 by PLN: a post-send job cap reports phase job_timeout (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: the upload response read is phase job_timeout (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: serverInfo.version follows package.json (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: situation-first errors, coordinate wording, plain-text OCR (GPL-3.0; see NOTICE).
 
 /**
  * MCP server factory for PiKVM tools
@@ -50,7 +51,13 @@ import {
   GetPromptRequestSchema,
   Tool,
 } from '@modelcontextprotocol/sdk/types.js';
-import { type PiKVMClient, type FrameEcho, KvmdError, redactionPassword } from './pikvm/client.js';
+import {
+  type PiKVMClient,
+  type FrameEcho,
+  KvmdError,
+  SERVER_ERROR_TYPES,
+  redactionPassword,
+} from './pikvm/client.js';
 import { redactSecrets } from './redact.js';
 import type { BusyLock } from './pikvm/lock.js';
 import { type Fleet, type FleetDevice, resolveFleetDevice } from './devices.js';
@@ -338,24 +345,34 @@ export function formatToolError(error: unknown, password = ''): string {
     return `Error [${error.type}]: ${message}\n${details}`;
   }
   if (error instanceof KvmdError) {
-    const message = redact(error.message);
-    const endpoint = redact(error.endpoint);
-    const type = redact(error.type);
-    const summary = `Error [${type}] ${endpoint} (HTTP ${error.status}): ${message}`;
-    const details = JSON.stringify({
-      status: error.status,
-      type,
-      message,
-      endpoint,
-    });
+    const details = kvmdErrorDetails(error, password);
+    // A type this server raises leads with the situation. kvmd's own
+    // errors keep the endpoint and status, which help debugging.
+    const summary = SERVER_ERROR_TYPES.has(error.type)
+      ? `Error [${details.type}]: ${details.message}`
+      : `Error [${details.type}] ${details.endpoint} (HTTP ${details.status}): ${details.message}`;
+    const next = details.next ? `\nNext: ${details.next.tool} ${JSON.stringify(details.next.args)}` : '';
     // Fields are already redacted. A second pass over the JSON would treat
     // the closing quote as part of X-KVMD-Passwd=[REDACTED] and break the block.
-    return `${summary}\n${details}`;
+    return `${summary}${next}\n${JSON.stringify(details)}`;
   }
   if (error instanceof Error) {
     return `Error: ${redact(error.message)}`;
   }
   return 'Error: An unexpected error occurred';
+}
+
+/** Redacted KvmdError fields, for the JSON line and structuredContent. */
+export function kvmdErrorDetails(error: KvmdError, password = '') {
+  const redact = (value: string) => redactUrl(redactSecrets(value, password));
+  return {
+    status: error.status,
+    type: redact(error.type),
+    message: redact(error.message),
+    endpoint: redact(error.endpoint),
+    ...(error.reason !== undefined ? { cause: error.reason } : {}),
+    ...(error.next !== undefined ? { next: error.next } : {}),
+  };
 }
 
 function disarmedResult(tool: string) {
@@ -436,6 +453,18 @@ function implicitFleet(deps: McpServerDeps): Fleet {
   };
 }
 
+/** The other devices' passwords, over each string field. */
+function redactDetails<T extends Record<string, unknown>>(details: T, passwords: readonly string[]): T {
+  const out: Record<string, unknown> = { ...details };
+  for (const [key, value] of Object.entries(out)) {
+    if (typeof value !== 'string') continue;
+    let text = value;
+    for (const password of passwords.slice(1)) text = redactSecrets(text, password);
+    out[key] = text;
+  }
+  return out as T;
+}
+
 function redactToolText(error: unknown, passwords: readonly string[]): string {
   let text = formatToolError(error, passwords[0] ?? '');
   for (const password of passwords.slice(1)) {
@@ -457,12 +486,18 @@ function listFleetDevices(fleet: Fleet) {
   return { default: fleet.defaultName, devices };
 }
 
-function tagFleetResult<T extends { content?: Array<{ type?: string; text?: string }> }>(
+function tagFleetResult<T extends {
+  content?: Array<{ type?: string; text?: string }>;
+  structuredContent?: Record<string, unknown>;
+}>(
   result: T,
   ctx: FleetDevice | undefined,
   registryActive: boolean,
 ): T {
   if (!registryActive || !ctx) return result;
+  if (result.structuredContent) {
+    result = { ...result, structuredContent: { ...result.structuredContent, device: ctx.name } };
+  }
   const content = result.content;
   if (!content || content.length === 0) return result;
   const first = content[0];
@@ -495,7 +530,7 @@ function tagFleetResult<T extends { content?: Array<{ type?: string; text?: stri
 const tools: Tool[] = [
   {
     name: 'pikvm_screenshot',
-    description: 'Capture a screenshot from the PiKVM video stream. Returns a JPEG plus coordinate metadata, including frameId. Defaults are PIKVM_SCREENSHOT_MAX_WIDTH 960, PIKVM_SCREENSHOT_MAX_HEIGHT 600, and PIKVM_SCREENSHOT_QUALITY 70, unless the device registry sets screenshot. A per-call value wins. region crops the captured image locally and must lie inside it. The default click frame is the last full preview, in request order rather than completion order. A crop does not change it. Pass that capture\'s frameId to a mouse tool to click in the crop.',
+    description: 'Capture a screenshot from the PiKVM video stream. Mouse x and y are pixels in the returned image, not screen pixels. Returns a JPEG plus coordinate metadata, including frameId. Defaults are PIKVM_SCREENSHOT_MAX_WIDTH 960, PIKVM_SCREENSHOT_MAX_HEIGHT 600, and PIKVM_SCREENSHOT_QUALITY 70, unless the device registry sets screenshot. A per-call value wins. region crops the captured image locally and must lie inside it. The default click frame is the last full preview, in request order rather than completion order. A crop does not change it. Pass that capture\'s frameId to a mouse tool to click in the crop.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -527,7 +562,7 @@ const tools: Tool[] = [
   },
   {
     name: 'pikvm_read_text',
-    description: 'Read on-screen text. BREAKING: the result is one JSON text block, the same shape as screenshot metadata, not plain text. engine is host (the system tesseract binary) or kvmd. Unset PIKVM_OCR_ENGINE uses host when tesseract was found at startup, and is off otherwise. kvmd is never the unset default and is never a fallback after a host failure. Host is listed when the binary was found. kvmd is listed while any device is enabled or not yet probed. off is hidden. A host call needs a box unless fullFrame is true and PIKVM_OCR_ALLOW_FULL_FRAME=1. The region is refused before a snapshot when it is above the pixel cap. words[].click is the word centre in this frameId. Text is capped at 64 KiB.',
+    description: 'Read on-screen text. The result is the plain text; structuredContent carries the engine, crop, source size and timings. detail "words" returns the full JSON instead, with every word, its confidence, box and click point. engine is host (the system tesseract binary) or kvmd. Unset PIKVM_OCR_ENGINE uses host when tesseract was found at startup, and is off otherwise. kvmd is never the unset default and is never a fallback after a host failure. Host is listed when the binary was found. kvmd is listed while any device is enabled or not yet probed. off is hidden. A host call needs a box unless fullFrame is true and PIKVM_OCR_ALLOW_FULL_FRAME=1. The region is refused before a snapshot when it is above the pixel cap. words[].click is the word centre in this frameId. Text is capped at 64 KiB.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -551,12 +586,17 @@ const tools: Tool[] = [
           type: 'string',
           description: 'Capture whose pixels the box is in. Omitted uses the default click frame. Unknown sends no OCR request.',
         },
+        detail: {
+          type: 'string',
+          enum: ['text', 'words'],
+          description: 'text (default): the recognized text. words: the full JSON result with per-word boxes and click points.',
+        },
       },
     },
   },
   {
     name: 'pikvm_get_resolution',
-    description: 'Get the current screen resolution of the remote machine. Useful for knowing valid coordinate ranges for mouse operations.',
+    description: 'Get the remote screen resolution in screen pixels. Mouse tools do not take screen pixels: their x and y are pixels of the last screenshot image. Use this to understand the scale between the two.',
     inputSchema: {
       type: 'object',
       properties: {},
@@ -629,7 +669,7 @@ const tools: Tool[] = [
   },
   {
     name: 'pikvm_mouse_move',
-    description: 'Move the mouse cursor. Absolute coordinates are pixels in the default click frame, which is the last full preview in request order. Pass frameId to use that capture, including a crop: the point is mapped with that frame\'s scale, crop origin, and calibration. An unknown, evicted, or other-device frameId is PIKVM_UNKNOWN_FRAME and sends no HID event. Relative deltas are clamped to -127 to 127 and are not mapped through the frame. The result echoes frameId or default, width, height, scale, and origin.',
+    description: 'Move the mouse cursor. x and y are pixels in the last screenshot image (see its width and height), not screen pixels. In detail: absolute coordinates are pixels in the default click frame, which is the last full preview in request order. Pass frameId to use that capture, including a crop: the point is mapped with that frame\'s scale, crop origin, and calibration. An unknown, evicted, or other-device frameId is PIKVM_UNKNOWN_FRAME and sends no HID event. Relative deltas are clamped to -127 to 127 and are not mapped through the frame. The result echoes frameId or default, width, height, scale, and origin.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -655,7 +695,7 @@ const tools: Tool[] = [
   },
   {
     name: 'pikvm_mouse_click',
-    description: 'Click a mouse button. Optional x and y are pixels in the default click frame (the last full preview, in request order). Pass frameId to move in that capture, including a crop. An unknown, evicted, or other-device frameId is PIKVM_UNKNOWN_FRAME and sends no HID event. The result echoes frameId or default, width, height, scale, and origin.',
+    description: 'Click a mouse button. Optional x and y are pixels in the last screenshot image (see its width and height), not screen pixels; that is the default click frame (the last full preview, in request order). Pass frameId to move in that capture, including a crop. An unknown, evicted, or other-device frameId is PIKVM_UNKNOWN_FRAME and sends no HID event. The result echoes frameId or default, width, height, scale, and origin.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1108,14 +1148,13 @@ export function createMcpServer(deps: McpServerDeps): Server {
             hid: result.hid,
           };
 
-          let infoText = `Screenshot captured (${result.screenshotWidth}x${result.screenshotHeight}`;
-          if (result.scaleX !== 1 || result.scaleY !== 1) {
-            infoText += `, scaled from ${result.actualWidth}x${result.actualHeight}`;
-            infoText += `, scale factor: ${result.scaleX.toFixed(2)}x${result.scaleY.toFixed(2)}`;
-          }
-          infoText += result.region
-            ? '). This crop does not change the default click frame. Pass frameId to click in this image.'
-            : '). This full preview is the default click frame, in request order.';
+          const screen = `the ${result.actualWidth}x${result.actualHeight} screen`;
+          let infoText = result.region
+            ? `Screenshot: ${result.screenshotWidth}x${result.screenshotHeight} crop at (${result.region.x}, ${result.region.y}) `
+              + `of the full image of ${screen}. To click in this crop, pass its frameId to the mouse tool; `
+              + 'without frameId, mouse x and y stay pixels of the last full screenshot.'
+            : `Screenshot: ${result.screenshotWidth}x${result.screenshotHeight} image of ${screen}. `
+              + 'Mouse x and y are pixels in this image.';
           infoText += `\n${JSON.stringify(meta)}`;
 
           return {
@@ -1166,16 +1205,28 @@ export function createMcpServer(deps: McpServerDeps): Server {
               return state;
             },
           });
-          return jsonText(result);
+          const detail = validateEnum(args.detail, ['text', 'words'] as const, 'text');
+          if (detail === 'words') {
+            return { ...jsonText(result), structuredContent: { ...result } };
+          }
+          const { words: _words, ...summary } = result;
+          return {
+            content: [{ type: 'text', text: result.text === '' ? '(no text recognized)' : result.text }],
+            structuredContent: { ...summary },
+          };
         }
 
         case 'pikvm_get_resolution': {
           const resolution = await deviceClient.getResolution(true); // force refresh
+          const last = deviceClient.describeFrame().echo;
+          const mouse = last.width !== null && last.height !== null
+            ? `Mouse x and y are pixels of the last screenshot (${last.width}x${last.height}), not screen pixels.`
+            : 'Mouse x and y are pixels of the last screenshot, not screen pixels; take a screenshot first.';
           return {
             content: [
               {
                 type: 'text',
-                text: `Screen resolution: ${resolution.width}x${resolution.height} pixels. Valid mouse coordinates: x=0-${resolution.width - 1}, y=0-${resolution.height - 1}`,
+                text: `Screen resolution: ${resolution.width}x${resolution.height} pixels. ${mouse}`,
               },
             ],
           };
@@ -1183,15 +1234,19 @@ export function createMcpServer(deps: McpServerDeps): Server {
 
         case 'pikvm_type': {
           const text = requireString(args.text, 'text');
-          await deviceClient.type(text, {
+          const typed = await deviceClient.type(text, {
             keymap: validateString(args.keymap),
             slow: validateBoolean(args.slow),
             delay: validateNumber(args.delay, 0, 200),
           });
           // Don't echo full text in response to avoid leaking sensitive input
           const displayText = text.length > 50 ? `${text.substring(0, 50)}...` : text;
+          // kvmd answers a fast print before it has typed it.
+          const pending = typed.queuedMs >= 1000
+            ? ` kvmd is still typing; it finishes in about ${Math.ceil(typed.queuedMs / 1000)} s.`
+            : '';
           return {
-            content: [{ type: 'text', text: `Typed ${text.length} character(s): "${displayText}"` }],
+            content: [{ type: 'text', text: `Typed ${text.length} character(s): "${displayText}".${pending}` }],
           };
         }
 
@@ -1544,6 +1599,9 @@ export function createMcpServer(deps: McpServerDeps): Server {
     } catch (error) {
       return tagFleetResult({
         content: [{ type: 'text' as const, text: redactToolText(error, fleet.passwords) }],
+        ...(error instanceof KvmdError
+          ? { structuredContent: { error: redactDetails(kvmdErrorDetails(error, fleet.passwords[0] ?? ''), fleet.passwords) } }
+          : {}),
         isError: true as const,
       }, ctx, fleet.registryActive);
     }
