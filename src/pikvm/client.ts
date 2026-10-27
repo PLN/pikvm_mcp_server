@@ -35,6 +35,7 @@
 // Modified 2026-10 by PLN: refuse a relative move that kvmd would drop (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: no-signal cause, error hints, typing drain estimate (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: keep-awake input and HID inactivity (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: device status: picture, screen on-time, input idle timers (GPL-3.0; see NOTICE).
 // AbortSignal.timeout and PIKVM_UNREACHABLE / PIKVM_AUTH_FAILED no-retry codes
 // adapted from dtrukr/pikvm_mcp_server src/pikvm/client.ts @ d120243 (GPL-3.0).
 // Snapshot HTTP 503 retry-once adapted from dvaerum/pikvm_mcp_server
@@ -163,7 +164,7 @@ import {
   hidDelayQueryValue,
 } from '../hid-deadline.js';
 import { CaptureSession, HeldInputError, HidBusyError, HidGate } from './capture-session.js';
-import { KeepAwake, KeepAwakeCancelled, type KeepAwakeInput } from '../keep-awake.js';
+import { KeepAwake, KeepAwakeCancelled, type KeepAwakeInput, type KeepAwakeState } from '../keep-awake.js';
 import { capKvmdField, redactSecrets } from '../redact.js';
 import { redactError, redactUrl } from '../url-policy.js';
 import {
@@ -808,6 +809,48 @@ function heldInputChange(path: string): { id: string; held: boolean } | null {
 
 interface StreamerSource extends ScreenResolution {
   online: boolean;
+  fps?: number;
+}
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/** HID POST paths by the input they carry, for the idle timers in status. */
+function hidInputKind(path: string): 'keyboard' | 'mouse' | null {
+  const pathname = path.split('?')[0];
+  if (pathname === '/hid/print' || pathname === '/hid/events/send_key' || pathname === '/hid/events/send_shortcut') {
+    return 'keyboard';
+  }
+  if (pathname.startsWith('/hid/events/send_mouse_')) return 'mouse';
+  return null;
+}
+
+export type PictureState = 'visible' | 'display_asleep' | 'usb_offline' | 'capture_stopped' | 'unknown';
+
+/** One read-only look at a device, for pikvm_status. */
+export interface DeviceStatusReading {
+  reachable: boolean;
+  error?: { type: string; message: string };
+  picture: { state: PictureState; width?: number; height?: number; fps?: number };
+  /** Signal transitions this server saw, from every streamer read. */
+  screen: { state: 'on' | 'off' | 'capture stopped'; since: string; lastChecked: string } | null;
+  input: {
+    keyboardOnline: boolean | null;
+    mouseOnline: boolean | null;
+    mouse: 'absolute' | 'relative' | null;
+    held: string[];
+  };
+  idle: {
+    /** kvmd's HID inactivity: every source, including keep-awake and kvmd's jiggler. */
+    anyInputSeconds: number | null;
+    /** This server's tool input; keep-awake is reported in keepAwake. */
+    lastToolKeyboardInput: string | null;
+    lastToolMouseInput: string | null;
+  };
+  captureSession: { open: boolean; captures: number; closesAt?: string };
+  keepAwake: KeepAwakeState;
+  media: unknown;
 }
 
 function delay(ms: number, signal?: AbortSignal): Promise<void> {
@@ -1426,6 +1469,10 @@ export class PiKVMClient {
   private keepAwakeAction: Promise<unknown> | null = null;
   /** Set only while keep-awake starts a request; read synchronously at request entry. */
   private sendingKeepAwake = false;
+  /** Last signal state this server saw, and since when. */
+  private signal: { state: 'on' | 'off' | 'capture stopped'; since: number; checked: number } | null = null;
+  /** Last HID input from tools, epoch ms. Keep-awake input is not counted here. */
+  private lastToolInput: { keyboard: number; mouse: number } = { keyboard: 0, mouse: 0 };
 
   constructor(config: PiKVMConfig) {
     const base = {
@@ -1479,6 +1526,7 @@ export class PiKVMClient {
     this.keepAwake = new KeepAwake({
       hidInactivitySeconds: () => this.hidInactivitySeconds(),
       hidBusy: () => this.hidGate.busy(),
+      observeSignal: () => this.streamerSource().then(() => undefined, () => undefined),
       sendKeepAwake: (input, mayPost) => this.sendKeepAwake(input, mayPost),
     }, () => keepAwakeTimings.get(this) ?? { pollMs: 5_000, secondMs: 1000 });
   }
@@ -1542,6 +1590,9 @@ export class PiKVMClient {
     signal?: AbortSignal,
   ): Promise<T> {
     if (!isHidPost(method, path)) return this.requestRetrying<T>(method, path, body, contentType, timeoutMs, signal);
+    // Synchronous, before the first await: keep-awake's own input is not tool input.
+    const kind = hidInputKind(path);
+    if (kind && !this.sendingKeepAwake) this.lastToolInput[kind] = Date.now();
     // A tool's input waits for a keep-awake input that has started.
     if (!this.sendingKeepAwake) {
       while (this.keepAwakeAction) await this.keepAwakeAction.catch(() => undefined);
@@ -2032,6 +2083,7 @@ export class PiKVMClient {
         streamer?: {
           source?: {
             online?: unknown;
+            captured_fps?: unknown;
             resolution?: { width?: unknown; height?: unknown };
           };
         } | null;
@@ -2040,18 +2092,96 @@ export class PiKVMClient {
 
     const response = await this.request<StreamerResponse>('GET', '/streamer');
     const streamer = response?.result?.streamer;
-    if (streamer === null) return null;
+    if (streamer === null) {
+      this.noteSignal('capture stopped');
+      return null;
+    }
 
     // Defensive null checks for nested API response structure
     const resolution = streamer?.source?.resolution;
     if (!resolution || typeof resolution.width !== 'number' || typeof resolution.height !== 'number') {
       throw new Error('Invalid or missing resolution data from PiKVM streamer API');
     }
+    const online = streamer.source?.online !== false;
+    this.noteSignal(online ? 'on' : 'off');
+    const fps = streamer.source?.captured_fps;
     return {
       width: resolution.width,
       height: resolution.height,
-      online: streamer.source?.online !== false,
+      online,
+      ...(typeof fps === 'number' ? { fps } : {}),
     };
+  }
+
+  private noteSignal(state: 'on' | 'off' | 'capture stopped'): void {
+    const now = Date.now();
+    if (!this.signal || this.signal.state !== state) this.signal = { state, since: now, checked: now };
+    else this.signal.checked = now;
+  }
+
+  /**
+   * Read-only look at the device for pikvm_status. Starts no capture,
+   * opens no session, sends no input. Each read fails on its own.
+   */
+  async status(): Promise<DeviceStatusReading> {
+    const [streamer, hid, idle, media] = await Promise.allSettled([
+      this.streamerSource(),
+      this.request<{
+        result?: {
+          keyboard?: { online?: unknown };
+          mouse?: { online?: unknown; absolute?: unknown };
+        };
+      }>('GET', '/hid'),
+      this.hidInactivitySeconds(),
+      this.getMsdState(),
+    ]);
+    const hidResult = hid.status === 'fulfilled' ? hid.value?.result : undefined;
+    const bool = (value: unknown) => (typeof value === 'boolean' ? value : null);
+    const keyboardOnline = bool(hidResult?.keyboard?.online);
+    const mouseOnline = bool(hidResult?.mouse?.online);
+    const absolute = bool(hidResult?.mouse?.absolute);
+    const usbOffline = keyboardOnline === false && mouseOnline === false;
+
+    let picture: DeviceStatusReading['picture'] = { state: 'unknown' };
+    if (streamer.status === 'fulfilled') {
+      const source = streamer.value;
+      if (source === null) picture = { state: usbOffline ? 'usb_offline' : 'capture_stopped' };
+      else if (source.online) picture = { state: 'visible', width: source.width, height: source.height, ...(source.fps !== undefined ? { fps: source.fps } : {}) };
+      else picture = { state: usbOffline ? 'usb_offline' : 'display_asleep' };
+    }
+    const failure = streamer.status === 'rejected' ? streamer.reason : null;
+    const iso = (ms: number) => (ms > 0 ? new Date(ms).toISOString() : null);
+    const reading: DeviceStatusReading = {
+      reachable: failure === null,
+      picture,
+      screen: this.signal
+        ? {
+          state: this.signal.state,
+          since: new Date(this.signal.since).toISOString(),
+          lastChecked: new Date(this.signal.checked).toISOString(),
+        }
+        : null,
+      input: {
+        keyboardOnline,
+        mouseOnline,
+        mouse: absolute === null ? null : absolute ? 'absolute' : 'relative',
+        held: this.hidGate.heldInput(),
+      },
+      idle: {
+        anyInputSeconds: idle.status === 'fulfilled' ? idle.value : null,
+        lastToolKeyboardInput: iso(this.lastToolInput.keyboard),
+        lastToolMouseInput: iso(this.lastToolInput.mouse),
+      },
+      captureSession: this.capture.state(),
+      keepAwake: this.keepAwake.state(),
+      media: media.status === 'fulfilled' ? media.value : { error: this.redact(errorText(media.reason)) },
+    };
+    if (failure !== null) {
+      reading.error = failure instanceof KvmdError
+        ? { type: failure.type, message: failure.message }
+        : { type: 'Error', message: this.redact(errorText(failure)) };
+    }
+    return reading;
   }
 
   /**

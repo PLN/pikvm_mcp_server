@@ -17,7 +17,9 @@
  * Any other tool call on the device suspends it while the call runs and
  * for `suspendSeconds` after the call ends; then it resumes by itself.
  * Input is also skipped while this server's own HID input is in flight,
- * draining or held, and while auto-calibration holds the device.
+ * draining or held, and while auto-calibration holds the device. Every
+ * poll also reads the video signal, which keeps the screen on-time in
+ * pikvm_status current.
  * State is in memory: a server restart stops it.
  */
 
@@ -58,6 +60,8 @@ export interface KeepAwakeTarget {
   hidInactivitySeconds(): Promise<number | null>;
   /** True while this client's HID input is in flight, draining or held. */
   hidBusy(): boolean;
+  /** Read the video signal, for the screen on-time in pikvm_status. Never throws. */
+  observeSignal(): Promise<void>;
   /**
    * Send one input. Mouse x and y are shares of the screen, 0 to 1.
    * `mayPost` is checked synchronously right before every POST; when it
@@ -213,6 +217,7 @@ export class KeepAwake {
     if (!options || this.polling) return;
     this.polling = true;
     try {
+      await this.target.observeSignal();
       const skip = this.skipReason();
       if (skip) {
         this.lastSkip = skip;
