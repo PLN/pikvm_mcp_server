@@ -1,0 +1,4 @@
+# Modified 2026-10 by PLN: Docker image (GPL-3.0; see NOTICE).
+# A CRLF checkout must not turn the entrypoint into /bin/sh^M.
+*.sh text eol=lf
+Dockerfile text eol=lf

@@ -1,0 +1,37 @@
+# Modified 2026-10 by PLN: Docker image (GPL-3.0; see NOTICE).
+#
+# Not yet published: the first image release is still to come.
+#
+# Quick start: write secrets into the volume (umask 077; at least 32
+# random bytes for the bearer, e.g. openssl rand -hex 32), then
+#   docker compose run --rm pikvm-mcp pin default
+# and compare the fingerprint with the PiKVM web UI, then
+#   docker compose up -d
+# PIKVM_HOST and other settings can come from an optional .env here.
+# A registry in /data/devices.json needs no PIKVM_HOST.
+services:
+  pikvm-mcp:
+    image: ghcr.io/pln/pikvm_mcp_server:0.3.0   # pin X.Y.Z or @sha256 in production
+    restart: unless-stopped
+    user: "10001:10001"               # "$(id -u):$(id -g)" for a bind-mounted ./data
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 512m                   # starting values
+    pids_limit: 128
+    stop_grace_period: 30s
+    env_file:
+      - path: .env
+        required: false
+    ports: ["127.0.0.1:8675:8675"]    # loopback only with Docker Engine 28 or later
+    environment:
+      PIKVM_MCP_PORT: "8675"
+      PIKVM_TLS_MODE: pin
+      # PIKVM_MCP_ARM_HID: "1"
+      # PIKVM_MCP_ARM_MSD: "1"
+    volumes:
+      - pikvm-data:/data
+      # - /srv/isos:/data/images:ro   # optional: large ISOs elsewhere
+volumes:
+  pikvm-data:
