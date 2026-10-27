@@ -60,9 +60,19 @@ export interface KeepAwakeTarget {
   hidBusy(): boolean;
   /**
    * Send one input. Mouse x and y are shares of the screen, 0 to 1.
+   * `mayPost` is checked synchronously right before every POST; when it
+   * is false the rest is not sent and KeepAwakeCancelled is thrown.
    * Returns how it was sent: an absolute move, a relative one, or a key.
    */
-  sendKeepAwake(input: KeepAwakeInput): Promise<'absolute' | 'relative' | 'key'>;
+  sendKeepAwake(input: KeepAwakeInput, mayPost: () => boolean): Promise<'absolute' | 'relative' | 'key'>;
+}
+
+/** A tool call started, or keep-awake stopped, before keep-awake's input was sent. */
+export class KeepAwakeCancelled extends Error {
+  constructor() {
+    super('cancelled before sending');
+    this.name = 'KeepAwakeCancelled';
+  }
 }
 
 export interface KeepAwakeAction {
@@ -109,7 +119,14 @@ export class KeepAwake {
   private actions = 0;
   private lastAction: KeepAwakeAction | null = null;
   private lastSkip: string | undefined;
-  private flip = false;
+  /** Alternates the input kind in mixed mode. */
+  private turn = false;
+  /** Alternates the two pointer points, on every mouse input. */
+  private point = false;
+  /** Bumped by start and stop; an action from an older run sends and records nothing. */
+  private generation = 0;
+  /** When this server last saw input it knows of: its own keep-awake input and tool calls. Epoch ms. */
+  private lastKnownInput = 0;
   private polling = false;
   private isBusy: () => boolean = () => false;
 
@@ -121,19 +138,22 @@ export class KeepAwake {
   /** Start, or restart with new options. `isBusy` reports auto-calibration. */
   start(options: KeepAwakeOptions, isBusy: () => boolean): KeepAwakeState {
     this.stopTimer();
+    this.generation += 1;
     this.options = { ...options };
     this.isBusy = isBusy;
     this.startedAt = new Date().toISOString();
     this.actions = 0;
     this.lastAction = null;
     this.lastSkip = undefined;
-    this.flip = false;
+    this.turn = false;
+    this.point = false;
     this.schedule();
     return this.state();
   }
 
   stop(): KeepAwakeState {
     this.stopTimer();
+    this.generation += 1;
     const state = this.state();
     this.options = null;
     this.startedAt = null;
@@ -152,6 +172,7 @@ export class KeepAwake {
   /** That call ended. Suspension runs `suspendSeconds` from now. */
   callEnded(): void {
     this.activeCalls = Math.max(0, this.activeCalls - 1);
+    this.lastKnownInput = Date.now();
     if (!this.options) return;
     const until = Date.now() + this.options.suspendSeconds * this.timing().secondMs;
     this.suspendedUntil = Math.max(this.suspendedUntil, until);
@@ -197,19 +218,22 @@ export class KeepAwake {
         this.lastSkip = skip;
         return;
       }
-      const idle = await this.target.hidInactivitySeconds();
-      // Somebody gave input within the interval: nothing to do yet.
-      if (idle !== null && idle < options.intervalSeconds) {
-        this.lastSkip = undefined;
+      const generation = this.generation;
+      const kvmdIdle = await this.target.hidInactivitySeconds();
+      // Without kvmd's timer, fall back to the input this server knows of:
+      // at most one input per interval, though a web viewer's input is unseen.
+      const idle = kvmdIdle ?? (Date.now() - this.lastKnownInput) / this.timing().secondMs;
+      if (idle < options.intervalSeconds) {
+        this.lastSkip = kvmdIdle === null ? 'kvmd does not report inactivity; using this server\'s own input times' : undefined;
         return;
       }
       // Checked again: a tool call may have started during the read.
       const late = this.skipReason();
-      if (late || this.options !== options) {
+      if (late || generation !== this.generation) {
         if (late) this.lastSkip = late;
         return;
       }
-      await this.act(options);
+      await this.act(options, generation, kvmdIdle === null);
     } catch (err) {
       this.lastAction = {
         at: new Date().toISOString(),
@@ -230,22 +254,30 @@ export class KeepAwake {
     return undefined;
   }
 
-  private async act(options: KeepAwakeOptions): Promise<void> {
-    this.flip = !this.flip;
-    const useKey = options.mode === 'keyboard' || (options.mode === 'mixed' && this.flip);
+  private async act(options: KeepAwakeOptions, generation: number, ownTimes: boolean): Promise<void> {
+    this.turn = !this.turn;
+    const useKey = options.mode === 'keyboard' || (options.mode === 'mixed' && this.turn);
     let input: KeepAwakeInput;
     if (useKey) {
       input = { kind: 'key', key: KEEP_AWAKE_KEY };
     } else {
+      this.point = !this.point;
       const centre = quadrantCentre(options.quadrant);
-      const offset = this.flip ? POINT_OFFSET : -POINT_OFFSET;
+      const offset = this.point ? POINT_OFFSET : -POINT_OFFSET;
       input = { kind: 'mouse', x: centre.x + offset, y: centre.y + offset };
     }
     const at = new Date().toISOString();
+    // Right before each POST: no tool call started, no suspension, same run.
+    const mayPost = () => generation === this.generation
+      && this.activeCalls === 0
+      && Date.now() >= this.suspendedUntil
+      && !this.isBusy();
     try {
-      const sent = await this.target.sendKeepAwake(input);
+      const sent = await this.target.sendKeepAwake(input, mayPost);
+      if (generation !== this.generation) return;
       this.actions += 1;
-      this.lastSkip = undefined;
+      this.lastKnownInput = Date.now();
+      this.lastSkip = ownTimes ? 'kvmd does not report inactivity; using this server\'s own input times' : undefined;
       this.lastAction = {
         at,
         input: input.kind === 'key'
@@ -256,6 +288,11 @@ export class KeepAwake {
         ok: true,
       };
     } catch (err) {
+      if (generation !== this.generation) return;
+      if (err instanceof KeepAwakeCancelled) {
+        this.lastSkip = 'a tool call started before the input was sent';
+        return;
+      }
       this.lastAction = {
         at,
         input: input.kind === 'key' ? `key ${input.key}` : 'mouse move',

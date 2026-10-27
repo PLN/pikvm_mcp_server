@@ -163,7 +163,7 @@ import {
   hidDelayQueryValue,
 } from '../hid-deadline.js';
 import { CaptureSession, HeldInputError, HidBusyError, HidGate } from './capture-session.js';
-import { KeepAwake, type KeepAwakeInput } from '../keep-awake.js';
+import { KeepAwake, KeepAwakeCancelled, type KeepAwakeInput } from '../keep-awake.js';
 import { capKvmdField, redactSecrets } from '../redact.js';
 import { redactError, redactUrl } from '../url-policy.js';
 import {
@@ -1422,6 +1422,10 @@ export class PiKVMClient {
   private readonly capture: CaptureSession;
   /** Keeps the attached computer awake until stopped. Shared by every MCP session. */
   readonly keepAwake: KeepAwake;
+  /** A keep-awake input under way. Tool HID posts wait for it, so its input stays whole. */
+  private keepAwakeAction: Promise<unknown> | null = null;
+  /** Set only while keep-awake starts a request; read synchronously at request entry. */
+  private sendingKeepAwake = false;
 
   constructor(config: PiKVMConfig) {
     const base = {
@@ -1475,7 +1479,7 @@ export class PiKVMClient {
     this.keepAwake = new KeepAwake({
       hidInactivitySeconds: () => this.hidInactivitySeconds(),
       hidBusy: () => this.hidGate.busy(),
-      sendKeepAwake: (input) => this.sendKeepAwake(input),
+      sendKeepAwake: (input, mayPost) => this.sendKeepAwake(input, mayPost),
     }, () => keepAwakeTimings.get(this) ?? { pollMs: 5_000, secondMs: 1000 });
   }
 
@@ -1538,6 +1542,10 @@ export class PiKVMClient {
     signal?: AbortSignal,
   ): Promise<T> {
     if (!isHidPost(method, path)) return this.requestRetrying<T>(method, path, body, contentType, timeoutMs, signal);
+    // A tool's input waits for a keep-awake input that has started.
+    if (!this.sendingKeepAwake) {
+      while (this.keepAwakeAction) await this.keepAwakeAction.catch(() => undefined);
+    }
     await this.hidGate.enter();
     const change = heldInputChange(path);
     try {
@@ -2091,20 +2099,48 @@ export class PiKVMClient {
    * resolution and works while the display is dark. A relative mouse gets
    * a small move there and back.
    */
-  private async sendKeepAwake(input: KeepAwakeInput): Promise<'absolute' | 'relative' | 'key'> {
+  private async sendKeepAwake(
+    input: KeepAwakeInput,
+    mayPost: () => boolean,
+  ): Promise<'absolute' | 'relative' | 'key'> {
+    // The first POST goes out only when mayPost holds, checked after every
+    // await, so it cannot land inside a tool call's input. From then on the
+    // action is whole: tool HID posts wait in request() until it ends.
+    let action: Promise<unknown> | null = null;
+    const send = (path: string) => {
+      this.sendingKeepAwake = true;
+      try {
+        return this.request('POST', path);
+      } finally {
+        this.sendingKeepAwake = false;
+      }
+    };
+    const begin = (sequence: () => Promise<void>) => {
+      if (!mayPost()) throw new KeepAwakeCancelled();
+      action = sequence();
+      this.keepAwakeAction = action;
+      return action.finally(() => {
+        if (this.keepAwakeAction === action) this.keepAwakeAction = null;
+      });
+    };
     if (input.kind === 'key') {
-      await this.request('POST', `/hid/events/send_key?${new URLSearchParams({ key: input.key })}`);
+      await begin(async () => {
+        await send(`/hid/events/send_key?${new URLSearchParams({ key: input.key })}`);
+      });
       return 'key';
     }
     const hid = await this.request<{ result?: { mouse?: { absolute?: unknown } } }>('GET', '/hid');
     if (hid?.result?.mouse?.absolute === false) {
-      for (const delta of ['5', '-5']) {
-        await this.request('POST', `/hid/events/send_mouse_relative?${new URLSearchParams({ delta_x: delta, delta_y: delta })}`);
-      }
+      await begin(async () => {
+        await send(`/hid/events/send_mouse_relative?${new URLSearchParams({ delta_x: '5', delta_y: '5' })}`);
+        await send(`/hid/events/send_mouse_relative?${new URLSearchParams({ delta_x: '-5', delta_y: '-5' })}`);
+      });
       return 'relative';
     }
     const toHid = (share: number) => String(Math.round(HID_MOUSE_MIN + Math.min(1, Math.max(0, share)) * (HID_MOUSE_MAX - HID_MOUSE_MIN)));
-    await this.request('POST', `/hid/events/send_mouse_move?${new URLSearchParams({ to_x: toHid(input.x), to_y: toHid(input.y) })}`);
+    await begin(async () => {
+      await send(`/hid/events/send_mouse_move?${new URLSearchParams({ to_x: toHid(input.x), to_y: toHid(input.y) })}`);
+    });
     return 'absolute';
   }
 

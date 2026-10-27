@@ -1414,6 +1414,10 @@ No code from another pikvm_mcp_server fork was added for these methods.
   Any other tool call on the device pauses it while the call runs and
   for suspendSeconds after it ends, and then it resumes. It skips while
   this server's input is in flight, draining or held, and during
-  auto-calibration. HID arm-gated, and kept in memory. The modes, the
-  quadrant and the suspension follow the owner's design.
+  auto-calibration. Its input goes out only when no tool call has
+  started, checked right before each send, and a tool's input waits for
+  a keep-awake input that has started. Without kvmd's inactivity it
+  falls back to this server's own input times. HID arm-gated, and kept
+  in memory. The modes, the quadrant and the suspension follow the
+  owner's design.
   No code from another pikvm_mcp_server fork was copied.

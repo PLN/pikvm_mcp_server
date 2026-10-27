@@ -115,6 +115,61 @@ test('held input and auto-calibration pause it', async () => {
   });
 });
 
+test('keep-awake input never lands inside a tool call, and a stopped run sends nothing', async () => {
+  // A tool call that starts while keep-awake reads the mouse mode stops its move.
+  await withClient({ routes: { 'GET /api/hid': { delayMs: 150, status: 200, body: { ok: true, result: { online: true, keyboard: { online: true }, mouse: { absolute: true, online: true } } } } } }, async ({ mock, client }) => {
+    client.keepAwake.start(options(), () => false);
+    await waitUntil(() => mock.calls.some((c) => c.path === '/api/hid'));
+    client.keepAwake.callStarted();
+    await sleep(250);
+    assert.equal(moves(mock).length, 0);
+    // The move would have followed the slow read; later polls then see the running call.
+    assert.match(client.keepAwake.state().lastSkip, /tool call/);
+    client.keepAwake.callEnded();
+  });
+
+  // Stopping while the mouse mode is read: no move afterwards, nothing counted.
+  await withClient({ routes: { 'GET /api/hid': { delayMs: 150, status: 200, body: { ok: true, result: { online: true, keyboard: { online: true }, mouse: { absolute: true, online: true } } } } } }, async ({ mock, client }) => {
+    client.keepAwake.start(options(), () => false);
+    await waitUntil(() => mock.calls.some((c) => c.path === '/api/hid'));
+    client.keepAwake.stop();
+    await sleep(250);
+    assert.equal(moves(mock).length, 0);
+    assert.equal(client.keepAwake.state().actions, 0);
+  });
+
+  // A relative move and its way back stay together: a click that comes in between waits.
+  await withClient({
+    mouseAbsolute: false,
+    routes: { 'POST /api/hid/events/send_mouse_relative': { delayMs: 150, status: 200, body: { ok: true, result: {} }, failTimes: 1 } },
+  }, async ({ mock, client }) => {
+    client.keepAwake.start(options(), () => false);
+    await waitUntil(() => mock.calls.some((c) => c.path === '/api/hid/events/send_mouse_relative'));
+    await client.mouseClick('left');
+    const order = mock.calls
+      .filter((c) => c.path === '/api/hid/events/send_mouse_relative' || c.path === '/api/hid/events/send_mouse_button')
+      .map((c) => c.path.split('_').at(-1));
+    assert.deepEqual(order.slice(0, 4), ['relative', 'relative', 'button', 'button']);
+  });
+});
+
+test('without kvmd inactivity it acts once per interval; mixed mode still alternates the points', async () => {
+  await withClient({ routes: { 'GET /api/hid/inactivity': { status: 404, body: { ok: false } } } }, async ({ mock, client }) => {
+    client.keepAwake.start(options(), () => false);
+    await waitUntil(() => moves(mock).length >= 3);
+    const seen = moves(mock);
+    for (let i = 1; i < seen.length; i += 1) assert.ok(seen[i].at - seen[i - 1].at >= 90, 'not every poll');
+    assert.match(client.keepAwake.state().lastSkip, /kvmd does not report inactivity/);
+  });
+
+  await withClient({}, async ({ mock, client }) => {
+    client.keepAwake.start(options({ mode: 'mixed' }), () => false);
+    await waitUntil(() => moves(mock).length >= 2, 5000);
+    const [a, b] = moves(mock);
+    assert.notEqual(a.x, b.x, 'mouse turns in mixed mode alternate between the two points');
+  });
+});
+
 test('through the server: a toggle, paused by another tool call, then resumed; disarmed is refused', async () => {
   const mock = await startKvmdMock({ inactivitySecondMs: SECOND_MS });
   const pikvm = new PiKVMClient({ host: mock.url, username: 'admin', password: 'testpw', verifySsl: false });
