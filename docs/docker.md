@@ -1,5 +1,6 @@
 <!-- Modified 2026-10 by PLN: Docker guide (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: the image is published; verify and build sections (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: image 0.3.1; gh attestation verify needs a login (GPL-3.0; see NOTICE) -->
 
 # Running the server in Docker
 
@@ -38,7 +39,7 @@ HID and MSD tools stay disarmed in HTTP mode until you set `PIKVM_MCP_ARM_HID: "
 An MCP client can start the container itself:
 
 ```bash
-claude mcp add pikvm -- docker run -i --rm --read-only --cap-drop ALL -v pikvm-data:/data -e PIKVM_HOST=https://pikvm.example.net ghcr.io/pln/pikvm_mcp_server:0.3.0
+claude mcp add pikvm -- docker run -i --rm --read-only --cap-drop ALL -v pikvm-data:/data -e PIKVM_HOST=https://pikvm.example.net ghcr.io/pln/pikvm_mcp_server:0.3.1
 ```
 
 Stdout carries only the protocol; logs go to stderr. The process exits when the client closes stdin. **stdio has no process-level arm gate: `PIKVM_MCP_ARM_HID` and `PIKVM_MCP_ARM_MSD` do not apply, and HID and MSD tools are armed** unless a registry device sets `armHid` or `armMsd` to `false`. The password comes from `/data/secrets/pikvm-password` in that volume. Compose prefixes its volumes with the project name (for example `pikvm_mcp_server_pikvm-data`), so `pikvm-data` here is a separate volume unless you name the Compose one.
@@ -195,10 +196,10 @@ Pin `X.Y.Z` (or `@sha256:...`) in production. Upgrade with `docker compose pull 
 
 ## Verifying an image
 
-Each release carries a build provenance attestation made by the release workflow:
+Each release carries a build provenance attestation made by the release workflow. `gh` must be logged in (`gh auth login` with any GitHub account, or `GH_TOKEN`), even though the image is public:
 
 ```bash
-gh attestation verify oci://ghcr.io/pln/pikvm_mcp_server:0.3.0 --repo PLN/pikvm_mcp_server --signer-workflow PLN/pikvm_mcp_server/.github/workflows/release.yml
+gh attestation verify oci://ghcr.io/pln/pikvm_mcp_server:0.3.1 --repo PLN/pikvm_mcp_server --signer-workflow PLN/pikvm_mcp_server/.github/workflows/release.yml
 ```
 
 Check the signer workflow and repository. The source commit is in the image's `org.opencontainers.image.revision` label and the matching `vX.Y.Z` git tag.
