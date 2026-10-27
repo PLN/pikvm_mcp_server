@@ -524,11 +524,13 @@ export function findTextMatches(
 ): TextMatch[] {
   const tokens = phrase.split(/\s+/).map(normalizeWord).filter((token) => token !== '');
   if (tokens.length === 0) return [];
-  const normalized = words.map((word) => normalizeWord(word.text));
+  // Punctuation-only words ("&", "-") are skipped, as they are in the phrase.
+  const kept = words.map((word, index) => ({ index, norm: normalizeWord(word.text) })).filter((w) => w.norm !== '');
   const matches: TextMatch[] = [];
-  for (let i = 0; i + tokens.length <= words.length; i += 1) {
-    if (!tokens.every((token, k) => normalized[i + k] === token)) continue;
-    const group = words.slice(i, i + tokens.length);
+  for (let i = 0; i + tokens.length <= kept.length; i += 1) {
+    if (!tokens.every((token, k) => kept[i + k].norm === token)) continue;
+    // The words as on screen, punctuation included, from the first match to the last.
+    const group = words.slice(kept[i].index, kept[i + tokens.length - 1].index + 1);
     const left = Math.min(...group.map((w) => w.bbox.left));
     const top = Math.min(...group.map((w) => w.bbox.top));
     const right = Math.max(...group.map((w) => w.bbox.left + w.bbox.width));
@@ -1519,17 +1521,18 @@ export function createMcpServer(deps: McpServerDeps): Server {
       if (!ctx) throw new Error(`Unknown tool: ${name}`);
       const active = ctx;
 
-      const deviceScreenshot = () => deviceClient.screenshot({
+      const deviceScreenshot = (signalWaitMs?: number) => deviceClient.screenshot({
         maxWidth: active.screenshot.maxWidth,
         maxHeight: active.screenshot.maxHeight,
         quality: active.screenshot.quality,
+        ...(signalWaitMs !== undefined ? { signalWaitMs } : {}),
       });
       /**
        * After PIKVM_NO_SIGNAL with a connected computer: press the wake
        * key once and wait for the picture. Rethrows anything else, and
        * never presses when USB is offline or HID is disarmed.
        */
-      const wakeDisplay = async (error: unknown): Promise<string> => {
+      const wakeDisplay = async (error: unknown, maxWaitMs = WAKE_SIGNAL_WAIT_MS): Promise<string> => {
         if (!(error instanceof KvmdError) || error.type !== 'PIKVM_NO_SIGNAL' || error.reason === 'usb_offline') throw error;
         if (!active.armHid) {
           error.message += '. wake did not press a key: HID is disarmed';
@@ -1539,9 +1542,9 @@ export function createMcpServer(deps: McpServerDeps): Server {
         }
         return deviceClient.holdingCapture(async () => {
           await deviceClient.sendKey(WAKE_KEY);
-          const signal = await deviceClient.waitForSignal(WAKE_SIGNAL_WAIT_MS);
+          const signal = await deviceClient.waitForSignal(maxWaitMs);
           if (!signal.online) {
-            error.message += `. Pressed ${WAKE_KEY}; still no picture after ${WAKE_SIGNAL_WAIT_MS / 1000} s`;
+            error.message += `. Pressed ${WAKE_KEY}; still no picture after ${Math.round(maxWaitMs / 100) / 10} s`;
             error.next = undefined;
             throw error;
           }
@@ -1549,12 +1552,15 @@ export function createMcpServer(deps: McpServerDeps): Server {
         });
       };
       /** Host or kvmd OCR as configured, over a box in screenshot pixels or the whole screen. */
-      const runOcr = (box: ReturnType<typeof parseOcrBox>) => {
+      const runOcr = (box: ReturnType<typeof parseOcrBox>, budgetMs?: number) => {
         const described = deviceClient.describeFrame();
         const calibration = deviceClient.getCalibration();
         return executeOcr({
           deviceName: active.name,
-          runtime: ocrRuntime,
+          // A wait gives each look only the time it has left.
+          runtime: budgetMs === undefined
+            ? ocrRuntime
+            : { ...ocrRuntime, timeoutMs: Math.max(1, Math.min(ocrRuntime.timeoutMs, Math.round(budgetMs))) },
           override: active.ocr,
           engineArg: undefined,
           langsArg: undefined,
@@ -1655,18 +1661,22 @@ export function createMcpServer(deps: McpServerDeps): Server {
           const box = parseOcrBox({ left: args.left, top: args.top, right: args.right, bottom: args.bottom });
           const started = Date.now();
           const deadline = started + timeoutSeconds * 1000;
+          const left = () => Math.max(0, deadline - Date.now());
           let checks = 0;
           let woke = '';
+          let wakeTried = false;
           let baseline: Buffer | null = null;
           let lastShot: ScreenshotResult | null = null;
           let lastText = '';
+          // Each look gets only the time left, so the wait ends near its deadline.
+          // A look that started in time and matched still counts.
           for (;;) {
             checks += 1;
             let matched = false;
             let at: { x: number; y: number } | undefined;
             try {
               if (condition === 'text' || condition === 'gone') {
-                const ocr = await runOcr(box);
+                const ocr = await runOcr(box, Math.max(1000, left()));
                 lastText = ocr.text;
                 const present = normalizeText(ocr.text).includes(normalizeText(wanted));
                 matched = condition === 'text' ? present : !present;
@@ -1675,29 +1685,38 @@ export function createMcpServer(deps: McpServerDeps): Server {
                   if (found.length > 0) at = found[0].screen;
                 }
               } else {
-                lastShot = await deviceScreenshot();
+                lastShot = await deviceScreenshot(Math.max(250, left()));
                 if (condition === 'signal') matched = true;
                 else if (baseline === null) baseline = lastShot.buffer;
                 else matched = (await changedShare(baseline, lastShot.buffer)) >= CHANGED_SHARE;
               }
             } catch (error) {
-              // A dark screen is a look without an answer; wake it once when asked.
+              // A dark screen is a look without an answer. With wake, one key
+              // press at most; a wake that brings no picture does not end the wait.
               if (!(error instanceof KvmdError && error.type === 'PIKVM_NO_SIGNAL')) throw error;
-              if (wake && !woke && error.reason !== 'usb_offline') woke = await wakeDisplay(error);
+              if (wake && !wakeTried && error.reason !== 'usb_offline' && left() > 0) {
+                wakeTried = true;
+                try {
+                  woke = await wakeDisplay(error, Math.min(WAKE_SIGNAL_WAIT_MS, left()));
+                } catch (wakeError) {
+                  woke = `Wake did not bring a picture: ${wakeError instanceof Error ? wakeError.message : String(wakeError)}. `;
+                }
+              }
             }
             if (matched) {
               const seconds = ((Date.now() - started) / 1000).toFixed(1);
               const what = condition === 'text'
                 ? `"${wanted}" is on screen${at ? ` at screen (${at.x}, ${at.y})` : ''}`
                 : condition === 'gone' ? `"${wanted}" is gone` : condition === 'signal' ? 'there is a picture' : 'the screen changed';
-              const shot = condition === 'signal' || condition === 'changed' ? lastShot! : await deviceScreenshot();
+              const shot = condition === 'signal' || condition === 'changed' ? lastShot! : await deviceScreenshot(1000);
               return { content: screenshotBlocks(shot, `${woke}Waited ${seconds} s (${checks} looks): ${what}. `) };
             }
-            if (Date.now() + intervalMs > deadline) break;
-            await new Promise((resolve) => setTimeout(resolve, intervalMs));
+            if (left() <= 0) break;
+            await new Promise((resolve) => setTimeout(resolve, Math.min(intervalMs, left())));
           }
           const details: Record<string, unknown> = { condition, checks, timeoutSeconds };
           if (condition === 'text' || condition === 'gone') details.lastText = lastText.slice(0, 2000);
+          if (woke) details.wake = woke.trim();
           const missed = new IntentError(
             'PIKVM_WAIT_TIMEOUT',
             `${condition === 'text' ? `"${wanted}" did not appear` : condition === 'gone' ? `"${wanted}" did not go away`
@@ -1707,7 +1726,8 @@ export function createMcpServer(deps: McpServerDeps): Server {
           const text = redactToolText(missed, fleet.passwords);
           let image: ResultBlock[] = [];
           try {
-            image = screenshotBlocks(lastShot ?? await deviceScreenshot(), 'Last look: ').slice(1);
+            // The last look's image, or one short look: the deadline has passed.
+            image = screenshotBlocks(lastShot ?? await deviceScreenshot(250), 'Last look: ').slice(1);
           } catch {
             // No picture to show.
           }

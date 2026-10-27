@@ -147,6 +147,39 @@ test('wait_for: text that appears, a timeout with the last look, a screen that c
   });
 });
 
+test('wait_for keeps to its timeout, looks more than once, and keeps waiting after a failed wake', async () => {
+  // Cold, dark capture: the first look must not take its own 10 s signal wait.
+  await withServer({ mockOptions: { capture: { running: false, signal: false } } }, async ({ call }) => {
+    const started = Date.now();
+    const result = await call('pikvm_wait_for', { signal: true, timeoutSeconds: 1 });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /PIKVM_WAIT_TIMEOUT/);
+    assert.ok(Date.now() - started < 3000, `took ${Date.now() - started} ms`);
+  });
+
+  // A 1 s wait with the default 1 s interval still gets a second look.
+  await withServer({}, async ({ call }) => {
+    const started = Date.now();
+    const result = await call('pikvm_wait_for', { changed: true, timeoutSeconds: 1 });
+    assert.equal(result.isError, true);
+    const details = JSON.parse(result.content[0].text.split('\n').at(-1));
+    assert.ok(details.checks >= 2, `${details.checks} looks`);
+    assert.ok(Date.now() - started >= 900);
+  });
+
+  // F15 brings no picture: one key press, then the wait goes on to its timeout.
+  await withServer({ mockOptions: { capture: { running: true, signal: false } } }, async ({ mock, call }) => {
+    const started = Date.now();
+    const result = await call('pikvm_wait_for', { signal: true, wake: true, timeoutSeconds: 3, intervalMs: 250 });
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /^Error \[PIKVM_WAIT_TIMEOUT\]: no picture appeared within 3 s/);
+    const details = JSON.parse(result.content[0].text.split('\n').at(-1));
+    assert.match(details.wake, /Wake did not bring a picture/);
+    assert.deepEqual(keysSent(mock), ['F15']);
+    assert.ok(Date.now() - started >= 2500, 'waited out its timeout');
+  });
+});
+
 test('click_text: a phrase over two lines, ambiguous text, nth, and text that is not there', async () => {
   const words = [
     word('Recycle', 88, 61, 38, 12),
@@ -155,6 +188,9 @@ test('click_text: a phrase over two lines, ambiguous text, nth, and text that is
     word('Windows', 612, 74, 56, 12),
     word('OK', 900, 500),
     word('OK', 900, 700),
+    word('Save', 300, 900, 40, 12),
+    word('&', 345, 900, 10, 12),
+    word('Close', 360, 900, 40, 12),
   ];
   await withServer({ recognize: async () => ({ words }) }, async ({ mock, call }) => {
     const clicked = await call('pikvm_click_text', { text: 'update windows' });
@@ -176,6 +212,10 @@ test('click_text: a phrase over two lines, ambiguous text, nth, and text that is
     const second = await call('pikvm_click_text', { text: 'OK', nth: 2, observe: false });
     assert.equal(second.content.length, 1);
     assert.match(second.content[0].text, /at screen \(920, 706\) \(match 2 of 2\)/);
+
+    // OCR keeps "&" as its own word; it is skipped like the query's "&".
+    const saved = await call('pikvm_click_text', { text: 'Save & Close', observe: false });
+    assert.equal(saved.content[0].text, 'Clicked "Save & Close" at screen (350, 906).');
 
     const missing = await call('pikvm_click_text', { text: 'Cancel' });
     assert.equal(missing.isError, true);
