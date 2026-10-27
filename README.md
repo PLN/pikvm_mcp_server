@@ -46,6 +46,7 @@
 <!-- Modified 2026-10 by PLN: capture start, no signal, and relative moves on an absolute mouse (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: situation-first errors, no-signal cause, coordinate wording, plain-text OCR (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: pikvm_keep_awake (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: pikvm_status (GPL-3.0; see NOTICE) -->
 
 # PiKVM MCP Server
 
@@ -493,6 +494,22 @@ Or if using the .env file:
 ```
 
 ## Available Tools
+
+### Status
+- **`pikvm_status`** - What state each device is in, read-only (optional: device; omitted means every device)
+
+`pikvm_status` reads each device's streamer, HID and media state and its HID inactivity, all in parallel. It starts no capture, opens no stream session, sends no input and does not pause keep-awake. It works during auto-calibration. Each device gets a one-line verdict, a few readable lines, and the same data as JSON on the last line and in `structuredContent`:
+
+- **verdict**: `ready`; `ready; capture is stopped and starts on the next screenshot`; `display asleep: press a key`; `no computer: its USB keyboard and mouse are offline (off, suspended or unplugged)`; or `unreachable: <type>`.
+- **picture**: `visible` (with resolution and fps), `display_asleep`, `usb_offline`, `capture_stopped` or `unknown`.
+- **screen**: the signal state as this server last saw it (`on`, `off` or `capture stopped`), since when, and when it last checked. kvmd keeps no history, so this comes from this server's own reads: captures, status calls and, while keep-awake is on, every keep-awake poll.
+- **input**: whether the USB keyboard and mouse are online, whether the mouse is absolute or relative, keys and buttons this server holds, and whether HID is armed.
+- **idle**: kvmd's seconds since any keyboard or mouse input (`GET /api/hid/inactivity`, all sources, including keep-awake and kvmd's jiggler), and this server's last keyboard and last mouse input from tools. Keep-awake input does not count there; it is under keepAwake.
+- **keepAwake**: on or off, mode, quadrant, interval, whether and until when it is paused, inputs sent, the last input and its result.
+- **captureSession**: this server's stream session, open or not, and when an idle one closes.
+- **media**: the MSD drive (image, connected, cdrom, rw), and whether MSD is armed.
+
+ATX is not reported: this server has no ATX tools.
 
 ### Display
 - **`pikvm_screenshot`** - Capture the screen as a JPEG preview (optional: maxWidth, maxHeight, quality, region). Defaults are 960×600 at quality 70.

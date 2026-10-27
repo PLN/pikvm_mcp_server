@@ -81,6 +81,7 @@ Modified 2026-10 by PLN: start idle capture, report no signal, refuse dropped re
 Modified 2026-10 by PLN: version 0.3.1 (GPL-3.0; see below).
 Modified 2026-10 by PLN: situation-first errors, no-signal cause, plain-text OCR (GPL-3.0; see below).
 Modified 2026-10 by PLN: pikvm_keep_awake (GPL-3.0; see below).
+Modified 2026-10 by PLN: pikvm_status (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -1420,4 +1421,15 @@ No code from another pikvm_mcp_server fork was added for these methods.
   falls back to this server's own input times. HID arm-gated, and kept
   in memory. The modes, the quadrant and the suspension follow the
   owner's design.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  pikvm_status reports each device read-only: a verdict, the picture,
+  the screen on-time as this server saw it, keyboard and mouse online
+  state and mouse mode, held input, kvmd's HID inactivity and this
+  server's last keyboard and mouse input (keep-awake counted
+  separately), keep-awake state, the capture session and media. It
+  starts no capture, sends no input and does not pause keep-awake.
+  Keep-awake reads the signal on every poll, which keeps the screen
+  on-time current.
   No code from another pikvm_mcp_server fork was copied.
