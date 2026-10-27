@@ -232,9 +232,10 @@ check S12 "pin mode without a pin file exits 78 naming pin default" \
 # S13: OCR.
 check S13 "tesseract has eng" bash -c "docker run --rm --entrypoint tesseract '$IMAGE' --list-langs 2>&1 | grep -qx eng"
 d=$(newdata s13); own_data "$d"
-tools=$($MCP tools -- docker run -i --rm --label "$LABEL" --read-only --cap-drop ALL -v "$d:/data" \
-  -e PIKVM_HOST=https://kvm.invalid -e PIKVM_PASSWORD=dummy -e PIKVM_OCR_ENGINE=off "$IMAGE" 2>/dev/null) || true
-check S13 "PIKVM_OCR_ENGINE=off hides pikvm_read_text" lacks "$tools" pikvm_read_text
+rc=0; tools=$($MCP tools -- docker run -i --rm --label "$LABEL" --read-only --cap-drop ALL -v "$d:/data" \
+  -e PIKVM_HOST=https://kvm.invalid -e PIKVM_PASSWORD=dummy -e PIKVM_OCR_ENGINE=off "$IMAGE" 2>/dev/null) || rc=$?
+ocr_off() { [ "$rc" -eq 0 ] && has "$tools" pikvm_screenshot && lacks "$tools" pikvm_read_text; }
+check S13 "PIKVM_OCR_ENGINE=off answers tools/list without pikvm_read_text" ocr_off
 rc=0; out=$(run -v "$d:/data" -e PIKVM_HOST=https://kvm.invalid -e PIKVM_PASSWORD=dummy -e PIKVM_OCR_ENGINE=host \
   -e PIKVM_OCR_TESSERACT_BIN=/nonexistent/tesseract "$IMAGE" </dev/null 2>&1) || rc=$?
 check S13 "a bogus tesseract path with engine host fails startup" \

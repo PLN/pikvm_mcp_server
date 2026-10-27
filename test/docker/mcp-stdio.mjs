@@ -7,8 +7,10 @@
  * Sends initialize, then tools/list or one tools/call, prints the result,
  * closes stdin and waits for the server to exit. `tools` prints one name
  * per line. `call` prints the text content, then a line isError=<bool>.
- * The server's stderr passes through. The exit code is the server's, or
- * 124 when no answer or exit came within 60 s.
+ * The server's stderr passes through. The exit code is the server's once
+ * both answers arrived. An RPC error or an exit before the second answer
+ * is exit 1 (or the server's non-zero code). No answer or exit within
+ * 60 s is 124.
  */
 
 import { spawn } from 'node:child_process';
@@ -32,7 +34,10 @@ function send(message) {
   child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', ...message })}\n`);
 }
 
+let answered = false;
+
 function done(result) {
+  answered = true;
   if (mode === 'tools') {
     for (const tool of result.tools) console.log(tool.name);
   } else {
@@ -52,23 +57,26 @@ child.stdout.on('data', (chunk) => {
     buffer = buffer.slice(newline + 1);
     if (line.trim() === '') continue;
     const message = JSON.parse(line);
-    if (message.id === 1) {
+    if (message.error) {
+      console.error(`mcp-stdio: request ${message.id} failed: ${JSON.stringify(message.error)}`);
+      child.stdin.end();
+    } else if (message.id === 1) {
       send({ method: 'notifications/initialized' });
       if (mode === 'tools') send({ id: 2, method: 'tools/list' });
       else send({ id: 2, method: 'tools/call', params: { name: toolName, arguments: JSON.parse(toolArgs ?? '{}') } });
     } else if (message.id === 2) {
-      if (message.error) {
-        console.error(`mcp-stdio: ${JSON.stringify(message.error)}`);
-        child.stdin.end();
-      } else {
-        done(message.result);
-      }
+      done(message.result);
     }
   }
 });
 child.on('exit', (code, signal) => {
   clearTimeout(timer);
-  process.exit(code ?? (signal ? 128 : 1));
+  const status = code ?? (signal ? 128 : 1);
+  if (!answered) {
+    console.error('mcp-stdio: the server exited without answering');
+    process.exit(status === 0 ? 1 : status);
+  }
+  process.exit(status);
 });
 
 send({
