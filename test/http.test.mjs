@@ -1,4 +1,5 @@
 // Modified 2026-10 by PLN: pikvm_keep_awake is HID arm-gated (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: pikvm_click_text is HID arm-gated (GPL-3.0; see NOTICE).
 
 /**
  * HTTP transport tests — run the server in-process against a mock KVMD.
@@ -277,6 +278,7 @@ test('ARM_GATED_TOOLS choke point covers every HID-mutating tool', () => {
     [
       'pikvm_auto_calibrate',
       'pikvm_calibrate',
+      'pikvm_click_text',
       'pikvm_keep_awake',
       'pikvm_key',
       'pikvm_mouse_click',

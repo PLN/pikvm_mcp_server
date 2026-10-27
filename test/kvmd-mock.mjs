@@ -20,6 +20,7 @@
 // Modified 2026-10 by PLN: idle capture, /api/ws stream sessions, GET /api/hid (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: USB keyboard and mouse online state (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: GET /api/hid/inactivity (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: a key that wakes the display (GPL-3.0; see NOTICE).
 
 /**
  * Minimal KVMD REST mock implementing exactly the routes src/pikvm/client.ts
@@ -89,7 +90,8 @@
  * is false, and an online USB keyboard and mouse unless `hidOnline` is
  * false (a host that is off or unplugged). GET /api/hid/inactivity counts
  * seconds since the last HID POST, starting long idle; `inactivitySecondMs`
- * shortens a second for tests.
+ * shortens a second for tests. `capture.wakeKey` turns the signal on when
+ * that key is sent, like a blanked display waking.
  */
 
 import crypto from 'node:crypto';
@@ -1059,6 +1061,9 @@ export async function startKvmdMock(options = {}) {
     if (await handleMsd(req, res, u)) return;
     if (req.method === 'POST') {
       if (u.pathname.startsWith('/api/hid')) lastHidAt = Date.now();
+      if (capture?.wakeKey && u.pathname === '/api/hid/events/send_key' && u.searchParams.get('key') === capture.wakeKey) {
+        capture.signal = true;
+      }
       // HID/event endpoints land here (send_mouse_button, send_mouse_move,
       // send_key, print, send_shortcut, ...). 204 = accepted, no body.
       res.writeHead(204);

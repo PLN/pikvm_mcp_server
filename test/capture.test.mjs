@@ -1,5 +1,6 @@
 // Modified 2026-10 by PLN: idle capture start, no signal, HID ordering, relative moves (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: the no-signal cause from USB state (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: the no-signal next step is a screenshot with wake (GPL-3.0; see NOTICE).
 
 /**
  * kvmd runs capture only while a stream-enabled WebSocket is connected.
@@ -65,7 +66,7 @@ test('no signal is reported at once when capture already runs, and after the wai
     await assert.rejects(client.screenshot(), (err) => {
       assert.equal(err.type, 'PIKVM_NO_SIGNAL');
       assert.equal(err.reason, 'display_asleep');
-      assert.deepEqual(err.next, { tool: 'pikvm_key', args: { key: 'ShiftLeft' } });
+      assert.deepEqual(err.next, { tool: 'pikvm_screenshot', args: { wake: true } });
       return true;
     });
     await assert.rejects(client.getResolution(true), { type: 'PIKVM_NO_SIGNAL' });

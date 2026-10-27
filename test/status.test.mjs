@@ -147,7 +147,7 @@ test('pikvm_status: verdicts, screen on-time, idle timers and keep-awake, withou
     assert.match(status.content[0].text, /Keep-awake: on, mouse in the bottom-right quadrant/);
 
     assert.equal(byName.lab2.picture.state, 'display_asleep');
-    assert.match(byName.lab2.verdict, /^display asleep: press a key/);
+    assert.match(byName.lab2.verdict, /^display asleep: pikvm_screenshot with wake: true wakes it/);
     assert.equal(byName.lab3.picture.state, 'usb_offline');
     assert.match(byName.lab3.verdict, /^no computer: its USB keyboard and mouse are offline/);
     assert.equal(byName.lab4.picture.state, 'capture_stopped');

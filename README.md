@@ -47,6 +47,7 @@
 <!-- Modified 2026-10 by PLN: situation-first errors, no-signal cause, coordinate wording, plain-text OCR (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: pikvm_keep_awake (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: pikvm_status (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: wake, observe, pikvm_wait_for, pikvm_click_text (GPL-3.0; see NOTICE) -->
 
 # PiKVM MCP Server
 
@@ -495,12 +496,24 @@ Or if using the .env file:
 
 ## Available Tools
 
+### Intent tools
+- **`pikvm_wait_for`** - Wait until text appears (`text`), text disappears (`gone`), the screen visibly changes (`changed: true`) or a picture appears (`signal: true`), then return the screenshot (optional: timeoutSeconds, intervalMs, left/top/right/bottom, wake)
+- **`pikvm_click_text`** - Find text with OCR, click its centre and return the screenshot after (required: text; optional: nth, button, double, observe, left/top/right/bottom). Needs HID armed and host OCR.
+
+`wake: true` on `pikvm_screenshot` handles a dark display in one call. When the picture is missing but the computer's USB keyboard or mouse is online, it presses F15 once, waits up to 7 s for the picture, and returns it, with a first line naming the key and the delay. F15 is in kvmd's key map and is ignored by normal applications. When capture had to be started first, it waits 3 s for a picture before pressing. It never presses when USB is offline (the computer is off, suspended or unplugged), and it needs HID armed. The `PIKVM_NO_SIGNAL` next step is this call.
+
+`observe: true` on `pikvm_key`, `pikvm_shortcut`, `pikvm_type`, `pikvm_mouse_move`, `pikvm_mouse_click` and `pikvm_mouse_scroll` adds a screenshot taken after the action to the same result, so no separate screenshot call is needed. It waits `observeDelayMs` first: 0 to 10000, default 500. For typing, the default is until kvmd should have typed the text, at most 30 s. If that screenshot fails, the action still succeeds, and the result says why there is no image.
+
+`pikvm_wait_for` takes exactly one condition. `text` and `gone` use OCR (case-insensitive, whitespace-normalised) on a box in pixels of the last screenshot, or on the whole screen when `PIKVM_OCR_ALLOW_FULL_FRAME=1`. `changed` compares each screenshot with the first one, small and in grey, and counts it changed when 0.5% of its pixels changed visibly; a clock can count. `timeoutSeconds` is 1 to 300 (default 30) and `intervalMs` 250 to 10000 (default 1000). Each look gets only the time left, so the wait ends near its deadline; a look that started in time and matches still counts. A dark screen is a look without an answer. With `wake: true` it presses the wake key at most once, and a wake that brings no picture does not end the wait. A timeout is `PIKVM_WAIT_TIMEOUT`: the details include the last recognized text, and the result carries the last screenshot. The wait is a tool call, so keep-awake stays paused during it.
+
+`pikvm_click_text` matches whole words in OCR reading order, case-insensitive, with surrounding punctuation ignored. Punctuation-only words such as `&` are skipped, so "Save & Close" matches. A phrase can span lines, so "Update Windows" matches a desktop icon label on two lines. It clicks the centre of the matched words in screen pixels, with calibration, so no screenshot or frame is needed first. With several matches and no `nth`, it refuses with `PIKVM_TEXT_AMBIGUOUS` and lists them with their positions. No match is `PIKVM_TEXT_NOT_FOUND`, with the recognized text. kvmd OCR has no word positions, so it is `PIKVM_OCR_NO_WORDS`. `observe` defaults to true here.
+
 ### Status
 - **`pikvm_status`** - What state each device is in, read-only (optional: device; omitted means every device)
 
 `pikvm_status` reads each device's streamer, HID and media state and its HID inactivity, all in parallel. Error text in it is scrubbed of every device's password. It starts no capture, opens no stream session, sends no input and does not pause keep-awake. It works during auto-calibration. Each device gets a one-line verdict, a few readable lines, and the same data as JSON on the last line and in `structuredContent`:
 
-- **verdict**: `ready`; `ready; capture is stopped and starts on the next screenshot`; `display asleep: press a key`; `no computer: its USB keyboard and mouse are offline (off, suspended or unplugged)`; `picture visible, but its USB keyboard and mouse are offline: input will not reach it`; `no picture, and the USB state could not be read`; or `unreachable: <type>`.
+- **verdict**: `ready`; `ready; capture is stopped and starts on the next screenshot`; `display asleep: pikvm_screenshot with wake: true wakes it`; `no computer: its USB keyboard and mouse are offline (off, suspended or unplugged)`; `picture visible, but its USB keyboard and mouse are offline: input will not reach it`; `no picture, and the USB state could not be read`; or `unreachable: <type>`.
 - **picture**: `visible` (with resolution and fps), `display_asleep` (the USB keyboard or mouse is online), `usb_offline` (both offline), `no_signal` (the USB state could not be read), `capture_stopped` or `unknown`.
 - **screen**: the signal state as this server last saw it (`on`, `off` or `capture stopped`), since when, and when it last checked. kvmd keeps no history, so this comes from this server's own reads: captures, status calls and, while keep-awake is on, every keep-awake poll.
 - **input**: whether the USB keyboard and mouse are online, whether the mouse is absolute or relative, keys and buttons this server holds, and whether HID is armed.
@@ -512,7 +525,7 @@ Or if using the .env file:
 ATX is not reported: this server has no ATX tools.
 
 ### Display
-- **`pikvm_screenshot`** - Capture the screen as a JPEG preview (optional: maxWidth, maxHeight, quality, region). Defaults are 960×600 at quality 70.
+- **`pikvm_screenshot`** - Capture the screen as a JPEG preview (optional: maxWidth, maxHeight, quality, region, wake). Defaults are 960×600 at quality 70.
 - **`pikvm_read_text`** - Read on-screen text. The result is the plain text; `detail: "words"` returns the full JSON with per-word boxes and click points. Host uses the system `tesseract` binary when `PIKVM_OCR_ENGINE` is unset and the startup probe finds it. `kvmd` is never that default.
 - **`pikvm_get_resolution`** - Get the screen resolution in screen pixels. Mouse tools take pixels of the last screenshot image, not screen pixels
 

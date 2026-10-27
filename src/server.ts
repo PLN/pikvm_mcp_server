@@ -35,6 +35,7 @@
 // Modified 2026-10 by PLN: situation-first errors, coordinate wording, plain-text OCR (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: pikvm_keep_awake, suspended by other tool calls (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: pikvm_status (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: wake, observe, pikvm_wait_for, pikvm_click_text (GPL-3.0; see NOTICE).
 
 /**
  * MCP server factory for PiKVM tools
@@ -57,10 +58,13 @@ import {
   type DeviceStatusReading,
   type PiKVMClient,
   type FrameEcho,
+  type ScreenshotResult,
   KvmdError,
   SERVER_ERROR_TYPES,
+  WAKE_KEY,
   redactionPassword,
 } from './pikvm/client.js';
+import sharp from 'sharp';
 import { redactSecrets } from './redact.js';
 import type { BusyLock } from './pikvm/lock.js';
 import { type Fleet, type FleetDevice, resolveFleetDevice } from './devices.js';
@@ -301,6 +305,7 @@ const VALID_KEY_STATES = ['press', 'release', 'click'] as const;
  * as do the skill_* guidance tools.
  */
 export const ARM_GATED_TOOLS = new Set([
+  'pikvm_click_text',
   'pikvm_keep_awake',
   'pikvm_type',
   'pikvm_key',
@@ -357,6 +362,19 @@ export function formatToolError(error: unknown, password = '', otherPasswords: r
   ) {
     const message = redact(error.message);
     const details = JSON.stringify({ type: error.type, message });
+    return `Error [${error.type}]: ${message}\n${details}`;
+  }
+  if (error instanceof IntentError) {
+    const message = redact(error.message);
+    const redactValue = (value: unknown): unknown => {
+      if (typeof value === 'string') return redact(value);
+      if (Array.isArray(value)) return value.map(redactValue);
+      if (value !== null && typeof value === 'object') {
+        return Object.fromEntries(Object.entries(value).map(([key, inner]) => [key, redactValue(inner)]));
+      }
+      return value;
+    };
+    const details = JSON.stringify({ type: error.type, message, ...(redactValue(error.details) as object) });
     return `Error [${error.type}]: ${message}\n${details}`;
   }
   if (error instanceof OcrError) {
@@ -431,6 +449,117 @@ function durationText(seconds: number): string {
   return `${Math.round(s / 86_400)} days`;
 }
 
+/** A refusal or miss from an intent tool: text not found, ambiguous, a wait that timed out. */
+export class IntentError extends Error {
+  readonly type: string;
+  readonly details: Record<string, unknown>;
+
+  constructor(type: string, message: string, details: Record<string, unknown> = {}) {
+    super(message);
+    this.name = 'IntentError';
+    this.type = type;
+    this.details = details;
+  }
+}
+
+/** After a wake key, how long to wait for the signal. */
+const WAKE_SIGNAL_WAIT_MS = 7000;
+/** With wake, a capture the screenshot starts waits this long before the key. */
+const WAKE_FIRST_WAIT_MS = 3000;
+/** The client's default wait for a signal after starting capture; a wait's looks use less. */
+const CAPTURE_SIGNAL_WAIT_DEFAULT_MS = 10_000;
+/** Default settle time before an observe screenshot. */
+const OBSERVE_DELAY_MS = 500;
+/** The longest an observe screenshot waits for typing to finish. */
+const OBSERVE_TYPE_MAX_MS = 30_000;
+
+type ResultBlock = { type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string };
+
+/** Text and image for one screenshot, the same for every tool that returns one. */
+export function screenshotBlocks(result: ScreenshotResult, lead = ''): ResultBlock[] {
+  const meta = {
+    frameId: result.frameId,
+    width: result.width,
+    height: result.height,
+    actualWidth: result.actualWidth,
+    actualHeight: result.actualHeight,
+    scaleX: result.scaleX,
+    scaleY: result.scaleY,
+    ...(result.region ? { region: result.region } : {}),
+    calibration: result.calibration,
+    hid: result.hid,
+  };
+  const screen = `the ${result.actualWidth}x${result.actualHeight} screen`;
+  let infoText = result.region
+    ? `Screenshot: ${result.screenshotWidth}x${result.screenshotHeight} crop at (${result.region.x}, ${result.region.y}) `
+      + `of the full image of ${screen}. To click in this crop, pass its frameId to the mouse tool; `
+      + 'without frameId, mouse x and y stay pixels of the last full screenshot.'
+    : `Screenshot: ${result.screenshotWidth}x${result.screenshotHeight} image of ${screen}. `
+      + 'Mouse x and y are pixels in this image.';
+  infoText = `${lead}${infoText}\n${JSON.stringify(meta)}`;
+  return [
+    { type: 'text', text: infoText },
+    { type: 'image', data: result.buffer.toString('base64'), mimeType: 'image/jpeg' },
+  ];
+}
+
+/** Lower case, inner whitespace collapsed, surrounding punctuation dropped from each word. */
+function normalizeWord(word: string): string {
+  return word.toLowerCase().replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '');
+}
+
+function normalizeText(text: string): string {
+  return text.toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+interface TextMatch {
+  text: string;
+  /** Centre in screen pixels. */
+  screen: { x: number; y: number };
+}
+
+/** Phrase matches over consecutive OCR words, in reading order. */
+export function findTextMatches(
+  words: ReadonlyArray<{ text: string; bbox: { left: number; top: number; width: number; height: number } }>,
+  phrase: string,
+  crop: { left: number; top: number } | null,
+): TextMatch[] {
+  const tokens = phrase.split(/\s+/).map(normalizeWord).filter((token) => token !== '');
+  if (tokens.length === 0) return [];
+  // Punctuation-only words ("&", "-") are skipped, as they are in the phrase.
+  const kept = words.map((word, index) => ({ index, norm: normalizeWord(word.text) })).filter((w) => w.norm !== '');
+  const matches: TextMatch[] = [];
+  for (let i = 0; i + tokens.length <= kept.length; i += 1) {
+    if (!tokens.every((token, k) => kept[i + k].norm === token)) continue;
+    // The words as on screen, punctuation included, from the first match to the last.
+    const group = words.slice(kept[i].index, kept[i + tokens.length - 1].index + 1);
+    const left = Math.min(...group.map((w) => w.bbox.left));
+    const top = Math.min(...group.map((w) => w.bbox.top));
+    const right = Math.max(...group.map((w) => w.bbox.left + w.bbox.width));
+    const bottom = Math.max(...group.map((w) => w.bbox.top + w.bbox.height));
+    matches.push({
+      text: group.map((w) => w.text).join(' '),
+      screen: {
+        x: Math.round((crop?.left ?? 0) + (left + right) / 2),
+        y: Math.round((crop?.top ?? 0) + (top + bottom) / 2),
+      },
+    });
+  }
+  return matches;
+}
+
+/** Share of pixels that differ visibly between two screenshots, compared small and grey. */
+async function changedShare(before: Buffer, after: Buffer): Promise<number> {
+  const small = (image: Buffer) => sharp(image).resize(64, 36, { fit: 'fill' }).greyscale().raw().toBuffer();
+  const [a, b] = await Promise.all([small(before), small(after)]);
+  let changed = 0;
+  for (let i = 0; i < a.length; i += 1) if (Math.abs(a[i] - b[i]) > 32) changed += 1;
+  return changed / a.length;
+}
+
+/** A screenshot counts as changed when this share of its pixels changed. */
+const CHANGED_SHARE = 0.005;
+
 function agoText(iso: string | null | undefined, now: number): string {
   if (!iso) return 'never';
   return `${durationText((now - Date.parse(iso)) / 1000)} ago`;
@@ -453,7 +582,7 @@ function statusVerdict(reading: DeviceStatusReading): string {
       return usbOffline ? 'picture visible, but its USB keyboard and mouse are offline: input will not reach it' : 'ready';
     case 'no_signal': return 'no picture, and the USB state could not be read';
     case 'capture_stopped': return 'ready; capture is stopped and starts on the next screenshot';
-    case 'display_asleep': return 'display asleep: press a key (pikvm_key ShiftLeft) to wake it';
+    case 'display_asleep': return 'display asleep: pikvm_screenshot with wake: true wakes it';
     case 'usb_offline': return 'no computer: its USB keyboard and mouse are offline (off, suspended or unplugged)';
     default: return 'unknown picture state';
   }
@@ -651,6 +780,34 @@ function tagFleetResult<T extends {
   };
 }
 
+const OBSERVE_PROPERTIES = {
+  observe: {
+    type: 'boolean',
+    description: 'Also return a screenshot taken after the action, so no separate pikvm_screenshot is needed.',
+  },
+  observeDelayMs: {
+    type: 'number',
+    description: 'Wait before that screenshot, 0-10000 ms (default 500; for typing, until kvmd has typed the text).',
+  },
+} as const;
+
+/** Input tools that accept observe. */
+const OBSERVE_TOOLS = new Set([
+  'pikvm_key',
+  'pikvm_shortcut',
+  'pikvm_type',
+  'pikvm_mouse_move',
+  'pikvm_mouse_click',
+  'pikvm_mouse_scroll',
+]);
+
+const OCR_BOX_PROPERTIES = {
+  left: { type: 'number', description: 'Left edge of a box to read, in pixels of the last screenshot.' },
+  top: { type: 'number', description: 'Top edge of that box.' },
+  right: { type: 'number', description: 'Right edge of that box.' },
+  bottom: { type: 'number', description: 'Bottom edge of that box.' },
+} as const;
+
 // Define available tools
 const tools: Tool[] = [
   {
@@ -659,6 +816,10 @@ const tools: Tool[] = [
     inputSchema: {
       type: 'object',
       properties: {
+        wake: {
+          type: 'boolean',
+          description: `When the display is dark but the computer is connected, press ${WAKE_KEY} once (ignored by applications), wait for the picture and return it. Needs HID armed. Never presses when the computer's USB is offline.`,
+        },
         maxWidth: {
           type: 'number',
           description: 'Maximum preview width in pixels (1-10000). Omitted uses the device default.',
@@ -733,6 +894,7 @@ const tools: Tool[] = [
     inputSchema: {
       type: 'object',
       properties: {
+        ...OBSERVE_PROPERTIES,
         text: {
           type: 'string',
           description: 'The text to type',
@@ -759,6 +921,7 @@ const tools: Tool[] = [
     inputSchema: {
       type: 'object',
       properties: {
+        ...OBSERVE_PROPERTIES,
         key: {
           type: 'string',
           description: 'Key code (e.g., KeyA, Enter, Escape, F1)',
@@ -783,6 +946,7 @@ const tools: Tool[] = [
     inputSchema: {
       type: 'object',
       properties: {
+        ...OBSERVE_PROPERTIES,
         keys: {
           type: 'array',
           items: { type: 'string' },
@@ -798,6 +962,7 @@ const tools: Tool[] = [
     inputSchema: {
       type: 'object',
       properties: {
+        ...OBSERVE_PROPERTIES,
         x: {
           type: 'number',
           description: 'X coordinate in pixels (absolute) or delta pixels (relative)',
@@ -824,6 +989,7 @@ const tools: Tool[] = [
     inputSchema: {
       type: 'object',
       properties: {
+        ...OBSERVE_PROPERTIES,
         button: {
           type: 'string',
           enum: ['left', 'right', 'middle', 'up', 'down'],
@@ -855,6 +1021,7 @@ const tools: Tool[] = [
     inputSchema: {
       type: 'object',
       properties: {
+        ...OBSERVE_PROPERTIES,
         deltaX: {
           type: 'number',
           description: 'Horizontal scroll amount (negative = left, positive = right)',
@@ -1109,6 +1276,40 @@ const tools: Tool[] = [
     },
   },
   {
+    name: 'pikvm_wait_for',
+    description: 'Wait until something happens on screen, then return the screenshot: text appears (text), text disappears (gone), anything visibly changes (changed: true), or a picture appears (signal: true). Give exactly one. Text uses OCR on a box (left, top, right, bottom in pixels of the last screenshot) or, without a box, the whole screen when PIKVM_OCR_ALLOW_FULL_FRAME=1. A timeout is PIKVM_WAIT_TIMEOUT with the last screenshot. Read-only unless wake is true.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        text: { type: 'string', description: 'Wait until this text is on screen (case-insensitive).' },
+        gone: { type: 'string', description: 'Wait until this text is no longer on screen.' },
+        changed: { type: 'boolean', description: 'true: wait until the screen visibly changes from the first look (a clock counts).' },
+        signal: { type: 'boolean', description: 'true: wait until there is a picture.' },
+        timeoutSeconds: { type: 'number', description: 'Give up after this long, 1-300 (default 30).' },
+        intervalMs: { type: 'number', description: 'Time between looks, 250-10000 (default 1000).' },
+        ...OCR_BOX_PROPERTIES,
+        wake: { type: 'boolean', description: `If the display goes dark while connected, press ${WAKE_KEY} once. Needs HID armed.` },
+      },
+    },
+  },
+  {
+    name: 'pikvm_click_text',
+    description: 'Click on text: find it with OCR, click its centre and return the screenshot after. Matches whole words in reading order, case-insensitive, so "Update Windows" matches a label split over two lines. Several matches are refused with their positions unless nth picks one. Needs host OCR (word boxes) and HID armed. Reads a box (left, top, right, bottom in pixels of the last screenshot) or, without one, the whole screen when PIKVM_OCR_ALLOW_FULL_FRAME=1.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        text: { type: 'string', description: 'The text to click, one or more words.' },
+        nth: { type: 'number', description: 'Which match to click, from 1, in reading order. Needed when there are several.' },
+        button: { type: 'string', enum: ['left', 'right', 'middle'], description: 'Default left.' },
+        double: { type: 'boolean', description: 'Double-click.' },
+        observe: { type: 'boolean', description: 'Return the screenshot after the click (default true).' },
+        observeDelayMs: OBSERVE_PROPERTIES.observeDelayMs,
+        ...OCR_BOX_PROPERTIES,
+      },
+      required: ['text'],
+    },
+  },
+  {
     name: 'pikvm_status',
     description: 'What state each device is in, read-only: a one-line verdict (ready, display asleep, no computer, unreachable), the picture (visible, display asleep, capture stopped, resolution, fps), screen on-time as seen by this server, keyboard and mouse online and absolute or relative, held input, idle timers (kvmd\'s time since any input, and this server\'s last keyboard and mouse input), keep-awake state, the capture session and media. Starts no capture and sends no input. Omit device for every device.',
     inputSchema: {
@@ -1322,6 +1523,82 @@ export function createMcpServer(deps: McpServerDeps): Server {
       if (!ctx) throw new Error(`Unknown tool: ${name}`);
       const active = ctx;
 
+      const deviceScreenshot = (signalWaitMs?: number) => deviceClient.screenshot({
+        maxWidth: active.screenshot.maxWidth,
+        maxHeight: active.screenshot.maxHeight,
+        quality: active.screenshot.quality,
+        ...(signalWaitMs !== undefined ? { signalWaitMs } : {}),
+      });
+      /**
+       * After PIKVM_NO_SIGNAL with a connected computer: press the wake
+       * key once and wait for the picture. Rethrows anything else, and
+       * never presses when USB is offline or HID is disarmed.
+       */
+      const wakeDisplay = async (error: unknown, maxWaitMs = WAKE_SIGNAL_WAIT_MS): Promise<string> => {
+        if (!(error instanceof KvmdError) || error.type !== 'PIKVM_NO_SIGNAL' || error.reason === 'usb_offline') throw error;
+        if (!active.armHid) {
+          error.message += '. wake did not press a key: HID is disarmed';
+          // Repeating the wake cannot help.
+          error.next = undefined;
+          throw error;
+        }
+        return deviceClient.holdingCapture(async () => {
+          await deviceClient.sendKey(WAKE_KEY);
+          const signal = await deviceClient.waitForSignal(maxWaitMs);
+          if (!signal.online) {
+            error.message += `. Pressed ${WAKE_KEY}; still no picture after ${Math.round(maxWaitMs / 100) / 10} s`;
+            error.next = undefined;
+            throw error;
+          }
+          return `Woke the display: pressed ${WAKE_KEY}, picture after ${signal.afterMs} ms. `;
+        });
+      };
+      /** Host or kvmd OCR as configured, over a box in screenshot pixels or the whole screen. */
+      const runOcr = (box: ReturnType<typeof parseOcrBox>, budgetMs?: number) => {
+        const described = deviceClient.describeFrame();
+        const calibration = deviceClient.getCalibration();
+        return executeOcr({
+          deviceName: active.name,
+          // A wait gives each look only the time it has left.
+          runtime: budgetMs === undefined
+            ? ocrRuntime
+            : { ...ocrRuntime, timeoutMs: Math.max(1, Math.min(ocrRuntime.timeoutMs, Math.round(budgetMs))) },
+          override: active.ocr,
+          engineArg: undefined,
+          langsArg: undefined,
+          box,
+          frame: described.frame,
+          frameId: described.echo.frameId,
+          fullFrame: box === undefined,
+          getSource: () => deviceClient.getResolution(
+            true,
+            budgetMs === undefined ? undefined : Math.min(CAPTURE_SIGNAL_WAIT_DEFAULT_MS, Math.max(250, Math.round(budgetMs))),
+          ),
+          calibration: calibration ? { factorX: calibration.factorX, factorY: calibration.factorY } : null,
+          fetchSnapshot: (timeoutMs) => deviceClient.fetchFullSnapshot(timeoutMs),
+          readKvmd: (langs) => deviceClient.readText({ langs, box, ...(budgetMs === undefined ? {} : { budgetMs }) }),
+          ensureKvmd: async () => {
+            let state = deviceClient.ocrState();
+            if (state.status === 'unknown') state = await deviceClient.probeOcr(active.name);
+            if (state.status !== 'enabled') throw new OcrUnavailableError(active.name);
+            return state;
+          },
+        });
+      };
+      const observeBlocks = async (delayMs: number): Promise<ResultBlock[]> => {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        try {
+          return screenshotBlocks(await deviceScreenshot(), 'After the action: ');
+        } catch (error) {
+          return [{ type: 'text', text: `After the action, no screenshot: ${redactToolText(error, fleet.passwords)}` }];
+        }
+      };
+      const observeDelay = (fallbackMs: number) => {
+        const requested = validateNumber(args.observeDelayMs, 0, 10_000);
+        return requested === undefined ? fallbackMs : Math.round(requested);
+      };
+      let typedQueuedMs = 0;
+
       // Every other tool call on this device pauses keep-awake while it runs
       // and for its suspendSeconds after.
       const suspends = !KEEP_AWAKE_NEUTRAL_TOOLS.has(name);
@@ -1358,42 +1635,155 @@ export function createMcpServer(deps: McpServerDeps): Server {
             ? settings.quality
             : requireScreenshotInteger(args.quality, 'quality', 1, 100);
           const region = parseRegion(args.region);
-          const result = await deviceClient.screenshot({ maxWidth, maxHeight, quality, region });
-          const meta = {
-            frameId: result.frameId,
-            width: result.width,
-            height: result.height,
-            actualWidth: result.actualWidth,
-            actualHeight: result.actualHeight,
-            scaleX: result.scaleX,
-            scaleY: result.scaleY,
-            ...(result.region ? { region: result.region } : {}),
-            calibration: result.calibration,
-            hid: result.hid,
-          };
+          const wake = validateBoolean(args.wake) === true;
+          const shoot = () => deviceClient.screenshot({
+            maxWidth,
+            maxHeight,
+            quality,
+            region,
+            ...(wake ? { signalWaitMs: WAKE_FIRST_WAIT_MS } : {}),
+          });
+          try {
+            return { content: screenshotBlocks(await shoot()) };
+          } catch (error) {
+            if (!wake) throw error;
+            const lead = await wakeDisplay(error);
+            return { content: screenshotBlocks(await deviceClient.holdingCapture(shoot), lead) };
+          }
+        }
 
-          const screen = `the ${result.actualWidth}x${result.actualHeight} screen`;
-          let infoText = result.region
-            ? `Screenshot: ${result.screenshotWidth}x${result.screenshotHeight} crop at (${result.region.x}, ${result.region.y}) `
-              + `of the full image of ${screen}. To click in this crop, pass its frameId to the mouse tool; `
-              + 'without frameId, mouse x and y stay pixels of the last full screenshot.'
-            : `Screenshot: ${result.screenshotWidth}x${result.screenshotHeight} image of ${screen}. `
-              + 'Mouse x and y are pixels in this image.';
-          infoText += `\n${JSON.stringify(meta)}`;
+        case 'pikvm_wait_for': {
+          const conditions = ['text', 'gone', 'changed', 'signal'].filter((key) => args[key] !== undefined);
+          if (conditions.length !== 1) throw new Error('give exactly one of text, gone, changed or signal');
+          const condition = conditions[0];
+          const wanted = condition === 'text' || condition === 'gone' ? requireString(args[condition], condition) : '';
+          if ((condition === 'changed' || condition === 'signal') && args[condition] !== true) {
+            throw new Error(`${condition} must be true`);
+          }
+          const timeoutSeconds = requireIntegerIn(args.timeoutSeconds, 'timeoutSeconds', { default: 30, min: 1, max: 300 });
+          const intervalMs = requireIntegerIn(args.intervalMs, 'intervalMs', { default: 1000, min: 250, max: 10_000 });
+          const wake = validateBoolean(args.wake) === true;
+          const box = parseOcrBox({ left: args.left, top: args.top, right: args.right, bottom: args.bottom });
+          const started = Date.now();
+          const deadline = started + timeoutSeconds * 1000;
+          const left = () => Math.max(0, deadline - Date.now());
+          let checks = 0;
+          let woke = '';
+          let wakeTried = false;
+          let baseline: Buffer | null = null;
+          let lastShot: ScreenshotResult | null = null;
+          let lastText = '';
+          let lookBudget = 0;
+          // Each look gets only the time left, so the wait ends near its deadline.
+          // A look that started in time and matched still counts.
+          for (;;) {
+            checks += 1;
+            lookBudget = 0;
+            let matched = false;
+            let at: { x: number; y: number } | undefined;
+            try {
+              if (condition === 'text' || condition === 'gone') {
+                lookBudget = Math.max(1000, left());
+                const ocr = await runOcr(box, lookBudget);
+                lastText = ocr.text;
+                const present = normalizeText(ocr.text).includes(normalizeText(wanted));
+                matched = condition === 'text' ? present : !present;
+                if (condition === 'text' && present) {
+                  const found = findTextMatches(ocr.words, wanted, ocr.crop);
+                  if (found.length > 0) at = found[0].screen;
+                }
+              } else {
+                lastShot = await deviceScreenshot(Math.max(250, left()));
+                if (condition === 'signal') matched = true;
+                else if (baseline === null) baseline = lastShot.buffer;
+                else matched = (await changedShare(baseline, lastShot.buffer)) >= CHANGED_SHARE;
+              }
+            } catch (error) {
+              // A timeout from the wait's own shortened budget is a look without
+              // an answer; the wait then ends with its own timeout result.
+              const ownBudget = lookBudget > 0 && lookBudget < ocrRuntime.timeoutMs;
+              const timedOut = (error instanceof OcrError && error.type === 'PIKVM_OCR_TIMEOUT')
+                || (error instanceof KvmdError && error.type === 'PIKVM_TIMEOUT');
+              if (ownBudget && timedOut) {
+                lookBudget = 0;
+                if (left() <= 0) break;
+                continue;
+              }
+              // A dark screen is a look without an answer. With wake, one key
+              // press at most; a wake that brings no picture does not end the wait.
+              if (!(error instanceof KvmdError && error.type === 'PIKVM_NO_SIGNAL')) throw error;
+              if (wake && !wakeTried && error.reason !== 'usb_offline' && left() > 0) {
+                wakeTried = true;
+                try {
+                  woke = await wakeDisplay(error, Math.min(WAKE_SIGNAL_WAIT_MS, left()));
+                } catch (wakeError) {
+                  woke = `Wake did not bring a picture: ${wakeError instanceof Error ? wakeError.message : String(wakeError)}. `;
+                }
+              }
+            }
+            if (matched) {
+              const seconds = ((Date.now() - started) / 1000).toFixed(1);
+              const what = condition === 'text'
+                ? `"${wanted}" is on screen${at ? ` at screen (${at.x}, ${at.y})` : ''}`
+                : condition === 'gone' ? `"${wanted}" is gone` : condition === 'signal' ? 'there is a picture' : 'the screen changed';
+              const shot = condition === 'signal' || condition === 'changed' ? lastShot! : await deviceScreenshot(1000);
+              return { content: screenshotBlocks(shot, `${woke}Waited ${seconds} s (${checks} looks): ${what}. `) };
+            }
+            if (left() <= 0) break;
+            await new Promise((resolve) => setTimeout(resolve, Math.min(intervalMs, left())));
+          }
+          const details: Record<string, unknown> = { condition, checks, timeoutSeconds };
+          if (condition === 'text' || condition === 'gone') details.lastText = lastText.slice(0, 2000);
+          if (woke) details.wake = woke.trim();
+          const missed = new IntentError(
+            'PIKVM_WAIT_TIMEOUT',
+            `${condition === 'text' ? `"${wanted}" did not appear` : condition === 'gone' ? `"${wanted}" did not go away`
+              : condition === 'signal' ? 'no picture appeared' : 'the screen did not change'} within ${timeoutSeconds} s (${checks} looks)`,
+            details,
+          );
+          const text = redactToolText(missed, fleet.passwords);
+          let image: ResultBlock[] = [];
+          try {
+            // The last look's image, or one short look: the deadline has passed.
+            image = screenshotBlocks(lastShot ?? await deviceScreenshot(250), 'Last look: ').slice(1);
+          } catch {
+            // No picture to show.
+          }
+          return { content: [{ type: 'text', text }, ...image], isError: true };
+        }
 
-          return {
-            content: [
-              {
-                type: 'text',
-                text: infoText,
-              },
-              {
-                type: 'image',
-                data: result.buffer.toString('base64'),
-                mimeType: 'image/jpeg',
-              },
-            ],
-          };
+        case 'pikvm_click_text': {
+          const wanted = requireString(args.text, 'text');
+          const box = parseOcrBox({ left: args.left, top: args.top, right: args.right, bottom: args.bottom });
+          const button = validateEnum(args.button, ['left', 'right', 'middle'] as const, 'left');
+          const ocr = await runOcr(box);
+          if (ocr.engine !== 'host') {
+            throw new IntentError('PIKVM_OCR_NO_WORDS', 'pikvm_click_text needs host OCR: kvmd OCR returns text without word positions');
+          }
+          const matches = findTextMatches(ocr.words, wanted, ocr.crop);
+          const listed = matches.slice(0, 10).map((m, i) => ({ nth: i + 1, text: m.text, screen: m.screen }));
+          if (matches.length === 0) {
+            throw new IntentError('PIKVM_TEXT_NOT_FOUND', `"${wanted}" is not on screen`, { recognized: ocr.text.slice(0, 2000) });
+          }
+          let nth = 1;
+          if (args.nth !== undefined) {
+            nth = requireIntegerIn(args.nth, 'nth', { default: 1, min: 1, max: matches.length });
+          } else if (matches.length > 1) {
+            throw new IntentError(
+              'PIKVM_TEXT_AMBIGUOUS',
+              `"${wanted}" is on screen ${matches.length} times; pass nth to choose`,
+              { matches: listed },
+            );
+          }
+          const target = matches[nth - 1];
+          await deviceClient.mouseMoveScreen(target.screen.x, target.screen.y);
+          await deviceClient.mouseClick(button);
+          if (validateBoolean(args.double) === true) await deviceClient.mouseClick(button);
+          const clicked = `${validateBoolean(args.double) === true ? 'Double-clicked' : 'Clicked'} "${target.text}" `
+            + `at screen (${target.screen.x}, ${target.screen.y})${matches.length > 1 ? ` (match ${nth} of ${matches.length})` : ''}.`;
+          const blocks: ResultBlock[] = [{ type: 'text', text: clicked }];
+          if (validateBoolean(args.observe) !== false) blocks.push(...await observeBlocks(observeDelay(OBSERVE_DELAY_MS)));
+          return { content: blocks };
         }
 
         case 'pikvm_read_text': {
@@ -1467,6 +1857,7 @@ export function createMcpServer(deps: McpServerDeps): Server {
           });
           // Don't echo full text in response to avoid leaking sensitive input
           const displayText = text.length > 50 ? `${text.substring(0, 50)}...` : text;
+          typedQueuedMs = typed.queuedMs;
           // kvmd answers a fast print before it has typed it.
           const pending = typed.queuedMs >= 1000
             ? ` kvmd is still typing; it finishes in about ${Math.ceil(typed.queuedMs / 1000)} s.`
@@ -1820,7 +2211,16 @@ export function createMcpServer(deps: McpServerDeps): Server {
         default:
           throw new Error(`Unknown tool: ${name}`);
       }
-      })().finally(() => {
+      })().then(async (result) => {
+        // observe: the screenshot after the action, in the same call.
+        const failed = (result as { isError?: boolean }).isError === true;
+        if (!OBSERVE_TOOLS.has(name) || validateBoolean(args.observe) !== true || failed) return result;
+        const settle = name === 'pikvm_type'
+          ? Math.min(OBSERVE_TYPE_MAX_MS, Math.max(OBSERVE_DELAY_MS, typedQueuedMs + 250))
+          : OBSERVE_DELAY_MS;
+        const content = [...((result as { content?: ResultBlock[] }).content ?? []), ...await observeBlocks(observeDelay(settle))];
+        return { ...result, content };
+      }).finally(() => {
         if (suspends) active.client.keepAwake.callEnded();
       });
       return tagFleetResult(produced, active, fleet.registryActive);

@@ -82,6 +82,7 @@ Modified 2026-10 by PLN: version 0.3.1 (GPL-3.0; see below).
 Modified 2026-10 by PLN: situation-first errors, no-signal cause, plain-text OCR (GPL-3.0; see below).
 Modified 2026-10 by PLN: pikvm_keep_awake (GPL-3.0; see below).
 Modified 2026-10 by PLN: pikvm_status (GPL-3.0; see below).
+Modified 2026-10 by PLN: wake, observe, pikvm_wait_for, pikvm_click_text (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -1432,4 +1433,15 @@ No code from another pikvm_mcp_server fork was added for these methods.
   starts no capture, sends no input and does not pause keep-awake.
   Keep-awake reads the signal on every poll, which keeps the screen
   on-time current.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  Intent tools. pikvm_screenshot wake presses F15 once when the picture
+  is missing but USB is online, waits for the picture and returns it;
+  PIKVM_NO_SIGNAL's next step is that call. observe on the input tools
+  adds the screenshot after the action. pikvm_wait_for waits for text,
+  its absence, a visible change or a picture, with OCR or a small grey
+  image comparison. pikvm_click_text clicks the centre of OCR words that
+  match a phrase in reading order, refuses an ambiguous match unless
+  nth picks one, and returns the screenshot after.
   No code from another pikvm_mcp_server fork was copied.
