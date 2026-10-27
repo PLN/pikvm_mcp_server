@@ -1590,6 +1590,9 @@ export class PiKVMClient {
     signal?: AbortSignal,
   ): Promise<T> {
     if (!isHidPost(method, path)) return this.requestRetrying<T>(method, path, body, contentType, timeoutMs, signal);
+    // A print refused locally (above the 50 s ceiling) is refused here, before
+    // any held-input or idle-timer bookkeeping: nothing is sent.
+    if (path.split('?')[0] === '/hid/print') this.hidTimeoutMs(path, body);
     // Read synchronously, before the first await: keep-awake's own input is not tool input.
     const toolInput = this.sendingKeepAwake ? null : hidInputKind(path);
     // A tool's input waits for a keep-awake input that has started.

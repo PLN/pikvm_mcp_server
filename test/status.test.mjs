@@ -263,6 +263,11 @@ test('pikvm_status: other devices\' passwords, unknown USB, a picture without US
     const id = await session(base);
     const refused = await call(base, id, 'pikvm_key', { device: 'other', key: 'NoSuchKey' });
     assert.equal(refused.isError, true);
+    // Refused locally, above the 50 s print ceiling: nothing is sent.
+    const tooLong = await call(base, id, 'pikvm_type', { device: 'other', text: 'a'.repeat(400), slow: true });
+    assert.equal(tooLong.isError, true);
+    assert.match(tooLong.content[0].text, /Refusing \/hid\/print/);
+    assert.equal(rejecting.calls.some((c) => c.path === '/api/hid/print'), false);
 
     const status = await call(base, id, 'pikvm_status');
     const whole = JSON.stringify(status);
