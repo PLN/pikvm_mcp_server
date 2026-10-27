@@ -17,6 +17,7 @@
 // Modified 2026-10 by PLN: stream an upload response before the body is finished (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: the upload response read is phase job_timeout (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a reply cut short after Connection: close (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: idle capture, /api/ws stream sessions, GET /api/hid (GPL-3.0; see NOTICE).
 
 /**
  * Minimal KVMD REST mock implementing exactly the routes src/pikvm/client.ts
@@ -73,8 +74,20 @@
  * follows kvmd: .iso is not writable; an upload is in storage and not
  * adopted, so any other name is writable. Error class names and the
  * messages that kvmd defines are from kvmd v4.227 (see NOTICE).
+ *
+ * `capture` models kvmd's capture lifecycle; without it capture always
+ * runs. `running` (default false) and `signal` (default true) are the
+ * start state. A WebSocket to /api/ws with stream on (the default)
+ * starts capture after `startMs` (default 50); when the last one closes,
+ * capture stops after `stopMs` (default 0). While capture is stopped,
+ * GET /api/streamer has `streamer: null`; while stopped or without a
+ * signal, snapshots are HTTP 503. `wsStatus` refuses the upgrade with that
+ * status. `wsEvents` records opens and closes, `setSignal()` changes the
+ * signal. GET /api/hid reports an absolute mouse unless `mouseAbsolute`
+ * is false.
  */
 
+import crypto from 'node:crypto';
 import http from 'node:http';
 import { performance } from 'node:perf_hooks';
 import sharp from 'sharp';
@@ -390,6 +403,40 @@ export async function startKvmdMock(options = {}) {
   const catalogFresh = new Set();
   let streamerHolds = 0;
   let imageSnapshots = 0;
+  const capture = options.capture
+    ? { running: false, signal: true, startMs: 50, stopMs: 0, ...options.capture }
+    : null;
+  const wsSockets = new Set();
+  const wsEvents = [];
+  let streamClients = 0;
+  let captureTimer = null;
+
+  function addStreamClient() {
+    streamClients += 1;
+    clearTimeout(captureTimer);
+    captureTimer = null;
+    if (!capture.running) {
+      captureTimer = setTimeout(() => {
+        capture.running = true;
+      }, capture.startMs);
+    }
+  }
+
+  function removeStreamClient() {
+    streamClients -= 1;
+    if (streamClients > 0) return;
+    clearTimeout(captureTimer);
+    captureTimer = setTimeout(() => {
+      capture.running = false;
+    }, capture.stopMs);
+  }
+
+  function captureUnavailable(res) {
+    if (!capture || (capture.running && capture.signal)) return false;
+    res.writeHead(503, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, result: { error: 'UnavailableError', error_msg: 'Service Unavailable' } }));
+    return true;
+  }
   let catalogHideLeft = Number.isInteger(options.catalogHidePolls) ? options.catalogHidePolls : 0;
   const catalogHideMs = Number.isInteger(options.catalogHideMs) && options.catalogHideMs > 0
     ? options.catalogHideMs
@@ -910,10 +957,22 @@ export async function startKvmdMock(options = {}) {
         });
         if (req.destroyed || res.writableEnded || res.destroyed) return;
       }
+      let streamer = { source: { resolution: { width: 1920, height: 1080 } } };
+      if (capture && !capture.running) streamer = null;
+      else if (capture) {
+        streamer = capture.signal
+          ? { source: { online: true, resolution: { width: 1920, height: 1080 } } }
+          : { source: { online: false, resolution: { width: 640, height: 480 } } };
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, result: { streamer } }));
+      return;
+    }
+    if (req.method === 'GET' && u.pathname === '/api/hid') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         ok: true,
-        result: { streamer: { source: { resolution: { width: 1920, height: 1080 } } } },
+        result: { online: true, mouse: { absolute: options.mouseAbsolute !== false, online: true } },
       }));
       return;
     }
@@ -933,6 +992,7 @@ export async function startKvmdMock(options = {}) {
       return;
     }
     if (req.method === 'GET' && u.pathname === '/api/streamer/snapshot') {
+      if (captureUnavailable(res)) return;
       const ocr = u.searchParams.get('ocr');
       if (ocr === '1' || ocr === 'true') {
         if (options.ocrDelayMs) await waitOrClose(req, options.ocrDelayMs);
@@ -988,6 +1048,51 @@ export async function startKvmdMock(options = {}) {
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'mock: unknown route' }));
   });
+  // Just enough of RFC 6455 for one client: the handshake, one text
+  // event like kvmd's first "loop" event, and an answer to a close frame.
+  server.on('upgrade', (req, socket) => {
+    const u = new URL(req.url, 'http://localhost');
+    calls.push({ method: 'WS', path: u.pathname, query: u.search, at: Date.now() });
+    if (u.pathname !== '/api/ws' || !capture || capture.wsStatus) {
+      const status = capture?.wsStatus ?? 404;
+      socket.end(`HTTP/1.1 ${status} Refused\r\nContent-Length: 0\r\nConnection: close\r\n\r\n`);
+      return;
+    }
+    const accept = crypto.createHash('sha1')
+      .update(`${req.headers['sec-websocket-key']}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+      .digest('base64');
+    socket.write([
+      'HTTP/1.1 101 Switching Protocols',
+      'Upgrade: websocket',
+      'Connection: Upgrade',
+      `Sec-WebSocket-Accept: ${accept}`,
+      '',
+      '',
+    ].join('\r\n'));
+    const stream = !['0', 'false', 'no'].includes((u.searchParams.get('stream') ?? '1').toLowerCase());
+    wsSockets.add(socket);
+    wsEvents.push({ type: 'open', stream, at: Date.now() });
+    if (stream) addStreamClient();
+    const loop = Buffer.from(JSON.stringify({ event_type: 'loop', event: {} }));
+    socket.write(Buffer.concat([Buffer.from([0x81, loop.length]), loop]));
+    let gone = false;
+    const onGone = () => {
+      if (gone) return;
+      gone = true;
+      wsSockets.delete(socket);
+      wsEvents.push({ type: 'close', stream, at: Date.now() });
+      if (stream) removeStreamClient();
+    };
+    socket.on('data', (chunk) => {
+      if ((chunk[0] & 0x0f) === 0x8) {
+        socket.end(Buffer.from([0x88, 0x02, 0x03, 0xe8]));
+        onGone();
+      }
+    });
+    socket.on('close', onGone);
+    socket.on('error', onGone);
+  });
+
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const port = server.address().port;
 
@@ -998,7 +1103,13 @@ export async function startKvmdMock(options = {}) {
     uploads,
     pace,
     url: `http://127.0.0.1:${port}`,
+    wsEvents,
+    setSignal(on) {
+      capture.signal = on;
+    },
     close: () => new Promise((resolve) => {
+      clearTimeout(captureTimer);
+      for (const socket of wsSockets) socket.destroy();
       // A paused upload can leave the socket open after the client aborts.
       // Drop it so close settles.
       server.close(resolve);

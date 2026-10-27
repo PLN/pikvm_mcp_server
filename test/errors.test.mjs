@@ -3,6 +3,7 @@
 // Modified 2026-10 by PLN: pikvm_type delay is milliseconds (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: header and body timeouts stay timeouts (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a reply cut short after Connection: close (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: capture state is read before the snapshot (GPL-3.0; see NOTICE).
 
 /**
  * KvmdError, request timeout, and bounded GET retry.
@@ -350,7 +351,8 @@ test('persistent snapshot HTTP 503 stops after one grace retry', { timeout: 2000
     assert.equal(snaps.length, 2);
     const gap = snaps[1].at - snaps[0].at;
     assert.ok(gap >= 1200, `snapshot grace too short: ${gap}ms`);
-    assert.equal(count(mock, 'GET', '/api/streamer'), 0);
+    // The capture state read comes first; capture runs, so 503 is transient.
+    assert.equal(count(mock, 'GET', '/api/streamer'), 1);
   });
 });
 
