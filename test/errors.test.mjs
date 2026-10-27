@@ -18,7 +18,7 @@ import { Readable } from 'node:stream';
 import { MockAgent } from 'undici';
 import { KvmdError, PiKVMClient, setDispatcherForTests, setHidDeadlineScaleForTests } from '../dist/pikvm/client.js';
 import { BusyLock } from '../dist/pikvm/lock.js';
-import { createMcpServer } from '../dist/server.js';
+import { createMcpServer, formatToolError } from '../dist/server.js';
 import { startHttpServer } from '../dist/http.js';
 import { startKvmdMock } from './kvmd-mock.mjs';
 
@@ -137,6 +137,14 @@ async function withSession(routes, armGateEnforced, fn, options) {
     await mock.close();
   }
 }
+
+test('every device password is removed from each error field before it is serialized', () => {
+  // JSON escapes a quote and a backslash, so a pass over the finished text would miss them there.
+  const other = 'pa"ss\\word';
+  const text = formatToolError(new KvmdError(500, 'MockError', `saw ${other} here`, 'GET /api/x'), 'first', [other]);
+  assert.equal(text.includes('pa"ss'), false, text);
+  assert.equal(text.includes('pa\\"ss'), false, text);
+});
 
 test('an error this server raises leads with the situation, cause and next step', async () => {
   await withSession({

@@ -3,6 +3,7 @@
 // Modified 2026-10 by PLN: the HID-send capture test names the mapping it keeps (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: kvmd OCR results are JSON (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: read_text tests that read the JSON ask for detail words (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: fleet hints name the device; OCR text is not merged with the tag (GPL-3.0; see NOTICE).
 
 /**
  * Preview defaults, local crop, coordinate metadata, and optional OCR.
@@ -21,7 +22,7 @@ import { BusyLock } from '../dist/pikvm/lock.js';
 import { PiKVMClient, pixelToNormalized } from '../dist/pikvm/client.js';
 import { limitedSharp } from '../dist/screenshot.js';
 import { createMcpServer } from '../dist/server.js';
-import { kvmdOcr } from '../dist/ocr.js';
+import { hostOcr, kvmdOcr } from '../dist/ocr.js';
 import { startHttpServer } from '../dist/http.js';
 import { startKvmdMock } from './kvmd-mock.mjs';
 
@@ -458,6 +459,67 @@ test('crop bounds and metadata match pixelToNormalized, with and without calibra
     }
   } finally {
     await mock.close();
+  }
+});
+
+test('in a fleet, a next step names its device, and recognized text is not merged with the tag', async (t) => {
+  watchCrashes(t);
+  const lab1 = await startKvmdMock();
+  const lab2 = await startKvmdMock({ capture: { running: true, signal: false } });
+  const dir = mkdtempSync(join(tmpdir(), 'pikvm-fleet-'));
+  try {
+    const passwordFile = join(dir, 'pw');
+    writeFileSync(passwordFile, 'testpw\n', { mode: 0o600 });
+    const device = (url) => ({ host: url, username: 'admin', passwordFile, tls: { mode: 'insecure' } });
+    const config = withEnv({
+      PIKVM_DEVICES: JSON.stringify({ default: 'lab1', devices: { lab1: device(lab1.url), lab2: device(lab2.url) } }),
+    }, () => loadConfig());
+    const fleet = buildFleet(config, { hid: true, msd: true });
+    const frame = await sharp({ create: { width: 1920, height: 1080, channels: 3, background: '#111111' } }).jpeg().toBuffer();
+    fleet.devices.get('lab1').client.fetchFullSnapshot = async () => frame;
+    // Host OCR whose recognized text happens to be a JSON object.
+    const ocr = hostOcr({
+      recognize: async () => ({
+        words: [{ text: '{"answer":42}', conf: 99, bbox: { left: 0, top: 0, width: 4, height: 4 }, block: 1, par: 1, line: 1 }],
+      }),
+    });
+    const srv = await listen(() => createMcpServer({
+      pikvm: fleet.devices.get('lab1').client,
+      lock: fleet.devices.get('lab1').lock,
+      fleet,
+      calibrationConfig,
+      armGateEnforced: false,
+      ocr,
+    }));
+    try {
+      const sessionId = await openSession(srv.base);
+      // Following the hint without a device would type on lab1, the default.
+      const dark = await rpc(srv.base, sessionId, 'tools/call', {
+        name: 'pikvm_screenshot',
+        arguments: { device: 'lab2' },
+      });
+      assert.equal(dark.result.isError, true);
+      assert.deepEqual(dark.result.structuredContent.error.next, {
+        tool: 'pikvm_key',
+        args: { key: 'ShiftLeft', device: 'lab2' },
+      });
+      assert.match(dark.result.content[0].text, /\nNext: pikvm_key \{"key":"ShiftLeft","device":"lab2"\}\n/);
+
+      const read = await rpc(srv.base, sessionId, 'tools/call', {
+        name: 'pikvm_read_text',
+        arguments: { left: 0, top: 0, right: 4, bottom: 4 },
+      });
+      assert.equal(read.result.content[0].text, '{"answer":42}\nDevice: lab1.');
+      assert.equal(read.result.structuredContent.text, '{"answer":42}');
+      assert.equal(read.result.structuredContent.device, 'lab1');
+    } finally {
+      await srv.close();
+      await closeFleet(fleet);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    await lab1.close();
+    await lab2.close();
   }
 });
 

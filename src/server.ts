@@ -320,8 +320,15 @@ export function msdToolRequiresArm(name: string): boolean {
  * MsdUploadBusyError, and MsdUrlPolicyError keep their type. URL userinfo
  * is removed from every message. Other errors stay `Error: <message>`.
  */
-export function formatToolError(error: unknown, password = ''): string {
-  const redact = (value: string) => redactUrl(redactSecrets(value, password));
+export function formatToolError(error: unknown, password = '', otherPasswords: readonly string[] = []): string {
+  // Every password is removed from each field before it is serialized: a
+  // password with a quote or backslash is escaped in JSON, and a pass over
+  // the finished text would miss it there.
+  const redact = (value: string) => {
+    let text = redactUrl(redactSecrets(value, password));
+    for (const other of otherPasswords) text = redactSecrets(text, other);
+    return text;
+  };
   if (error instanceof MsdExpectImageError || error instanceof MsdImageTransferError) {
     const message = redact(error.message);
     const image = redact(error.image);
@@ -345,7 +352,7 @@ export function formatToolError(error: unknown, password = ''): string {
     return `Error [${error.type}]: ${message}\n${details}`;
   }
   if (error instanceof KvmdError) {
-    const details = kvmdErrorDetails(error, password);
+    const details = kvmdErrorDetails(error, password, otherPasswords);
     // A type this server raises leads with the situation. kvmd's own
     // errors keep the endpoint and status, which help debugging.
     const summary = SERVER_ERROR_TYPES.has(error.type)
@@ -363,8 +370,12 @@ export function formatToolError(error: unknown, password = ''): string {
 }
 
 /** Redacted KvmdError fields, for the JSON line and structuredContent. */
-export function kvmdErrorDetails(error: KvmdError, password = '') {
-  const redact = (value: string) => redactUrl(redactSecrets(value, password));
+export function kvmdErrorDetails(error: KvmdError, password = '', otherPasswords: readonly string[] = []) {
+  const redact = (value: string) => {
+    let text = redactUrl(redactSecrets(value, password));
+    for (const other of otherPasswords) text = redactSecrets(text, other);
+    return text;
+  };
   return {
     status: error.status,
     type: redact(error.type),
@@ -453,20 +464,8 @@ function implicitFleet(deps: McpServerDeps): Fleet {
   };
 }
 
-/** The other devices' passwords, over each string field. */
-function redactDetails<T extends Record<string, unknown>>(details: T, passwords: readonly string[]): T {
-  const out: Record<string, unknown> = { ...details };
-  for (const [key, value] of Object.entries(out)) {
-    if (typeof value !== 'string') continue;
-    let text = value;
-    for (const password of passwords.slice(1)) text = redactSecrets(text, password);
-    out[key] = text;
-  }
-  return out as T;
-}
-
 function redactToolText(error: unknown, passwords: readonly string[]): string {
-  let text = formatToolError(error, passwords[0] ?? '');
+  let text = formatToolError(error, passwords[0] ?? '', passwords.slice(1));
   for (const password of passwords.slice(1)) {
     text = redactSecrets(text, password);
   }
@@ -486,6 +485,9 @@ function listFleetDevices(fleet: Fleet) {
   return { default: fleet.defaultName, devices };
 }
 
+/** Results whose text is recognized screen text: never parsed as JSON for tagging. */
+const plainTextResults = new WeakSet<object>();
+
 function tagFleetResult<T extends {
   content?: Array<{ type?: string; text?: string }>;
   structuredContent?: Record<string, unknown>;
@@ -495,6 +497,8 @@ function tagFleetResult<T extends {
   registryActive: boolean,
 ): T {
   if (!registryActive || !ctx) return result;
+  // Read before the structuredContent copy below replaces the object.
+  const plainText = plainTextResults.has(result);
   if (result.structuredContent) {
     result = { ...result, structuredContent: { ...result.structuredContent, device: ctx.name } };
   }
@@ -509,7 +513,7 @@ function tagFleetResult<T extends {
   }
   let text = first.text;
   const trimmed = text.trim();
-  if (trimmed.startsWith('{')) {
+  if (trimmed.startsWith('{') && !plainText) {
     try {
       const parsed = JSON.parse(text) as unknown;
       if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) {
@@ -1210,10 +1214,12 @@ export function createMcpServer(deps: McpServerDeps): Server {
             return { ...jsonText(result), structuredContent: { ...result } };
           }
           const { words: _words, ...summary } = result;
-          return {
-            content: [{ type: 'text', text: result.text === '' ? '(no text recognized)' : result.text }],
+          const plain = {
+            content: [{ type: 'text' as const, text: result.text === '' ? '(no text recognized)' : result.text }],
             structuredContent: { ...summary },
           };
+          plainTextResults.add(plain);
+          return plain;
         }
 
         case 'pikvm_get_resolution': {
@@ -1597,10 +1603,14 @@ export function createMcpServer(deps: McpServerDeps): Server {
       })();
       return tagFleetResult(produced, active, fleet.registryActive);
     } catch (error) {
+      // A next step must act on the device that failed, not the default one.
+      if (error instanceof KvmdError && error.next && ctx && fleet.registryActive) {
+        error.next = { ...error.next, args: { ...error.next.args, device: ctx.name } };
+      }
       return tagFleetResult({
         content: [{ type: 'text' as const, text: redactToolText(error, fleet.passwords) }],
         ...(error instanceof KvmdError
-          ? { structuredContent: { error: redactDetails(kvmdErrorDetails(error, fleet.passwords[0] ?? ''), fleet.passwords) } }
+          ? { structuredContent: { error: kvmdErrorDetails(error, fleet.passwords[0] ?? '', fleet.passwords.slice(1)) } }
           : {}),
         isError: true as const,
       }, ctx, fleet.registryActive);

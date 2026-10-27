@@ -2266,10 +2266,10 @@ export class PiKVMClient {
     if (options?.slow) params.set('slow', '1');
     if (options?.delay !== undefined) params.set('delay', hidDelayQueryValue(options.delay));
 
-    const path = `/hid/print?${params}`;
-    await this.request('POST', path, text, 'text/plain');
-    // kvmd answers a print with no delay before it has typed it.
-    return { queuedMs: hidQueuedMs(path, text) };
+    await this.request('POST', `/hid/print?${params}`, text, 'text/plain');
+    // kvmd answers a print with no delay before it has typed it, behind
+    // anything still queued from earlier calls.
+    return { queuedMs: this.hidGate.drainRemainingMs() };
   }
 
   /**

@@ -97,6 +97,11 @@ export class HidGate {
     return [...this.held];
   }
 
+  /** Milliseconds until queued reports from every call are expected to be written. */
+  drainRemainingMs(): number {
+    return Math.max(0, this.backlogEnd - performance.now());
+  }
+
   /**
    * Run `fn` once HID is idle. HID calls that start meanwhile wait until
    * it settles. Throws HidBusyError when HID is not idle within `maxWaitMs`.

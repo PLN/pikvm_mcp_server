@@ -192,6 +192,15 @@ test('HID guard: a press during a waiting close, queued prints, a refused press'
   });
 });
 
+test('the typing estimate includes text still queued from earlier calls', async () => {
+  await withClient({}, {}, async ({ client }) => {
+    const first = await client.type('a'.repeat(400));
+    const second = await client.type('b'.repeat(400));
+    assert.ok(first.queuedMs >= 3900, `first ${first.queuedMs}`);
+    assert.ok(second.queuedMs >= first.queuedMs + 3500, `second ${second.queuedMs} after ${first.queuedMs}`);
+  });
+});
+
 test('closing the client closes the stream session', async () => {
   await withClient({ capture: { running: false } }, { lingerMs: 60_000 }, async ({ mock, client }) => {
     await client.screenshot();
