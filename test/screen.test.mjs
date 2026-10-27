@@ -2,6 +2,8 @@
 // Modified 2026-10 by PLN: frame tests watch crashes, and a capture cannot change a resolved move (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: the HID-send capture test names the mapping it keeps (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: kvmd OCR results are JSON (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: read_text tests that read the JSON ask for detail words (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: fleet hints name the device; OCR text is not merged with the tag (GPL-3.0; see NOTICE).
 
 /**
  * Preview defaults, local crop, coordinate metadata, and optional OCR.
@@ -20,7 +22,7 @@ import { BusyLock } from '../dist/pikvm/lock.js';
 import { PiKVMClient, pixelToNormalized } from '../dist/pikvm/client.js';
 import { limitedSharp } from '../dist/screenshot.js';
 import { createMcpServer } from '../dist/server.js';
-import { kvmdOcr } from '../dist/ocr.js';
+import { hostOcr, kvmdOcr } from '../dist/ocr.js';
 import { startHttpServer } from '../dist/http.js';
 import { startKvmdMock } from './kvmd-mock.mjs';
 
@@ -460,6 +462,67 @@ test('crop bounds and metadata match pixelToNormalized, with and without calibra
   }
 });
 
+test('in a fleet, a next step names its device, and recognized text is not merged with the tag', async (t) => {
+  watchCrashes(t);
+  const lab1 = await startKvmdMock();
+  const lab2 = await startKvmdMock({ capture: { running: true, signal: false } });
+  const dir = mkdtempSync(join(tmpdir(), 'pikvm-fleet-'));
+  try {
+    const passwordFile = join(dir, 'pw');
+    writeFileSync(passwordFile, 'testpw\n', { mode: 0o600 });
+    const device = (url) => ({ host: url, username: 'admin', passwordFile, tls: { mode: 'insecure' } });
+    const config = withEnv({
+      PIKVM_DEVICES: JSON.stringify({ default: 'lab1', devices: { lab1: device(lab1.url), lab2: device(lab2.url) } }),
+    }, () => loadConfig());
+    const fleet = buildFleet(config, { hid: true, msd: true });
+    const frame = await sharp({ create: { width: 1920, height: 1080, channels: 3, background: '#111111' } }).jpeg().toBuffer();
+    fleet.devices.get('lab1').client.fetchFullSnapshot = async () => frame;
+    // Host OCR whose recognized text happens to be a JSON object.
+    const ocr = hostOcr({
+      recognize: async () => ({
+        words: [{ text: '{"answer":42}', conf: 99, bbox: { left: 0, top: 0, width: 4, height: 4 }, block: 1, par: 1, line: 1 }],
+      }),
+    });
+    const srv = await listen(() => createMcpServer({
+      pikvm: fleet.devices.get('lab1').client,
+      lock: fleet.devices.get('lab1').lock,
+      fleet,
+      calibrationConfig,
+      armGateEnforced: false,
+      ocr,
+    }));
+    try {
+      const sessionId = await openSession(srv.base);
+      // Following the hint without a device would type on lab1, the default.
+      const dark = await rpc(srv.base, sessionId, 'tools/call', {
+        name: 'pikvm_screenshot',
+        arguments: { device: 'lab2' },
+      });
+      assert.equal(dark.result.isError, true);
+      assert.deepEqual(dark.result.structuredContent.error.next, {
+        tool: 'pikvm_key',
+        args: { key: 'ShiftLeft', device: 'lab2' },
+      });
+      assert.match(dark.result.content[0].text, /\nNext: pikvm_key \{"key":"ShiftLeft","device":"lab2"\}\n/);
+
+      const read = await rpc(srv.base, sessionId, 'tools/call', {
+        name: 'pikvm_read_text',
+        arguments: { left: 0, top: 0, right: 4, bottom: 4 },
+      });
+      assert.equal(read.result.content[0].text, '{"answer":42}\nDevice: lab1.');
+      assert.equal(read.result.structuredContent.text, '{"answer":42}');
+      assert.equal(read.result.structuredContent.device, 'lab1');
+    } finally {
+      await srv.close();
+      await closeFleet(fleet);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    await lab1.close();
+    await lab2.close();
+  }
+});
+
 test('OCR is hidden when every device is disabled, and a disabled device does not fetch', async (t) => {
   watchCrashes(t);
   const off = await startKvmdMock({ ocr: { enabled: false, langs: [] } });
@@ -507,7 +570,7 @@ test('OCR is hidden when every device is disabled, and a disabled device does no
       assert.equal(names.includes('pikvm_read_text'), false);
       const refused = await rpc(hiddenSrv.base, sessionId, 'tools/call', {
         name: 'pikvm_read_text',
-        arguments: { device: 'lab1' },
+        arguments: { detail: 'words', device: 'lab1' },
       });
       assert.equal(refused.result.isError, true);
       assert.match(refused.result.content[0].text, /PIKVM_OCR_UNAVAILABLE/);
@@ -556,7 +619,7 @@ test('OCR is hidden when every device is disabled, and a disabled device does no
       off.calls.length = 0;
       const blocked = await rpc(srv.base, sessionId, 'tools/call', {
         name: 'pikvm_read_text',
-        arguments: { device: 'lab1', langs: 'eng' },
+        arguments: { detail: 'words', device: 'lab1', langs: 'eng' },
       });
       assert.equal(blocked.result.isError, true);
       assert.match(blocked.result.content[0].text, /PIKVM_OCR_UNAVAILABLE/);
@@ -565,7 +628,7 @@ test('OCR is hidden when every device is disabled, and a disabled device does no
 
       const read = await rpc(srv.base, sessionId, 'tools/call', {
         name: 'pikvm_read_text',
-        arguments: { device: 'lab2', langs: 'eng', left: 1, top: 2, right: 3, bottom: 4 },
+        arguments: { detail: 'words', device: 'lab2', langs: 'eng', left: 1, top: 2, right: 3, bottom: 4 },
       });
       assert.notEqual(read.result.isError, true, read.result.content[0].text);
       const readBody = JSON.parse(read.result.content[0].text);
@@ -578,7 +641,7 @@ test('OCR is hidden when every device is disabled, and a disabled device does no
       on.calls.length = 0;
       const badLang = await rpc(srv.base, sessionId, 'tools/call', {
         name: 'pikvm_read_text',
-        arguments: { device: 'lab2', langs: 'fra' },
+        arguments: { detail: 'words', device: 'lab2', langs: 'fra' },
       });
       assert.equal(badLang.result.isError, true);
       assert.match(badLang.result.content[0].text, /not available/);
@@ -1196,7 +1259,7 @@ test('an OCR box is preview pixels, and text is capped', async (t) => {
       await session.pikvm.probeOcr('default');
       const plain = await rpc(session.srv.base, session.sessionId, 'tools/call', {
         name: 'pikvm_read_text',
-        arguments: { langs: 'eng', left: 1, top: 2, right: 3, bottom: 4 },
+        arguments: { detail: 'words', langs: 'eng', left: 1, top: 2, right: 3, bottom: 4 },
       });
       const plainBody = JSON.parse(plain.result.content[0].text);
       assert.equal(plainBody.engine, 'kvmd');
@@ -1216,7 +1279,7 @@ test('an OCR box is preview pixels, and text is capped', async (t) => {
       mock.calls.length = 0;
       const scaled = await rpc(session.srv.base, session.sessionId, 'tools/call', {
         name: 'pikvm_read_text',
-        arguments: { langs: 'eng', left: 1, top: 2, right: 3, bottom: 4 },
+        arguments: { detail: 'words', langs: 'eng', left: 1, top: 2, right: 3, bottom: 4 },
       });
       assert.notEqual(scaled.result.isError, true, scaled.result.content[0].text);
       assert.equal(
@@ -1232,7 +1295,7 @@ test('an OCR box is preview pixels, and text is capped', async (t) => {
       mock.calls.length = 0;
       const inCrop = await rpc(session.srv.base, session.sessionId, 'tools/call', {
         name: 'pikvm_read_text',
-        arguments: { langs: 'eng', left: 1, top: 2, right: 3, bottom: 4, frameId: cropId },
+        arguments: { detail: 'words', langs: 'eng', left: 1, top: 2, right: 3, bottom: 4, frameId: cropId },
       });
       assert.notEqual(inCrop.result.isError, true, inCrop.result.content[0].text);
       assert.equal(
@@ -1243,7 +1306,7 @@ test('an OCR box is preview pixels, and text is capped', async (t) => {
       mock.calls.length = 0;
       const outside = await rpc(session.srv.base, session.sessionId, 'tools/call', {
         name: 'pikvm_read_text',
-        arguments: { langs: 'eng', left: 0, top: 0, right: 1000, bottom: 10, frameId },
+        arguments: { detail: 'words', langs: 'eng', left: 0, top: 0, right: 1000, bottom: 10, frameId },
       });
       assert.equal(outside.result.isError, true);
       assert.match(outside.result.content[0].text, /outside the frame/);
@@ -1252,7 +1315,7 @@ test('an OCR box is preview pixels, and text is capped', async (t) => {
       mock.calls.length = 0;
       const missing = await rpc(session.srv.base, session.sessionId, 'tools/call', {
         name: 'pikvm_read_text',
-        arguments: { frameId: '00000000-0000-4000-8000-000000000000' },
+        arguments: { detail: 'words', frameId: '00000000-0000-4000-8000-000000000000' },
       });
       assert.equal(missing.result.isError, true);
       assert.match(missing.result.content[0].text, /PIKVM_UNKNOWN_FRAME/);

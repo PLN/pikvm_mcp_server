@@ -18,6 +18,7 @@
 // Modified 2026-10 by PLN: the upload response read is phase job_timeout (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a reply cut short after Connection: close (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: idle capture, /api/ws stream sessions, GET /api/hid (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: USB keyboard and mouse online state (GPL-3.0; see NOTICE).
 
 /**
  * Minimal KVMD REST mock implementing exactly the routes src/pikvm/client.ts
@@ -84,7 +85,8 @@
  * signal, snapshots are HTTP 503. `wsStatus` refuses the upgrade with that
  * status. `wsEvents` records opens and closes, `setSignal()` changes the
  * signal. GET /api/hid reports an absolute mouse unless `mouseAbsolute`
- * is false.
+ * is false, and an online USB keyboard and mouse unless `hidOnline` is
+ * false (a host that is off or unplugged).
  */
 
 import crypto from 'node:crypto';
@@ -972,7 +974,11 @@ export async function startKvmdMock(options = {}) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         ok: true,
-        result: { online: true, mouse: { absolute: options.mouseAbsolute !== false, online: true } },
+        result: {
+          online: true,
+          keyboard: { online: options.hidOnline !== false },
+          mouse: { absolute: options.mouseAbsolute !== false, online: options.hidOnline !== false },
+        },
       }));
       return;
     }

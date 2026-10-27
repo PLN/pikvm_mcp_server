@@ -1,4 +1,5 @@
 // Modified 2026-10 by PLN: idle capture start, no signal, HID ordering, relative moves (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: the no-signal cause from USB state (GPL-3.0; see NOTICE).
 
 /**
  * kvmd runs capture only while a stream-enabled WebSocket is connected.
@@ -63,7 +64,8 @@ test('no signal is reported at once when capture already runs, and after the wai
   await withClient({ capture: { running: true, signal: false } }, {}, async ({ mock, client }) => {
     await assert.rejects(client.screenshot(), (err) => {
       assert.equal(err.type, 'PIKVM_NO_SIGNAL');
-      assert.match(err.message, /ShiftLeft/);
+      assert.equal(err.reason, 'display_asleep');
+      assert.deepEqual(err.next, { tool: 'pikvm_key', args: { key: 'ShiftLeft' } });
       return true;
     });
     await assert.rejects(client.getResolution(true), { type: 'PIKVM_NO_SIGNAL' });
@@ -81,6 +83,19 @@ test('no signal is reported at once when capture already runs, and after the wai
     const shot = await client.screenshot();
     assert.equal(shot.actualWidth, 1920);
     assert.equal(opens(mock).length, 1);
+  });
+});
+
+test('no signal with the USB keyboard and mouse offline is a host that is off or unplugged', async () => {
+  // As on a PiKVM whose host was unplugged: no picture, keyboard and mouse offline.
+  await withClient({ capture: { running: true, signal: false }, hidOnline: false }, {}, async ({ client }) => {
+    await assert.rejects(client.screenshot(), (err) => {
+      assert.equal(err.type, 'PIKVM_NO_SIGNAL');
+      assert.equal(err.reason, 'usb_offline');
+      assert.match(err.message, /off, suspended or unplugged/);
+      assert.equal(err.next, undefined);
+      return true;
+    });
   });
 });
 
@@ -174,6 +189,15 @@ test('HID guard: a press during a waiting close, queued prints, a refused press'
     await assert.rejects(client.sendKey('NoSuchKey', { state: true }), { status: 400 });
     await client.screenshot();
     assert.equal(opens(mock).length, 1);
+  });
+});
+
+test('the typing estimate includes text still queued from earlier calls', async () => {
+  await withClient({}, {}, async ({ client }) => {
+    const first = await client.type('a'.repeat(400));
+    const second = await client.type('b'.repeat(400));
+    assert.ok(first.queuedMs >= 3900, `first ${first.queuedMs}`);
+    assert.ok(second.queuedMs >= first.queuedMs + 3500, `second ${second.queuedMs} after ${first.queuedMs}`);
   });
 });
 
