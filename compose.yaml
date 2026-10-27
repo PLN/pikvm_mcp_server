@@ -1,6 +1,6 @@
 # Modified 2026-10 by PLN: Docker image (GPL-3.0; see NOTICE).
 # Modified 2026-10 by PLN: the image is published (GPL-3.0; see NOTICE).
-# Modified 2026-10 by PLN: image 0.4.0 (GPL-3.0; see NOTICE).
+# Modified 2026-10 by PLN: image 0.4.1 (GPL-3.0; see NOTICE).
 #
 # Quick start: write secrets into the volume (umask 077; at least 32
 # random bytes for the bearer, e.g. openssl rand -hex 32), then
@@ -11,7 +11,7 @@
 # A registry in /data/devices.json needs no PIKVM_HOST.
 services:
   pikvm-mcp:
-    image: ghcr.io/pln/pikvm_mcp_server:0.4.0   # pin X.Y.Z or @sha256 in production
+    image: ghcr.io/pln/pikvm_mcp_server:0.4.1   # pin X.Y.Z or @sha256 in production
     restart: unless-stopped
     user: "10001:10001"               # "$(id -u):$(id -g)" for a bind-mounted ./data
     read_only: true

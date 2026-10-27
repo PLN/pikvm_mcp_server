@@ -1,6 +1,6 @@
 # Modified 2026-10 by PLN: Tailscale sidecar example (GPL-3.0; see NOTICE).
 # Modified 2026-10 by PLN: the image is published (GPL-3.0; see NOTICE).
-# Modified 2026-10 by PLN: image 0.4.0 (GPL-3.0; see NOTICE).
+# Modified 2026-10 by PLN: image 0.4.1 (GPL-3.0; see NOTICE).
 #
 # The MCP endpoint is reachable over the tailnet only: tailscale serve
 # (./ts-config/serve.json) forwards HTTPS 443 to http://127.0.0.1:8675.
@@ -35,7 +35,7 @@ services:
       - ./ts-config:/config:ro
 
   pikvm-mcp:
-    image: ghcr.io/pln/pikvm_mcp_server:0.4.0   # pin X.Y.Z or @sha256 in production
+    image: ghcr.io/pln/pikvm_mcp_server:0.4.1   # pin X.Y.Z or @sha256 in production
     network_mode: service:tailscale
     depends_on:
       tailscale:
