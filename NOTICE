@@ -1331,6 +1331,10 @@ No code from another pikvm_mcp_server fork was added for these methods.
   advisory to fail and a clean one to pass with a scanned target.
   gate-selftest.yml runs them in PR CI. test/release-condition.mjs
   evaluates the publish condition for every combination of upstream
-  results, and release-condition-test.yml also runs it in a stub job
-  graph for the cases that need no failing job.
+  results with GitHub's operator precedence, and must also catch known
+  wrong edits of it. release-condition-test.yml also runs it in a stub
+  job graph for the cases that need no failing job. The waiver lint
+  requires purls and paths to be lists of non-blank strings, and the
+  gate self-test checks it refuses a blank path. publish skips attesting
+  only when the registry already holds a verifying attestation.
   No code from another pikvm_mcp_server fork was copied.

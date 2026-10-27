@@ -4,7 +4,10 @@
 # Usage: scripts/lint-waivers.sh [file]   (default: .trivyignore.yaml)
 # Each entry under vulnerabilities needs an id, purls or paths, a
 # statement, and an expired_at date (YYYY-MM-DD) that has not passed and
-# is at most 90 days from today (UTC). An empty list passes.
+# is at most 90 days from today (UTC). purls and paths must be lists of
+# non-blank strings: Trivy matches an empty path against a package with
+# no path, so paths: [''] would waive the advisory everywhere. An empty
+# list of waivers passes.
 # Needs yq v4 (mikefarah, preinstalled on GitHub's Ubuntu runners) and jq.
 set -euo pipefail
 
@@ -23,6 +26,10 @@ problems=$(jq -r --arg today "$today" --arg limit "$limit" '
     | (if ($w.id | type) != "string" or $w.id == "" then "\($at): id is missing" else empty end),
       (if ((($w.purls // []) | length) + (($w.paths // []) | length)) == 0
         then "\($at): needs purls or paths; an id alone waives every package" else empty end),
+      (["purls", "paths"][] as $k | $w[$k] as $v
+        | if $v == null then empty
+          elif ($v | type) != "array" or any($v[]; (type != "string") or test("^\\s*$"))
+          then "\($at): \($k) must be a list of non-blank strings" else empty end),
       (if ($w.statement | type) != "string" or ($w.statement | length) == 0
         then "\($at): statement is missing" else empty end),
       (($w.expired_at // "") | tostring) as $exp

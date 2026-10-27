@@ -7,7 +7,8 @@
 # must pass with a scanned target, so an empty scan cannot pass. A dropped
 # --exit-code, an over-broad waiver, or a Trivy bump that fails open
 # breaks this test. The fixtures use a .json.txt name so Dependabot and
-# the dependency graph leave them alone.
+# the dependency graph leave them alone. It also checks that the waiver
+# lint refuses a blank path.
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -38,3 +39,15 @@ if [ "$results" -lt 1 ]; then
   exit 1
 fi
 echo "gate-selftest: bad fixture fails, good fixture passes with $results target(s)"
+
+# A blank path matches every package without a path, so this waiver
+# would silence the advisory everywhere. The lint must refuse it for that
+# reason; the fixture's fixed expiry date eventually fails on its own.
+lint_rc=0
+lint_out=$(bash "$root/scripts/lint-waivers.sh" "$root/test/fixtures/gate/waiver-blank-path.yaml" 2>&1) || lint_rc=$?
+if [ "$lint_rc" -eq 0 ] || ! grep -q 'paths must be a list of non-blank strings' <<<"$lint_out"; then
+  echo "gate-selftest: the waiver lint did not refuse the blank path (exit $lint_rc)" >&2
+  printf '%s\n' "$lint_out" >&2
+  exit 1
+fi
+echo "gate-selftest: the waiver lint refuses a blank path"

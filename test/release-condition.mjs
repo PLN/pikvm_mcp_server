@@ -101,25 +101,29 @@ function evaluate(src, ctx) {
     }
     throw new Error(`unexpected ${JSON.stringify(t)}`);
   }
+  // GitHub's precedence: ! binds tighter than == and !=, which bind
+  // tighter than &&, then ||. So !a != b is (!a) != b.
   function unary() {
     if (peek()?.op === '!') {
       i += 1;
       return !truthy(unary());
     }
-    const left = primary();
-    const op = peek()?.op;
-    if (op === '==' || op === '!=') {
-      i += 1;
-      const right = primary();
-      return op === '==' ? equal(left, right) : !equal(left, right);
+    return primary();
+  }
+  function equality() {
+    let v = unary();
+    while (peek()?.op === '==' || peek()?.op === '!=') {
+      const op = tokens[i++].op;
+      const r = unary();
+      v = op === '==' ? equal(v, r) : !equal(v, r);
     }
-    return left;
+    return v;
   }
   function and() {
-    let v = unary();
+    let v = equality();
     while (peek()?.op === '&&') {
       i += 1;
-      const r = unary();
+      const r = equality();
       v = truthy(v) ? r : v;
     }
     return v;
@@ -148,37 +152,65 @@ function specified({ cancelled, verify, resume, build, smoke, scan }) {
 
 const results = ['success', 'failure', 'cancelled', 'skipped'];
 const resumes = ['true', 'false', '', null];
-let checked = 0;
-let runs = 0;
-for (const cancelled of [false, true]) {
-  for (const verify of results) {
-    for (const resume of resumes) {
-      for (const build of results) {
-        for (const smoke of results) {
-          for (const scan of results) {
-            const c = { cancelled, verify, resume, build, smoke, scan };
-            const outputs = resume === null ? {} : { resume };
-            const ctx = {
-              cancelled,
-              needs: {
-                verify: { result: verify, outputs },
-                build: { result: build },
-                smoke: { result: smoke },
-                scan: { result: scan },
-              },
-            };
-            const got = evaluate(match[1], ctx);
-            if (got !== specified(c)) {
-              throw new Error(`publish would ${got ? 'run' : 'skip'} for ${JSON.stringify(c)}`);
+
+function* combinations() {
+  for (const cancelled of [false, true]) {
+    for (const verify of results) {
+      for (const resume of resumes) {
+        for (const build of results) {
+          for (const smoke of results) {
+            for (const scan of results) {
+              const c = { cancelled, verify, resume, build, smoke, scan };
+              const ctx = {
+                cancelled,
+                needs: {
+                  verify: { result: verify, outputs: resume === null ? {} : { resume } },
+                  build: { result: build },
+                  smoke: { result: smoke },
+                  scan: { result: scan },
+                },
+              };
+              yield { c, ctx };
             }
-            checked += 1;
-            if (got) runs += 1;
           }
         }
       }
     }
   }
 }
+
+let checked = 0;
+let runs = 0;
+for (const { c, ctx } of combinations()) {
+  const got = evaluate(match[1], ctx);
+  if (got !== specified(c)) {
+    throw new Error(`publish would ${got ? 'run' : 'skip'} for ${JSON.stringify(c)}`);
+  }
+  checked += 1;
+  if (got) runs += 1;
+}
+
+// The evaluator itself must reject wrong edits of the condition. The
+// second one was missed when ! was parsed below ==.
+const mutations = [
+  [/^!cancelled\(\) && /, ''],
+  [/needs\.scan\.result == 'success'/, "!needs.scan.result != 'success'"],
+  [/needs\.verify\.outputs\.resume != 'true' && /, ''],
+  [/needs\.scan\.result == 'success'/, "needs.scan.result != 'failure'"],
+];
+for (const [from, to] of mutations) {
+  const mutated = match[1].replace(from, to);
+  if (mutated === match[1]) throw new Error(`self-check mutation ${from} no longer applies; update it with the condition`);
+  let caught = false;
+  for (const { c, ctx } of combinations()) {
+    if (evaluate(mutated, ctx) !== specified(c)) {
+      caught = true;
+      break;
+    }
+  }
+  if (!caught) throw new Error(`the check misses a wrong condition: ${mutated}`);
+}
+console.log(`ok: ${mutations.length} wrong edits of the condition are caught`);
 
 // The named cases from the design, as a readable record.
 const named = [

@@ -423,16 +423,19 @@ jobs:
             exit 1
           fi
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
-      # A duplicate attestation is harmless, so anything but a clean
-      # verify means attest. In resume mode the attestation names the
-      # resume run; verify by signer workflow, not by source commit.
-      - name: (c) Check for an existing attestation
+      # Skip only when the registry already holds a verifying attestation.
+      # attest stores it on GitHub before pushing it to ghcr, so a run that
+      # failed between the two must attest again. A duplicate is harmless,
+      # so anything but a clean verify means attest. In resume mode the
+      # attestation names the resume run; verify by signer workflow, not
+      # by source commit.
+      - name: (c) Check for an existing attestation in the registry
         id: attested
         env:
           GH_TOKEN: ${{ github.token }}
           DIGEST: ${{ steps.index.outputs.digest }}
         run: |
-          if gh attestation verify "oci://$IMAGE@$DIGEST" --owner PLN >/dev/null 2>&1; then
+          if gh attestation verify "oci://$IMAGE@$DIGEST" --owner PLN --bundle-from-oci >/dev/null 2>&1; then
             echo "done=true" >> "$GITHUB_OUTPUT"
           else
             echo "done=false" >> "$GITHUB_OUTPUT"
