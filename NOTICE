@@ -73,8 +73,13 @@ Modified 2026-10 by PLN: privacy guard review fixes (GPL-3.0; see below).
 Modified 2026-10 by PLN: graceful shutdown and an external upload abort (GPL-3.0; see below).
 Modified 2026-10 by PLN: Docker image, entrypoint, compose file, and image smoke test (GPL-3.0; see below).
 Modified 2026-10 by PLN: a cut-short POST reply is state unknown; CI checkouts keep no credentials (GPL-3.0; see below).
+Modified 2026-10 by PLN: Docker and systemd guides, README and package metadata fixes (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
+
+Copyright (C) 2026 PLN, for the modifications listed in this file.
+Copyright in the upstream code stays with its authors; the projects are
+listed under Origins.
 
 Licence
 -------
@@ -1279,4 +1284,25 @@ No code from another pikvm_mcp_server fork was added for these methods.
   set persist-credentials to false, as the docker job already does.
   The npm audit warning says the audit may have failed rather
   than claiming advisories for every non-zero exit.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  docs/docker.md describes the container image: the Compose quick start,
+  the /data layout, the defaults the entrypoint fills, exit codes,
+  permissions, exposure, the Tailscale sidecar, pinning and a private CA,
+  upgrades, troubleshooting, and the licence and source statement.
+  docs/systemd.md takes the systemd drop-ins from README.md.
+  compose.tailscale.yaml is a sidecar example in kernel mode with no
+  published ports. README.md gains a Docker quick start, a fork line,
+  claude mcp add commands in place of a wrong settings path, and the
+  correct statement that verify mode uses Node's bundled CA roots
+  (NODE_EXTRA_CA_CERTS adds a private CA). Tailscale certificates come
+  from Let's Encrypt and need no extra trust. The upstream SonarQube and
+  LobeHub badges are removed: they describe the upstream project.
+  .env.example notes the Docker defaults and no longer sets
+  PIKVM_MCP_NO_DOTENV=0. package.json names PLN as author and this
+  repository. This file gains a copyright line for the fork's changes.
+  The image smoke test also validates compose.tailscale.yaml. Two
+  docker/entrypoint.sh comments no longer imply that an exit code stops
+  a restart policy from retrying.
   No code from another pikvm_mcp_server fork was copied.

@@ -41,21 +41,15 @@
 <!-- Modified 2026-10 by PLN: undici floor is 7.30.1 (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: allowScripts names sharp@0.35.5 (GPL-3.0; see NOTICE) -->
 <!-- Modified 2026-10 by PLN: graceful shutdown (GPL-3.0; see NOTICE) -->
+<!-- Modified 2026-10 by PLN: Docker quick start, client setup, CA wording, upstream badges removed (GPL-3.0; see NOTICE) -->
 
 # PiKVM MCP Server
-
-
-[![SonarQube Cloud](https://sonarcloud.io/images/project_badges/sonarcloud-light.svg)](https://sonarcloud.io/summary/new_code?id=kultivator-consulting_pikvm_mcp_server)
-
-
-[![MCP Badge](https://lobehub.com/badge/mcp/kultivatorconsulting-pikvm_mcp_server?style=plastic)](https://lobehub.com/mcp/kultivatorconsulting-pikvm_mcp_server)
-
-
-
 
 Give AI agents hands. This MCP server connects Claude Code (or any MCP client) directly to a [PiKVM](https://pikvm.org/) device, giving AI full keyboard, mouse, and screen access to a physical machine -- no browser automation, no virtual desktops, no emulators.
 
 Point it at real hardware. Let the AI see the screen, type commands, click buttons, and navigate GUIs on a machine it could never otherwise touch.
+
+This is PLN's fork of [KultivatorConsulting/pikvm_mcp_server](https://github.com/KultivatorConsulting/pikvm_mcp_server), distributed under GPL-3.0-only. See [LICENSE](LICENSE) and [NOTICE](NOTICE) for the licence, the origins, and the modification log.
 
 <p align="center">
   <img src="assets/simple_setup.jpg" alt="Raspberry Pi 5 connected to a PiKVM V4 Plus" width="600">
@@ -98,10 +92,31 @@ This next demonstration shows Claude, connected via the PiKVM MCP server, respon
 
 ## Installation
 
+### Docker
+
+The container image is the default way to run the server: Node.js, tesseract, and a `/data` volume for secrets, pinned certificates, and ISO images, running as an unprivileged user. `compose.yaml` adds a read-only root filesystem with every capability dropped. The full guide, including the Tailscale sidecar, is [docs/docker.md](docs/docker.md).
+
+> **Not yet published.** Until the first image release, build it with `docker buildx build --load -t pikvm-mcp:local .` and set `image: pikvm-mcp:local` in a `compose.override.yaml` (see [docs/docker.md](docs/docker.md)).
+
+```bash
+umask 077
+echo 'PIKVM_HOST=https://pikvm.example.net' > .env
+openssl rand -hex 32 > bearer.txt          # the MCP client needs this token
+docker compose run --rm -T --entrypoint sh pikvm-mcp -c 'umask 077; cat > /data/secrets/pikvm-mcp-bearer' < bearer.txt
+printf '%s' 'the-kvmd-password' | docker compose run --rm -T --entrypoint sh pikvm-mcp -c 'umask 077; cat > /data/secrets/pikvm-password'
+docker compose run --rm pikvm-mcp pin default   # compare the fingerprint with the PiKVM web UI, then type yes
+docker compose up -d
+claude mcp add --transport http pikvm http://127.0.0.1:8675/mcp --header "Authorization: Bearer $(cat bearer.txt)"
+```
+
+### From source
+
 ```bash
 npm install
 npm run build
 ```
+
+Running it as a systemd service is described in [docs/systemd.md](docs/systemd.md).
 
 `package.json` `allowScripts` is pinned to the versions in `package-lock.json`: `sharp@0.35.5` is allowed, and `esbuild@0.27.2` and `fsevents@2.3.3` are denied. sharp is used at runtime. sharp 0.35.5 publishes no install script; the pin still names that version and allows it. esbuild is only pulled in by `tsx` for `npm run dev`, and its postinstall is denied. fsevents is an optional dependency of `tsx`, installed on macOS only, and its install script is denied. A bump of any of these packages must update that pin in the same change, after the new install script is reviewed. Do not replace the map with a blanket allow. CI installs with npm 12 and `--strict-allow-scripts`, which fails the install when a dependency install script is neither allowed nor denied.
 
@@ -144,15 +159,7 @@ PIKVM_MSD_READY_TIMEOUT_MS=30000
 
 A direct value is used verbatim, including a trailing newline. Only file bytes lose exactly one trailing newline (`\n` or `\r\n`) and a leading UTF-8 BOM. Other whitespace, including a trailing space or a second newline, stays. Empty file content is a startup error. A NUL byte in a file is an error that names the variable and the path. An empty direct value and an empty `*_FILE` are unset and fall through. Symlinks are followed. The file is opened non-blocking and the opened target must be a regular file: a directory, FIFO, socket, or device is rejected, and a FIFO open does not wait. Other bits (`o+rwx`) are warned on stderr, with the variable name, the path, and the mode, never the value. Group bits are warned the same way, except when every one of these holds: `CREDENTIALS_DIRECTORY` is set, `realpath` of the file is a direct child of `realpath` of that directory, that directory is under `/run/credentials/<name>/` (not `/run/credentials` itself), the opened path is not a symlink, and `fstat` of the opened file has the same device and inode as `stat` of that real path. The credentials root is `/run/credentials` (or the test stand-in). `CREDENTIALS_DIRECTORY` does not choose that root. systemd `LoadCredential` files are often mode `0440` because of an ACL mask, and that group bit is not warned. The same exception applies when `PIKVM_PASSWORD_FILE`, `PIKVM_MCP_BEARER_FILE`, or a registry `passwordFile` points at such a file. The reader does not change the mode or the owner, and it does not copy the file. The mode check is skipped on Windows. A file larger than 64 KiB is rejected before the body is read. A missing or unreadable `*_FILE` is a startup error that names the variable and the path. If the direct variable and `*_FILE` are both non-empty, the direct variable wins and one stderr line says the file variable was ignored. In HTTP mode, a bearer with leading or trailing whitespace is rejected at startup. stdio does not use the bearer, so the same value still starts. The error names `PIKVM_MCP_BEARER` and not the value. None of these messages include the secret. A registry `passwordFile` uses this same file reader. `passwordCredential` is one path segment under `CREDENTIALS_DIRECTORY`.
 
-```ini
-# /etc/systemd/system/pikvm-mcp.service.d/credentials.conf
-[Service]
-LoadCredential=pikvm-password:/etc/pikvm/password
-LoadCredential=pikvm-mcp-bearer:/etc/pikvm/bearer
-Environment=PIKVM_HOST=https://pikvm.example.ts.net
-Environment=PIKVM_MCP_PORT=8675
-Environment=PIKVM_MCP_NO_DOTENV=1
-```
+A systemd drop-in that loads both credentials is in [docs/systemd.md](docs/systemd.md). The container image fills `PIKVM_PASSWORD_FILE` and `PIKVM_MCP_BEARER_FILE` from `/data/secrets/` instead ([docs/docker.md](docs/docker.md)).
 
 `PIKVM_REQUEST_TIMEOUT_MS` is the abort deadline, in milliseconds, for one ordinary kvmd call. It must be a string of digits from 1 to 600000 (default 5000). `5000abc`, `1e3`, ` 5000 `, `5.5`, and `0` use the default. A value above 600000 is clamped to 600000. An idempotent GET that fails with a network error, a timeout, HTTP 502, or HTTP 503 is tried up to 3 times (backoff 250 ms, then 500 ms, plus a little jitter). POST is not retried. HTTP 500 and 504 are not retried. `GET /streamer/snapshot` retries HTTP 503 once after a 1500 ms grace period, for the ustreamer idle-stop race. That extra try does not use up one of the three attempts, so a snapshot can make at most 4 calls.
 
@@ -170,7 +177,7 @@ kvmd ships a self-signed certificate. Three modes select how this process checks
 | `PIKVM_TLS_CERT_FILE` | PEM file for `pin`. Required in that mode. A regular file, at most 64 KiB. Opened the same non-blocking way as a secret file. It is not a secret: a loose mode is not warned. |
 | `PIKVM_VERIFY_SSL` | Legacy switch. Exactly `true` means `verify`. Any other value, including unset, means `insecure`. Ignored when `PIKVM_TLS_MODE` is set, with one stderr line when the two disagree. |
 
-`verify` uses the system CA store and checks the hostname. A stock self-signed certificate fails with `PIKVM_TLS_VERIFY_FAILED`. `pin` sends the pinned PEM as the only CA, keeps certificate checking on, and compares the leaf SPKI sha256. The hostname is not the identity, so an IP or a name that is not on the certificate still matches when the key matches. A CA-signed leaf is trusted on its own (`allowPartialTrustChain`), which is how a Tailscale or Let's Encrypt certificate works after `pin default`. Pin the leaf only. Pinning a CA or an intermediate fails with `PIKVM_TLS_PIN_MISMATCH`, because that key is not the leaf key. `insecure` turns certificate checks off.
+`verify` checks the certificate against Node's bundled CA roots, not the host's CA store, and checks the hostname. To trust a private CA, set `NODE_EXTRA_CA_CERTS` to its PEM file before the process starts (the container image does this for `/data/tls/ca.pem`). A stock self-signed certificate fails with `PIKVM_TLS_VERIFY_FAILED`. `pin` sends the pinned PEM as the only CA, keeps certificate checking on, and compares the leaf SPKI sha256. The hostname is not the identity, so an IP or a name that is not on the certificate still matches when the key matches. A CA-signed leaf is trusted on its own (`allowPartialTrustChain`), which is how a Tailscale or Let's Encrypt certificate works after `pin default`. Pin the leaf only. Pinning a CA or an intermediate fails with `PIKVM_TLS_PIN_MISMATCH`, because that key is not the leaf key. `insecure` turns certificate checks off.
 
 `insecure` is the current default: if `PIKVM_TLS_MODE` is unset and `PIKVM_VERIFY_SSL` is not exactly `true`, the process uses `insecure` and writes one stderr line naming that mode and `pikvm-mcp-server pin default`. That keeps existing self-signed setups working. Switching the default to `pin` or `verify` waits for a later major release. An explicit `PIKVM_TLS_MODE=insecure` logs the same kind of warning. A pin failure or a verify failure is terminal. It is not retried, it is not reported as `PIKVM_UNREACHABLE`, and it never falls back to `insecure`.
 
@@ -185,7 +192,7 @@ export PIKVM_TLS_MODE=pin
 
 `pin default` connects once, with verification disabled only for that handshake. It sends no request and no password. It prints the subject, issuer, validity, SHA-256 certificate fingerprint, and SPKI sha256. On a terminal it writes the file only after you type `yes`. Without a terminal it writes nothing unless you pass `--yes`. `--yes` is for a scripted re-pin after the new certificate was verified out of band. Replacing an existing file prints the old SPKI and the new SPKI first. A file that is already there but is corrupt or not a certificate is shown as `old SPKI sha256: unreadable`, and the command still asks before it writes. The write is a temp file in the same directory, then a rename, mode `0644`. The rename replaces a symlink at `--out` and does not write through it. On POSIX the directory is fsynced after the rename, best-effort. The command writes the leaf only, and it does not run by itself. A pin failure does not run it. An `https://[::1]/` host is connected as `::1` with no SNI name.
 
-An optional alternative is `verify` with a Tailscale certificate. On the PiKVM, `tailscale cert pikvm.example.ts.net` creates a certificate for that MagicDNS name. Trust the Tailscale CA on the machine that runs this server, set `PIKVM_HOST=https://pikvm.example.ts.net` and `PIKVM_TLS_MODE=verify`, and leave `PIKVM_TLS_CERT_FILE` unset. That is a choice, not the default, and it still needs the name on the certificate to match the host.
+An optional alternative is `verify` with a Tailscale certificate. On the PiKVM, `tailscale cert pikvm.example.ts.net` creates a certificate for that MagicDNS name. Those certificates come from Let's Encrypt, which Node already trusts. Set `PIKVM_HOST=https://pikvm.example.ts.net` and `PIKVM_TLS_MODE=verify`, and leave `PIKVM_TLS_CERT_FILE` unset. That is a choice, not the default, and it still needs the name on the certificate to match the host.
 
 ## Device registry
 
@@ -234,19 +241,9 @@ Two Tailscale devices, one pinned and one checked with a Tailscale certificate:
 }
 ```
 
-`lab2` is `verify` against the MagicDNS name on a Tailscale certificate. Trust that CA on the machine that runs this server. `lab1` is pinned. Create or replace the pin with `pikvm-mcp-server pin lab1`, which connects to `lab1`'s host and writes `tls.certFile` unless `--out` is set. The first pin can run before that file exists. The command still sends no password.
+`lab2` is `verify` against the MagicDNS name on a Tailscale certificate, which Node trusts without extra setup. `lab1` is pinned. Create or replace the pin with `pikvm-mcp-server pin lab1`, which connects to `lab1`'s host and writes `tls.certFile` unless `--out` is set. The first pin can run before that file exists. The command still sends no password.
 
-```ini
-# /etc/systemd/system/pikvm-mcp.service.d/devices.conf
-[Service]
-LoadCredential=pikvm-lab1:/etc/pikvm/lab1-password
-LoadCredential=pikvm-lab2:/etc/pikvm/lab2-password
-Environment=PIKVM_DEVICES_FILE=/etc/pikvm-mcp/devices.json
-Environment=PIKVM_MCP_PORT=8675
-Environment=PIKVM_MCP_NO_DOTENV=1
-```
-
-systemd sets `CREDENTIALS_DIRECTORY` for those credential names. Do not also set `PIKVM_HOST` or `PIKVM_PASSWORD` for these devices.
+`passwordCredential` names a systemd credential; [docs/systemd.md](docs/systemd.md) has the matching drop-in. In the container image use `passwordFile` with a path under `/data/secrets/` instead, and absolute `/data/...` paths for `tls.certFile` and `msdLocalDir`. Do not also set `PIKVM_HOST` or `PIKVM_PASSWORD` for these devices.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
@@ -289,8 +286,10 @@ PIKVM_MCP_NO_DOTENV=0
 - **`PIKVM_MCP_HOST`** — bind address, default `127.0.0.1`. Set it to a
   specific interface address (e.g. the docker bridge gateway IP `172.17.0.1`)
   if a containerized reverse proxy needs to reach the instance from outside
-  host loopback. Avoid wildcard binds (`0.0.0.0`) — bind only the interface
-  the proxy actually uses.
+  host loopback. On a host, avoid wildcard binds (`0.0.0.0`) — bind only the
+  interface the proxy actually uses. The container image binds `0.0.0.0`
+  inside its own network namespace, and `compose.yaml` publishes the port on
+  `127.0.0.1` only.
 - **`PIKVM_MCP_BEARER`** — required token for every `/mcp` request
   (`Authorization: Bearer <token>`), on POST, GET, and DELETE alike. HTTP
   mode **refuses to start** without it. The refusal names `PIKVM_MCP_BEARER`,
@@ -316,7 +315,8 @@ PIKVM_MCP_NO_DOTENV=0
   this variable and no mass-storage change reaches the device.
   `PIKVM_MCP_ARM_HID=1` does not arm them. Set `1` to arm. stdio mode is never gated.
 - **`PIKVM_MSD_LOCAL_DIR`** — directory `pikvm_msd_upload` may read, by bare
-  file name only. Unset hides that tool.
+  file name only. Unset hides that tool. The container image defaults it to
+  `/data/images`.
 - **`PIKVM_MSD_MAX_BYTES`** — per-transfer cap. Default 16 GiB.
 - **`PIKVM_MSD_URL_ALLOWLIST`** — comma-separated entries. An https entry is
   `https://host[:port]/path-prefix` (`https://images.example/iso` matches that
@@ -417,7 +417,8 @@ curl -i -X POST http://localhost:8675/mcp \
   arming is a per-deployment, explicit decision.
 - Bind defaults to `127.0.0.1`; widen it only when a local proxy/gateway
   actually needs the network, and front with a reverse proxy for TLS
-  termination or origin/host filtering.
+  termination or origin/host filtering. In Docker, keep the published port
+  on `127.0.0.1` ([docs/docker.md](docs/docker.md), Exposure).
 - No SSE streams: POSTs always return a single JSON body and the standalone
   GET SSE stream answers 405. Long-lived SSE connections are killed by
   Cloudflare's edge (and similar proxies), so keeping every MCP exchange a
@@ -442,7 +443,13 @@ HTTP mode stops accepting new connections, closes idle connections, aborts those
 
 > **Node.js:** `engines` is `>=22.9.0`. Pin mode sets `allowPartialTrustChain`, which Node added in 22.9.0, so a CA-signed leaf can be the pin. Node.js 20 is end-of-life. The runtime dependency undici 7.30.1 needs Node.js >=20.18.1, and `npm test` quotes a glob that `node --test` expands only on Node.js 21 and later. This server uses ES modules. If `node --version` shows an older version, replace `"command": "node"` with the full path to a compatible binary (e.g. `"/usr/local/bin/node"` or your nvm path like `"~/.nvm/versions/node/v22.x.x/bin/node"`). This is common when nvm's default alias points to an older version.
 
-Add to your Claude Code MCP settings (`~/.config/claude-code/settings.json` or via the settings UI):
+The container image includes Node.js; the Docker commands are in [docs/docker.md](docs/docker.md). For a build from source, register it with Claude Code:
+
+```bash
+claude mcp add --transport stdio --scope user pikvm -- node /path/to/pikvm_mcp_server/dist/index.js
+```
+
+`--scope user` stores the server in `~/.claude.json` for every project. `--scope project` writes a `.mcp.json` in the project root that can be committed; without `--scope` the entry is private to the current project. Pass settings with `--env PIKVM_HOST=...`, or rely on the `.env` next to the build. The same entry as JSON, for a `.mcp.json` or another MCP client:
 
 ```json
 {

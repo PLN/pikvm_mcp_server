@@ -22,8 +22,13 @@
     "remote-control",
     "hid"
   ],
-  "author": "",
+  "author": "PLN",
   "license": "GPL-3.0-only",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PLN/pikvm_mcp_server.git"
+  },
+  "homepage": "https://github.com/PLN/pikvm_mcp_server#readme",
   "allowScripts": {
     "sharp@0.35.5": true,
     "esbuild@0.27.2": false,

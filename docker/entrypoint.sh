@@ -1,5 +1,6 @@
 #!/bin/sh
 # Modified 2026-10 by PLN: Docker image (GPL-3.0; see NOTICE).
+# Modified 2026-10 by PLN: comments no longer promise an end to restarts (GPL-3.0; see NOTICE).
 #
 # Fills /data defaults for variables that are unset or empty, then runs
 # the server. A variable that is already set always wins. Each default
@@ -22,7 +23,7 @@ if [ ! -r /data ] || [ ! -x /data ]; then
 fi
 
 # The server parses the port with parseInt, so "http" would quietly
-# select stdio and loop under restart:. Empty means stdio.
+# select stdio. Empty means stdio.
 port=${PIKVM_MCP_PORT:-}
 if [ -n "$port" ]; then
   case $port in
@@ -56,7 +57,7 @@ if [ -z "${PIKVM_TLS_CERT_FILE:-}" ] && { [ "$tls_mode" = pin ] || [ "$first" = 
   default_to PIKVM_TLS_CERT_FILE /data/tls/default.pem
 fi
 # PIKVM_TLS_MODE applies to the legacy single device only. Without this
-# check a missing pin file is a bare ENOENT and restart: loops.
+# check a missing pin file is a bare ENOENT.
 if [ "$tls_mode" = pin ] && [ "$first" != pin ] && [ -z "${PIKVM_DEVICES:-}" ] && [ -z "${PIKVM_DEVICES_FILE:-}" ] \
   && [ ! -e "${PIKVM_TLS_CERT_FILE:-}" ]; then
   log "PIKVM_TLS_MODE=pin and ${PIKVM_TLS_CERT_FILE:-} does not exist. run: pin default"
