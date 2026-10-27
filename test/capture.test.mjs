@@ -132,6 +132,51 @@ test('the stream session opens and closes only while HID is idle', async () => {
   });
 });
 
+test('HID guard: a press during a waiting close, queued prints, a refused press', async () => {
+  // The linger expires during a print; a key pressed while the close
+  // waits for HID keeps the session open until it is released.
+  await withClient({
+    capture: { running: false },
+    routes: { 'POST /api/hid/print': { delayMs: 600, status: 204, body: '' } },
+  }, {}, async ({ mock, client }) => {
+    await client.screenshot();
+    const typing = client.type('hello');
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await client.sendKey('ShiftLeft', { state: true });
+    await typing;
+    await new Promise((resolve) => setTimeout(resolve, 900));
+    assert.equal(closes(mock).length, 0);
+    await client.sendKey('ShiftLeft', { state: false });
+    await waitUntil(() => closes(mock).length === 1);
+  });
+
+  // kvmd writes each fast print's reports after the previous one's, so
+  // the waits add up: about 1 s per 100 characters here.
+  await withClient({ capture: { running: false } }, {}, async ({ mock, client }) => {
+    await client.type('a'.repeat(100));
+    await client.type('b'.repeat(100));
+    const typed = Date.now();
+    await client.screenshot();
+    assert.ok(opens(mock)[0].at - typed >= 1900, `opened ${opens(mock)[0].at - typed}ms after two prints`);
+  });
+
+  // A press that kvmd refuses is not held.
+  await withClient({
+    capture: { running: false },
+    routes: {
+      'POST /api/hid/events/send_key': {
+        status: 400,
+        failTimes: 1,
+        body: { ok: false, result: { error: 'ValidatorError', error_msg: 'unknown key' } },
+      },
+    },
+  }, {}, async ({ mock, client }) => {
+    await assert.rejects(client.sendKey('NoSuchKey', { state: true }), { status: 400 });
+    await client.screenshot();
+    assert.equal(opens(mock).length, 1);
+  });
+});
+
 test('closing the client closes the stream session', async () => {
   await withClient({ capture: { running: false } }, { lingerMs: 60_000 }, async ({ mock, client }) => {
     await client.screenshot();

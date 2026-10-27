@@ -60,6 +60,7 @@ export class HeldInputError extends Error {
  */
 export class HidGate {
   private inFlight = 0;
+  private backlogEnd = 0;
   private quietAt = 0;
   private readonly held = new Set<string>();
   private transition: Promise<void> | null = null;
@@ -71,10 +72,15 @@ export class HidGate {
     this.inFlight += 1;
   }
 
-  /** After a HID POST, sent or not. kvmd may still be writing queued reports for `drainMs`. */
-  leave(drainMs: number): void {
+  /**
+   * After a HID POST, sent or not. kvmd writes the reports a call queued
+   * after those of earlier calls, for about `queuedMs`, so backlogs add
+   * up. `settleMs` is a margin after the last report.
+   */
+  leave(queuedMs: number, settleMs: number): void {
     this.inFlight -= 1;
-    this.quietAt = Math.max(this.quietAt, performance.now() + drainMs);
+    this.backlogEnd = Math.max(this.backlogEnd, performance.now()) + queuedMs;
+    this.quietAt = Math.max(this.quietAt, this.backlogEnd + settleMs);
     if (this.inFlight === 0) {
       const waiters = this.idleWaiters.splice(0);
       for (const wake of waiters) wake();
@@ -82,12 +88,9 @@ export class HidGate {
   }
 
   /** A key or button sent with state=true stays held until state=false. */
-  press(id: string): void {
-    this.held.add(id);
-  }
-
-  release(id: string): void {
-    this.held.delete(id);
+  setHeld(id: string, held: boolean): void {
+    if (held) this.held.add(id);
+    else this.held.delete(id);
   }
 
   heldInput(): string[] {
@@ -226,11 +229,6 @@ export class CaptureSession {
 
   private async closeIdle(): Promise<void> {
     if (this.users > 0 || !this.ready || this.closing || this.shutDown) return;
-    // Closing would release what is held. Keep the session until it is not.
-    if (this.options.gate.heldInput().length > 0) {
-      this.armLinger();
-      return;
-    }
     const closing = this.options.gate.exclusive(() => this.disconnect(), this.options.hidWaitMs)
       .catch(() => {
         // HID did not go idle. Try again after another linger period.
@@ -247,6 +245,11 @@ export class CaptureSession {
   private async disconnect(): Promise<void> {
     // A capture took the session while HID was settling.
     if (this.users > 0 || this.shutDown) return;
+    // Closing would release what is held. Keep the session until it is not.
+    if (this.options.gate.heldInput().length > 0) {
+      this.armLinger();
+      return;
+    }
     const ws = this.ws;
     this.ws = null;
     this.ready = null;

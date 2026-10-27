@@ -721,8 +721,8 @@ const CAPTURE_POLL_MS = 250;
 /** A print ceiling is at most 50 s; a fast print drains for up to about 10 s after it. */
 const CAPTURE_HID_WAIT_MS = 70_000;
 
-/** kvmd may still be writing queued HID reports after a POST returns. */
-const HID_DRAIN_BASE_MS = 250;
+/** Margin after the last queued HID report is expected to be written. */
+const HID_SETTLE_MS = 250;
 
 /**
  * A print with no per-event delay queues every event before kvmd answers.
@@ -739,25 +739,28 @@ export const PIKVM_MOUSE_ABSOLUTE = 'PIKVM_MOUSE_ABSOLUTE';
 const NO_SIGNAL_MESSAGE = 'capture is running but reports no video signal. The computer may be off or asleep, '
   + 'or its display blanked; a key press such as ShiftLeft wakes a blanked display';
 
-/** How long kvmd may still be writing this call's HID reports after it returns. */
-function hidDrainMs(path: string, body: string | object | undefined): number {
-  if (path.split('?')[0] !== '/hid/print') return HID_DRAIN_BASE_MS;
-  if (hidPrintPerEventSec(printDelaySent(path), printIsSlow(path)) > 0) return HID_DRAIN_BASE_MS;
+/**
+ * How long kvmd may still be writing the reports this call queued after
+ * it returns. Only a print with no per-event delay queues ahead of kvmd's
+ * answer; with a delay, kvmd answers after the last event.
+ */
+function hidQueuedMs(path: string, body: string | object | undefined): number {
+  if (path.split('?')[0] !== '/hid/print') return 0;
+  if (hidPrintPerEventSec(printDelaySent(path), printIsSlow(path)) > 0) return 0;
   const len = typeof body === 'string' ? Math.min(body.length, 1024) : 0;
-  return HID_DRAIN_BASE_MS + Math.ceil((4 * len + 2) * HID_DRAIN_PER_EVENT_MS);
+  return Math.ceil((4 * len + 2) * HID_DRAIN_PER_EVENT_MS);
 }
 
-/** Keys and buttons sent with state=true are held until state=false. */
-function noteHeldInput(gate: HidGate, path: string): void {
+/** A key or button press (state=true) or release (state=false), or null. */
+function heldInputChange(path: string): { id: string; held: boolean } | null {
   const [pathname, query = ''] = path.split('?');
   const params = new URLSearchParams(query);
   const state = params.get('state');
   let id: string | null = null;
   if (pathname === '/hid/events/send_key') id = `key ${params.get('key')}`;
   else if (pathname === '/hid/events/send_mouse_button') id = `mouse button ${params.get('button')}`;
-  if (id === null || state === null) return;
-  if (state === 'true') gate.press(id);
-  else gate.release(id);
+  if (id === null || state === null) return null;
+  return { id, held: state === 'true' };
 }
 
 interface StreamerSource extends ScreenResolution {
@@ -1477,11 +1480,18 @@ export class PiKVMClient {
   ): Promise<T> {
     if (!isHidPost(method, path)) return this.requestRetrying<T>(method, path, body, contentType, timeoutMs, signal);
     await this.hidGate.enter();
-    noteHeldInput(this.hidGate, path);
+    const change = heldInputChange(path);
     try {
-      return await this.requestRetrying<T>(method, path, body, contentType, timeoutMs, signal);
+      const result = await this.requestRetrying<T>(method, path, body, contentType, timeoutMs, signal);
+      if (change) this.hidGate.setHeld(change.id, change.held);
+      return result;
+    } catch (err) {
+      // Refused by kvmd or never sent: nothing changed. Otherwise kvmd may have applied it.
+      const definite = err instanceof KvmdError && (err.preSend || err.status >= 400);
+      if (change && !definite) this.hidGate.setHeld(change.id, change.held);
+      throw err;
     } finally {
-      this.hidGate.leave(hidDrainMs(path, body));
+      this.hidGate.leave(hidQueuedMs(path, body), HID_SETTLE_MS);
     }
   }
 
