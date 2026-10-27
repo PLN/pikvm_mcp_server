@@ -84,6 +84,7 @@ Modified 2026-10 by PLN: pikvm_keep_awake (GPL-3.0; see below).
 Modified 2026-10 by PLN: pikvm_status (GPL-3.0; see below).
 Modified 2026-10 by PLN: wake, observe, pikvm_wait_for, pikvm_click_text (GPL-3.0; see below).
 Modified 2026-10 by PLN: version 0.4.0 (GPL-3.0; see below).
+Modified 2026-10 by PLN: only input tools pause keep-awake (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -1454,4 +1455,13 @@ No code from another pikvm_mcp_server fork was added for these methods.
   with wake. compose.yaml, compose.tailscale.yaml and docs/docker.md
   name the 0.4.0 image. A keep-awake test now waits for its fallback
   reason, which a poll skipped for the HID settle can hide for a moment.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  Only tool calls that send keyboard or mouse input to the machine (the
+  HID-gated tools other than pikvm_keep_awake) pause keep-awake.
+  Screenshots, OCR, status, waits and media tools no longer pause it, so
+  the screen stays on while an agent watches or waits; the owner found
+  a screen timing out during pikvm_wait_for confusing. The status screen
+  line no longer repeats a state the picture already names.
   No code from another pikvm_mcp_server fork was copied.

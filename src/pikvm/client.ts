@@ -1608,13 +1608,19 @@ export class PiKVMClient {
     try {
       const result = await this.requestRetrying<T>(method, path, body, contentType, timeoutMs, signal);
       if (change) this.hidGate.setHeld(change.id, change.held);
-      if (toolInput) this.lastToolInput[toolInput] = Date.now();
+      if (toolInput) {
+        this.lastToolInput[toolInput] = Date.now();
+        this.keepAwake.noteInput();
+      }
       return result;
     } catch (err) {
       // Refused by kvmd or never sent: nothing changed. Otherwise kvmd may have applied it.
       const definite = err instanceof KvmdError && (err.preSend || err.status >= 400);
       if (change && !definite) this.hidGate.setHeld(change.id, change.held);
-      if (toolInput && !definite) this.lastToolInput[toolInput] = Date.now();
+      if (toolInput && !definite) {
+        this.lastToolInput[toolInput] = Date.now();
+        this.keepAwake.noteInput();
+      }
       throw err;
     } finally {
       this.hidGate.leave(hidQueuedMs(path, body), HID_SETTLE_MS);

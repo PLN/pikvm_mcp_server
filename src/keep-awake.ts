@@ -1,4 +1,5 @@
 // Modified 2026-10 by PLN: keep a device awake with harmless input (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: only input tools suspend it (GPL-3.0; see NOTICE).
 
 /**
  * Keeps the computer behind one PiKVM awake until it is stopped. Every
@@ -14,8 +15,10 @@
  * - keyboard: F15, which normal applications ignore.
  * - mixed: mouse and keyboard in turn.
  *
- * Any other tool call on the device suspends it while the call runs and
- * for `suspendSeconds` after the call ends; then it resumes by itself.
+ * A tool call that sends keyboard or mouse input to the device suspends it
+ * while the call runs and for `suspendSeconds` after the call ends; then it
+ * resumes by itself. Calls that only look (screenshots, OCR, status, waits)
+ * do not suspend it, so the screen stays on during them.
  * Input is also skipped while this server's own HID input is in flight,
  * draining or held, and while auto-calibration holds the device. Every
  * poll also reads the video signal, which keeps the screen on-time in
@@ -176,10 +179,18 @@ export class KeepAwake {
   /** That call ended. Suspension runs `suspendSeconds` from now. */
   callEnded(): void {
     this.activeCalls = Math.max(0, this.activeCalls - 1);
-    this.lastKnownInput = Date.now();
     if (!this.options) return;
     const until = Date.now() + this.options.suspendSeconds * this.timing().secondMs;
     this.suspendedUntil = Math.max(this.suspendedUntil, until);
+  }
+
+  /**
+   * A tool sent HID input (sent, or possibly applied). Feeds the fallback
+   * idle clock used when kvmd does not report inactivity. Calls that do not
+   * pause keep-awake, such as a wake key from a screenshot, count too.
+   */
+  noteInput(): void {
+    this.lastKnownInput = Date.now();
   }
 
   state(): KeepAwakeState {
