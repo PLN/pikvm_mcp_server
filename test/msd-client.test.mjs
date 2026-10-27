@@ -14,6 +14,7 @@
 // Modified 2026-10 by PLN: onResponseStarted is counted through the interceptor (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a post-send job cap reports phase job_timeout (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: the upload response read is phase job_timeout (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: a reply cut short after Connection: close (GPL-3.0; see NOTICE).
 
 /**
  * Plain kvmd MSD client methods against the mock. No MCP tools.
@@ -1480,6 +1481,44 @@ describe('MSD client', { timeout: MSD_FILE_TIMEOUT_MS }, () => {
         return true;
       },
     );
+  });
+
+  msdTest('a reply cut short after Connection: close is PIKVM_MSD_STATE_UNKNOWN and not resent', async () => {
+    for (const truncateBody of ['length', 'chunked']) {
+      await withMock({
+        routes: { 'POST /api/msd/write': { truncateBody } },
+      }, async (mock, client) => {
+        await assert.rejects(
+          () => client.msdWrite('cut.img', bodyOf('abcd'), 4),
+          (err) => {
+            assert.ok(err instanceof KvmdError);
+            assert.equal(err.type, 'PIKVM_MSD_STATE_UNKNOWN', truncateBody);
+            assert.equal(err.endpoint, 'POST /api/msd/write');
+            return true;
+          },
+        );
+        assert.equal(count(mock, 'POST', '/api/msd/write'), 1);
+      });
+
+      await withMock({
+        routes: { 'POST /api/msd/write_remote': { truncateBody } },
+      }, async (mock, client) => {
+        await assert.rejects(
+          async () => {
+            for await (const _line of client.msdWriteRemote('https://example.test/pics/a.iso')) {
+              // Drain until the cut.
+            }
+          },
+          (err) => {
+            assert.ok(err instanceof KvmdError);
+            assert.equal(err.type, 'PIKVM_MSD_STATE_UNKNOWN', truncateBody);
+            assert.equal(err.endpoint, 'POST /api/msd/write_remote');
+            return true;
+          },
+        );
+        assert.equal(count(mock, 'POST', '/api/msd/write_remote'), 1);
+      });
+    }
   });
 
   msdTest('a socket reset and HTTP 504 on an upload are PIKVM_MSD_STATE_UNKNOWN', async () => {

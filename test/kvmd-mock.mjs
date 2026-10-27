@@ -16,6 +16,7 @@
 // Modified 2026-10 by PLN: pace a write body (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: stream an upload response before the body is finished (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: the upload response read is phase job_timeout (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: a reply cut short after Connection: close (GPL-3.0; see NOTICE).
 
 /**
  * Minimal KVMD REST mock implementing exactly the routes src/pikvm/client.ts
@@ -26,6 +27,9 @@
  * (every hit, when `failTimes` is omitted). Keys are `METHOD /api/...`.
  * `delayMs` waits, and ends early if the client aborts. `drop` destroys
  * the socket. `resetAfterHeaders` writes a partial body and resets.
+ * `truncateBody` sends `Connection: close` and part of a body, then ends
+ * the socket cleanly: `length` declares a longer Content-Length, and
+ * `chunked` never sends the last chunk.
  * `delayAfterHeaders` sends headers, then waits, then the body.
  * `then` runs after `failTimes` is exhausted. Otherwise the built-in
  * route runs.
@@ -130,6 +134,13 @@ async function sendRoute(req, res, route) {
   if (req.destroyed || res.writableEnded) return;
   if (route.drop) {
     req.socket.destroy();
+    return;
+  }
+  if (route.truncateBody) {
+    const headers = { 'Content-Type': route.contentType ?? 'application/json', Connection: 'close' };
+    if (route.truncateBody === 'length') headers['Content-Length'] = 1000;
+    res.writeHead(route.status ?? 200, headers);
+    res.write('{"ok":', () => req.socket.end());
     return;
   }
   if (route.resetAfterHeaders) {
