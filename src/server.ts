@@ -423,19 +423,35 @@ function keepAwakeText(state: KeepAwakeState): string {
     + `enabled false, or the server restarts.\n${JSON.stringify(state)}`;
 }
 
+function durationText(seconds: number): string {
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 120) return `${s} s`;
+  if (s < 7200) return `${Math.round(s / 60)} min`;
+  if (s < 172_800) return `${Math.round(s / 3600)} h`;
+  return `${Math.round(s / 86_400)} days`;
+}
+
 function agoText(iso: string | null | undefined, now: number): string {
   if (!iso) return 'never';
-  const seconds = Math.max(0, Math.round((now - Date.parse(iso)) / 1000));
-  if (seconds < 120) return `${seconds} s ago`;
-  if (seconds < 7200) return `${Math.round(seconds / 60)} min ago`;
-  return `${Math.round(seconds / 3600)} h ago`;
+  return `${durationText((now - Date.parse(iso)) / 1000)} ago`;
 }
+
+const PICTURE_TEXT: Record<string, string> = {
+  display_asleep: 'dark (the display is off or asleep)',
+  usb_offline: 'no picture (USB offline)',
+  no_signal: 'no picture (USB state unknown)',
+  capture_stopped: 'capture stopped',
+  unknown: 'unknown',
+};
 
 /** The device's situation in one phrase, and what to do about it. */
 function statusVerdict(reading: DeviceStatusReading): string {
   if (!reading.reachable) return `unreachable: ${reading.error?.type ?? 'error'}`;
+  const usbOffline = reading.input.keyboardOnline === false && reading.input.mouseOnline === false;
   switch (reading.picture.state) {
-    case 'visible': return 'ready';
+    case 'visible':
+      return usbOffline ? 'picture visible, but its USB keyboard and mouse are offline: input will not reach it' : 'ready';
+    case 'no_signal': return 'no picture, and the USB state could not be read';
     case 'capture_stopped': return 'ready; capture is stopped and starts on the next screenshot';
     case 'display_asleep': return 'display asleep: press a key (pikvm_key ShiftLeft) to wake it';
     case 'usb_offline': return 'no computer: its USB keyboard and mouse are offline (off, suspended or unplugged)';
@@ -459,8 +475,12 @@ function deviceStatusText(status: DeviceStatus, now: number): string {
   const screen = status.screen;
   let screenLine = picture.state === 'visible'
     ? `  Screen: on, ${picture.width}x${picture.height}${picture.fps !== undefined ? ` at ${picture.fps} fps` : ''}`
-    : `  Screen: ${picture.state.replace('_', ' ')}`;
-  if (screen) screenLine += `; ${screen.state} since ${agoText(screen.since, now)}, as seen by this server`;
+    : `  Screen: ${PICTURE_TEXT[picture.state] ?? picture.state}`;
+  if (screen) {
+    screenLine += screen.since === screen.lastChecked
+      ? `; ${screen.state}, first seen just now by this server`
+      : `; ${screen.state} for ${durationText((now - Date.parse(screen.since)) / 1000)}, as seen by this server`;
+  }
   lines.push(`${screenLine}.`);
   const input = status.input;
   const online = (value: boolean | null) => (value === null ? 'unknown' : value ? 'online' : 'offline');
@@ -468,7 +488,7 @@ function deviceStatusText(status: DeviceStatus, now: number): string {
     + `${input.mouse ? ` (${input.mouse})` : ''}; ${input.held.length ? `held: ${input.held.join(', ')}` : 'nothing held'}`
     + `; HID ${status.armed.hid ? 'armed' : 'disarmed'}.`);
   const idle = status.idle;
-  lines.push(`  Idle: ${idle.anyInputSeconds === null ? 'unknown' : `${idle.anyInputSeconds} s`} since any input (kvmd, all sources); `
+  lines.push(`  Idle: ${idle.anyInputSeconds === null ? 'unknown' : durationText(idle.anyInputSeconds)} since any input (kvmd, all sources); `
     + `this server's last keyboard input ${agoText(idle.lastToolKeyboardInput, now)}, last mouse input ${agoText(idle.lastToolMouseInput, now)}.`);
   const keep = status.keepAwake;
   lines.push(keep.enabled
@@ -1230,8 +1250,17 @@ export function createMcpServer(deps: McpServerDeps): Server {
           ? [...fleet.devices.values()].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
           : [resolveFleetDevice(args, fleet)];
         const now = Date.now();
+        // Every device's password, so one device's error cannot carry another's.
+        const scrub = (value: string) => {
+          let text = redactUrl(value);
+          for (const password of fleet.passwords) text = redactSecrets(text, password);
+          return text;
+        };
         const devices: DeviceStatus[] = await Promise.all(chosen.map(async (device) => {
           const reading = await device.client.status();
+          if (reading.error) reading.error = { type: scrub(reading.error.type), message: scrub(reading.error.message) };
+          const mediaError = (reading.media as { error?: unknown } | null)?.error;
+          if (typeof mediaError === 'string') reading.media = { error: scrub(mediaError) };
           return {
             device: device.name,
             verdict: statusVerdict(reading),

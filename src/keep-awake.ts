@@ -215,16 +215,19 @@ export class KeepAwake {
   private async poll(): Promise<void> {
     const options = this.options;
     if (!options || this.polling) return;
+    // Captured before the first await: a stop or restart during a read ends this poll.
+    const generation = this.generation;
     this.polling = true;
     try {
       await this.target.observeSignal();
+      if (generation !== this.generation) return;
       const skip = this.skipReason();
       if (skip) {
         this.lastSkip = skip;
         return;
       }
-      const generation = this.generation;
       const kvmdIdle = await this.target.hidInactivitySeconds();
+      if (generation !== this.generation) return;
       // Without kvmd's timer, fall back to the input this server knows of:
       // at most one input per interval, though a web viewer's input is unseen.
       const idle = kvmdIdle ?? (Date.now() - this.lastKnownInput) / this.timing().secondMs;

@@ -210,3 +210,75 @@ test('pikvm_status reports an unreachable device without failing the others', as
     await ready.close();
   }
 });
+
+test('pikvm_status: other devices\' passwords, unknown USB, a picture without USB, and rejected input', async () => {
+  const leaky = await startKvmdMock({
+    routes: {
+      'GET /api/streamer': { status: 400, body: { ok: false, result: { error: 'MockError', error_msg: 'saw other"pw\\x here' } } },
+      'GET /api/msd': { status: 500, body: { ok: false, result: { error: 'MockError', error_msg: 'msd saw other"pw\\x too' } } },
+    },
+  });
+  const unknownUsb = await startKvmdMock({
+    capture: { running: true, signal: false },
+    routes: { 'GET /api/hid': { status: 500, body: { ok: false, result: { error: 'MockError', error_msg: 'hid down' } } } },
+  });
+  const noUsb = await startKvmdMock({ capture: { running: true, signal: true }, hidOnline: false });
+  const rejecting = await startKvmdMock({
+    routes: { 'POST /api/hid/events/send_key': { status: 400, body: { ok: false, result: { error: 'ValidatorError', error_msg: 'bad key' } } } },
+  });
+  const dir = mkdtempSync(join(tmpdir(), 'pikvm-status-'));
+  let fleet;
+  let httpServer;
+  try {
+    const one = join(dir, 'pw1');
+    const two = join(dir, 'pw2');
+    writeFileSync(one, 'testpw\n', { mode: 0o600 });
+    writeFileSync(two, 'other"pw\\x\n', { mode: 0o600 });
+    const device = (url, passwordFile) => ({ host: url, username: 'admin', passwordFile, tls: { mode: 'insecure' } });
+    const config = withEnv({
+      PIKVM_DEVICES: JSON.stringify({
+        default: 'leaky',
+        devices: {
+          leaky: device(leaky.url, one),
+          other: device(rejecting.url, two),
+          dark: device(unknownUsb.url, one),
+          nousb: device(noUsb.url, one),
+        },
+      }),
+    }, () => loadConfig());
+    fleet = buildFleet(config, { hid: true, msd: true });
+    httpServer = await startHttpServer({
+      port: 0,
+      host: '127.0.0.1',
+      bearerToken: TOKEN,
+      createServer: () => createMcpServer({
+        pikvm: fleet.devices.get('leaky').client,
+        lock: fleet.devices.get('leaky').lock,
+        fleet,
+        calibrationConfig: {},
+        armGateEnforced: true,
+      }),
+    });
+    const base = `http://127.0.0.1:${httpServer.address().port}`;
+    const id = await session(base);
+    const refused = await call(base, id, 'pikvm_key', { device: 'other', key: 'NoSuchKey' });
+    assert.equal(refused.isError, true);
+
+    const status = await call(base, id, 'pikvm_status');
+    const whole = JSON.stringify(status);
+    assert.equal(whole.includes('other\\"pw'), false, 'escaped password in the JSON');
+    assert.equal(status.content[0].text.includes('other"pw'), false, 'password in the prose');
+    const byName = Object.fromEntries(status.structuredContent.devices.map((d) => [d.device, d]));
+    assert.equal(byName.leaky.reachable, false);
+    assert.equal(byName.dark.picture.state, 'no_signal');
+    assert.equal(byName.dark.verdict, 'no picture, and the USB state could not be read');
+    assert.equal(byName.nousb.picture.state, 'visible');
+    assert.match(byName.nousb.verdict, /^picture visible, but its USB keyboard and mouse are offline/);
+    assert.equal(byName.other.idle.lastToolKeyboardInput, null, 'a rejected key is not input');
+  } finally {
+    if (httpServer) await new Promise((resolve) => httpServer.close(resolve));
+    if (fleet) await closeFleet(fleet);
+    rmSync(dir, { recursive: true, force: true });
+    for (const mock of [leaky, unknownUsb, noUsb, rejecting]) await mock.close();
+  }
+});

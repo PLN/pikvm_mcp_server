@@ -826,7 +826,7 @@ function hidInputKind(path: string): 'keyboard' | 'mouse' | null {
   return null;
 }
 
-export type PictureState = 'visible' | 'display_asleep' | 'usb_offline' | 'capture_stopped' | 'unknown';
+export type PictureState = 'visible' | 'display_asleep' | 'usb_offline' | 'no_signal' | 'capture_stopped' | 'unknown';
 
 /** One read-only look at a device, for pikvm_status. */
 export interface DeviceStatusReading {
@@ -1590,9 +1590,8 @@ export class PiKVMClient {
     signal?: AbortSignal,
   ): Promise<T> {
     if (!isHidPost(method, path)) return this.requestRetrying<T>(method, path, body, contentType, timeoutMs, signal);
-    // Synchronous, before the first await: keep-awake's own input is not tool input.
-    const kind = hidInputKind(path);
-    if (kind && !this.sendingKeepAwake) this.lastToolInput[kind] = Date.now();
+    // Read synchronously, before the first await: keep-awake's own input is not tool input.
+    const toolInput = this.sendingKeepAwake ? null : hidInputKind(path);
     // A tool's input waits for a keep-awake input that has started.
     if (!this.sendingKeepAwake) {
       while (this.keepAwakeAction) await this.keepAwakeAction.catch(() => undefined);
@@ -1602,11 +1601,13 @@ export class PiKVMClient {
     try {
       const result = await this.requestRetrying<T>(method, path, body, contentType, timeoutMs, signal);
       if (change) this.hidGate.setHeld(change.id, change.held);
+      if (toolInput) this.lastToolInput[toolInput] = Date.now();
       return result;
     } catch (err) {
       // Refused by kvmd or never sent: nothing changed. Otherwise kvmd may have applied it.
       const definite = err instanceof KvmdError && (err.preSend || err.status >= 400);
       if (change && !definite) this.hidGate.setHeld(change.id, change.held);
+      if (toolInput && !definite) this.lastToolInput[toolInput] = Date.now();
       throw err;
     } finally {
       this.hidGate.leave(hidQueuedMs(path, body), HID_SETTLE_MS);
@@ -2141,13 +2142,15 @@ export class PiKVMClient {
     const mouseOnline = bool(hidResult?.mouse?.online);
     const absolute = bool(hidResult?.mouse?.absolute);
     const usbOffline = keyboardOnline === false && mouseOnline === false;
+    // A dark display needs positive evidence that the computer is attached.
+    const usbOnline = keyboardOnline === true || mouseOnline === true;
 
     let picture: DeviceStatusReading['picture'] = { state: 'unknown' };
     if (streamer.status === 'fulfilled') {
       const source = streamer.value;
       if (source === null) picture = { state: usbOffline ? 'usb_offline' : 'capture_stopped' };
       else if (source.online) picture = { state: 'visible', width: source.width, height: source.height, ...(source.fps !== undefined ? { fps: source.fps } : {}) };
-      else picture = { state: usbOffline ? 'usb_offline' : 'display_asleep' };
+      else picture = { state: usbOffline ? 'usb_offline' : usbOnline ? 'display_asleep' : 'no_signal' };
     }
     const failure = streamer.status === 'rejected' ? streamer.reason : null;
     const iso = (ms: number) => (ms > 0 ? new Date(ms).toISOString() : null);
