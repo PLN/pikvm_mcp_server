@@ -78,6 +78,7 @@ Modified 2026-10 by PLN: manual image release workflow and image scan gate (GPL-
 Modified 2026-10 by PLN: version 0.3.0, reported in serverInfo (GPL-3.0; see below).
 Modified 2026-10 by PLN: docs after the first image release (GPL-3.0; see below).
 Modified 2026-10 by PLN: start idle capture, report no signal, refuse dropped relative moves (GPL-3.0; see below).
+Modified 2026-10 by PLN: version 0.3.1 (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -1375,4 +1376,11 @@ No code from another pikvm_mcp_server fork was added for these methods.
   mouse: kvmd answers such a move ok and drops it. The kvmd behaviour is
   from kvmd v4.227 (server.py, plugins/hid/otg) and was checked on a
   PiKVM V4 Mini.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  The version is 0.3.1, for the idle-capture fix. compose.yaml,
+  compose.tailscale.yaml and docs/docker.md name the 0.3.1 image.
+  docs/docker.md says gh attestation verify needs a GitHub login even
+  for the public image; an unauthenticated run stops at gh auth login.
   No code from another pikvm_mcp_server fork was copied.
