@@ -578,7 +578,7 @@ function statusVerdict(reading: DeviceStatusReading): string {
       return usbOffline ? 'picture visible, but its USB keyboard and mouse are offline: input will not reach it' : 'ready';
     case 'no_signal': return 'no picture, and the USB state could not be read';
     case 'capture_stopped': return 'ready; capture is stopped and starts on the next screenshot';
-    case 'display_asleep': return 'display asleep: press a key (pikvm_key ShiftLeft) to wake it';
+    case 'display_asleep': return 'display asleep: pikvm_screenshot with wake: true wakes it';
     case 'usb_offline': return 'no computer: its USB keyboard and mouse are offline (off, suspended or unplugged)';
     default: return 'unknown picture state';
   }
