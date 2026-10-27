@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Modified 2026-10 by PLN: Docker image smoke test (GPL-3.0; see NOTICE).
+# Modified 2026-10 by PLN: validate compose.tailscale.yaml (GPL-3.0; see NOTICE).
 #
 # Smoke test for the container image, cases S1-S20. S21 is this script on
 # an arm64 runner. No real PiKVM: hosts are kvm.invalid, or a host-side
@@ -282,11 +283,13 @@ check S17 "/app/LICENSE equals the repo's" bash -c "docker run --rm --entrypoint
 check S17 "/app/NOTICE equals the repo's" bash -c "docker run --rm --entrypoint cat '$IMAGE' /app/NOTICE | cmp -s - '$ROOT/NOTICE'"
 check S17 "/app/THIRD-PARTY-NOTICES.txt is not empty" docker run --rm --entrypoint test "$IMAGE" -s /app/THIRD-PARTY-NOTICES.txt
 
-# S18: compose file, with and without a .env next to it.
+# S18: compose files, with and without a .env next to them.
 mkdir -p "$WORK/compose"; cp "$ROOT/compose.yaml" "$WORK/compose/"
 check S18 "compose config without .env" docker compose --project-directory "$WORK/compose" -f "$WORK/compose/compose.yaml" config -q
 printf 'PIKVM_HOST=https://kvm.invalid\n' >"$WORK/compose/.env"
 check S18 "compose config with a dummy .env" docker compose --project-directory "$WORK/compose" -f "$WORK/compose/compose.yaml" config -q
+cp "$ROOT/compose.tailscale.yaml" "$WORK/compose/"
+check S18 "compose.tailscale.yaml config" docker compose --project-directory "$WORK/compose" -f "$WORK/compose/compose.tailscale.yaml" config -q
 
 # S19: verify mode with a private CA, one tool call each.
 d=$(newdata s19); own_data "$d"

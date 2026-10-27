@@ -1,0 +1,70 @@
+# Modified 2026-10 by PLN: Tailscale sidecar example (GPL-3.0; see NOTICE).
+#
+# Not yet published: the first image release is still to come.
+#
+# The MCP endpoint is reachable over the tailnet only: tailscale serve
+# (./ts-config/serve.json) forwards HTTPS 443 to http://127.0.0.1:8675.
+# No ports are published. Kernel mode (TS_USERSPACE=false) is needed when
+# the PiKVM itself is on the tailnet, because the server's kvmd client
+# does not use a proxy. Only the sidecar gets NET_ADMIN and /dev/net/tun;
+# the server keeps all capabilities dropped. Recreate both together:
+#   docker compose -f compose.tailscale.yaml up -d --force-recreate
+# Guide: docs/docker.md (Tailscale).
+services:
+  tailscale:
+    image: tailscale/tailscale:v1.104.2   # pin; stable moves
+    hostname: pikvm-mcp
+    restart: unless-stopped
+    environment:
+      TS_AUTHKEY: file:/run/secrets/ts-authkey
+      TS_AUTH_ONCE: "true"
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_SERVE_CONFIG: /config/serve.json
+      TS_USERSPACE: "false"
+      TS_ENABLE_HEALTH_CHECK: "true"
+      TS_LOCAL_ADDR_PORT: 127.0.0.1:9002
+    secrets: [ts-authkey]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9002/healthz"]
+      interval: 10s
+      retries: 6
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    cap_add: [net_admin]
+    volumes:
+      - ts-state:/var/lib/tailscale
+      - ./ts-config:/config:ro
+
+  pikvm-mcp:
+    image: ghcr.io/pln/pikvm_mcp_server:0.3.0   # pin X.Y.Z or @sha256 in production
+    network_mode: service:tailscale
+    depends_on:
+      tailscale:
+        condition: service_healthy
+    restart: unless-stopped
+    user: "10001:10001"
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 512m
+    pids_limit: 128
+    stop_grace_period: 30s
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      PIKVM_MCP_PORT: "8675"
+      PIKVM_MCP_HOST: "127.0.0.1"   # only tailscale serve reaches it
+      PIKVM_TLS_MODE: pin
+      # PIKVM_MCP_ARM_HID: "1"
+      # PIKVM_MCP_ARM_MSD: "1"
+    volumes:
+      - pikvm-data:/data
+
+secrets:
+  ts-authkey:
+    file: ./secrets/ts-authkey
+
+volumes:
+  ts-state:
+  pikvm-data:
