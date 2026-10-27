@@ -1,0 +1,123 @@
+# Modified 2026-10 by PLN: publish condition test stub (GPL-3.0; see NOTICE).
+#
+# Called by release-condition-test.yml. The release job graph (verify,
+# build, smoke, scan) with results taken from inputs, a probe job that
+# carries the exact publish condition, and an assert job. Builds and
+# publishes nothing. Only success and skipped are offered: a job that
+# fails on purpose fails the run, and continue-on-error reports success
+# to the jobs that need it (observed on GitHub). test/release-condition.mjs
+# covers the failure cases by evaluating the condition.
+name: release-condition-stub
+
+on:
+  workflow_call:
+    inputs:
+      verify:
+        description: success
+        type: string
+        required: true
+      resume:
+        description: verify's resume output, 'true', 'false' or empty
+        type: string
+        required: false
+        default: ''
+      build:
+        description: success or skipped
+        type: string
+        required: true
+      smoke:
+        description: success or skipped
+        type: string
+        required: true
+      scan:
+        description: success or skipped
+        type: string
+        required: true
+      expect:
+        description: run or skip, what publish must do
+        type: string
+        required: true
+
+permissions: {}
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      resume: ${{ steps.out.outputs.resume }}
+    steps:
+      - id: out
+        env:
+          RESUME: ${{ inputs.resume }}
+          RESULT: ${{ inputs.verify }}
+        run: |
+          echo "resume=$RESUME" >> "$GITHUB_OUTPUT"
+          [ "$RESULT" = success ]
+
+  build:
+    needs: verify
+    if: inputs.build != 'skipped'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - env:
+          RESULT: ${{ inputs.build }}
+        run: '[ "$RESULT" = success ]'
+
+  smoke:
+    needs: [verify, build]
+    if: inputs.smoke != 'skipped'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - env:
+          RESULT: ${{ inputs.smoke }}
+        run: '[ "$RESULT" = success ]'
+
+  scan:
+    needs: [verify, build]
+    if: inputs.scan != 'skipped'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - env:
+          RESULT: ${{ inputs.scan }}
+        run: '[ "$RESULT" = success ]'
+
+  probe:
+    needs: [verify, build, smoke, scan]
+    # One line: test/release-condition.mjs matches it against test/fixtures/release-publish-if.txt.
+    if: ${{ !cancelled() && needs.verify.result == 'success' && ( (needs.verify.outputs.resume != 'true' && needs.build.result == 'success' && needs.smoke.result == 'success' && needs.scan.result == 'success') || (needs.verify.outputs.resume == 'true' && needs.build.result == 'skipped' && needs.smoke.result == 'skipped' && needs.scan.result == 'skipped') ) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - run: echo "publish would run"
+
+  assert:
+    needs: [verify, build, smoke, scan, probe]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - env:
+          WANT: ${{ inputs.verify }} ${{ inputs.build }} ${{ inputs.smoke }} ${{ inputs.scan }}
+          GOT: ${{ needs.verify.result }} ${{ needs.build.result }} ${{ needs.smoke.result }} ${{ needs.scan.result }}
+          RESUME: ${{ needs.verify.outputs.resume }}
+          EXPECT: ${{ inputs.expect }}
+          PROBE: ${{ needs.probe.result }}
+        run: |
+          echo "verify build smoke scan: wanted $WANT, got $GOT; resume '$RESUME'; probe $PROBE; expected $EXPECT"
+          if [ "$WANT" != "$GOT" ]; then
+            echo "::error::the stubs did not produce the requested results, so this case tests nothing"
+            exit 1
+          fi
+          case $EXPECT in
+            run) want=success ;;
+            skip) want=skipped ;;
+            *) echo "::error::expect must be run or skip"; exit 1 ;;
+          esac
+          if [ "$PROBE" != "$want" ]; then
+            echo "::error::publish condition: probe was $PROBE, expected $want"
+            exit 1
+          fi

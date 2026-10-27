@@ -74,6 +74,7 @@ Modified 2026-10 by PLN: graceful shutdown and an external upload abort (GPL-3.0
 Modified 2026-10 by PLN: Docker image, entrypoint, compose file, and image smoke test (GPL-3.0; see below).
 Modified 2026-10 by PLN: a cut-short POST reply is state unknown; CI checkouts keep no credentials (GPL-3.0; see below).
 Modified 2026-10 by PLN: Docker and systemd guides, README and package metadata fixes (GPL-3.0; see below).
+Modified 2026-10 by PLN: manual image release workflow and image scan gate (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -1305,4 +1306,35 @@ No code from another pikvm_mcp_server fork was added for these methods.
   The image smoke test also validates compose.tailscale.yaml. Two
   docker/entrypoint.sh comments no longer imply that an exit code stops
   a restart policy from retrying.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  .github/workflows/release.yml releases the container image by hand
+  from main. verify checks the inputs, that the version matches
+  package.json, that neither the git tag nor the image tag exists, and
+  runs the tests, the waiver lint and the gate self-test. build pushes
+  one image per architecture by digest, smoke and scan test those
+  digests, and only then publish creates the image tag, attests build
+  provenance, creates the git tag and the release, and moves latest and
+  X.Y when this is the highest stable version. Each publish step checks
+  state first, and resume mode finishes a release whose image tag
+  exists by releasing the commit in the image's revision label after
+  checking it. Release notes are a fixed template.
+  scripts/image-tag-state.sh treats an image tag as absent only on an
+  explicit not-found answer and fails closed on anything else.
+  scripts/install-trivy.sh installs Trivy 0.76.1 after checking it
+  against scripts/trivy.sha256. scripts/trivy-gate.sh fails on a
+  fixable CRITICAL or HIGH finding after .trivyignore.yaml, which starts
+  empty. scripts/lint-waivers.sh requires an id, purls or paths, a
+  statement and an expiry at most 90 days out for each waiver.
+  scripts/gate-selftest.sh requires a lockfile with a known fixable
+  advisory to fail and a clean one to pass with a scanned target.
+  gate-selftest.yml runs them in PR CI. test/release-condition.mjs
+  evaluates the publish condition for every combination of upstream
+  results with GitHub's operator precedence, and must also catch known
+  wrong edits of it. release-condition-test.yml also runs it in a stub
+  job graph for the cases that need no failing job. The waiver lint
+  requires purls and paths to be lists of non-blank strings, and the
+  gate self-test checks it refuses a blank path. publish skips attesting
+  only when the registry already holds a verifying attestation.
   No code from another pikvm_mcp_server fork was copied.

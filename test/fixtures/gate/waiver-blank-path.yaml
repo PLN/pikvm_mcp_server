@@ -1,0 +1,9 @@
+# Modified 2026-10 by PLN: a waiver the lint must refuse (GPL-3.0; see NOTICE).
+# A blank path matches every package without a path, so Trivy would
+# drop this advisory everywhere. gate-selftest.sh requires the lint to
+# name the blank path, not just to fail (this date expires one day).
+vulnerabilities:
+  - id: CVE-2026-111181
+    paths: ['']
+    statement: meant to scope the waiver to one path
+    expired_at: 2026-11-20

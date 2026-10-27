@@ -1,0 +1,1 @@
+if: ${{ !cancelled() && needs.verify.result == 'success' && ( (needs.verify.outputs.resume != 'true' && needs.build.result == 'success' && needs.smoke.result == 'success' && needs.scan.result == 'success') || (needs.verify.outputs.resume == 'true' && needs.build.result == 'skipped' && needs.smoke.result == 'skipped' && needs.scan.result == 'skipped') ) }}

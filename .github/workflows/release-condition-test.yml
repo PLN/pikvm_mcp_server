@@ -1,0 +1,61 @@
+# Modified 2026-10 by PLN: publish condition tests C1-C8 (GPL-3.0; see NOTICE).
+#
+# The publish job in release.yml runs only when verify succeeded and
+# either (normal) build, smoke and scan all succeeded or (resume) all
+# three were skipped. Its if: replaces the implicit success(), so each
+# result is compared explicitly. test/release-condition.mjs checks that
+# release.yml carries the committed line and evaluates it for every
+# combination, C1-C9 included. The cases below run the same line in a
+# stub job graph on GitHub, so skipped jobs, outputs and the status
+# function behave as they will in a release: C6 is the resume path.
+# A failing stub would fail this run, so the failure cases (C2, C3, C4,
+# C7) are covered by the evaluation only. Path-filtered, so it is not a
+# required check.
+name: release-condition-test
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - .github/workflows/release-condition-test.yml
+      - .github/workflows/release-condition-stub.yml
+      - test/fixtures/release-publish-if.txt
+      - test/release-condition.mjs
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fixture:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 24.22.0
+      - name: The committed condition, evaluated for every combination
+        run: node test/release-condition.mjs
+
+  case:
+    needs: fixture
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { id: C1, verify: success, resume: 'false', build: success, smoke: success, scan: success, expect: run }
+          - { id: C5, verify: success, resume: '', build: skipped, smoke: skipped, scan: skipped, expect: skip }
+          - { id: C6, verify: success, resume: 'true', build: skipped, smoke: skipped, scan: skipped, expect: run }
+          - { id: C8, verify: success, resume: 'true', build: success, smoke: success, scan: success, expect: skip }
+    name: ${{ matrix.id }}
+    uses: ./.github/workflows/release-condition-stub.yml
+    with:
+      verify: ${{ matrix.verify }}
+      resume: ${{ matrix.resume }}
+      build: ${{ matrix.build }}
+      smoke: ${{ matrix.smoke }}
+      scan: ${{ matrix.scan }}
+      expect: ${{ matrix.expect }}

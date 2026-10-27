@@ -1,0 +1,47 @@
+# Modified 2026-10 by PLN: scan gate self-test in PR CI (GPL-3.0; see NOTICE).
+#
+# Installs the checksum-pinned Trivy, lints the waivers, and runs the
+# two-sided gate self-test whenever the gate or its inputs change.
+# Path-filtered, so it is not a required check. The release verify job
+# runs the same steps.
+name: gate-selftest
+
+on:
+  pull_request:
+    paths:
+      - scripts/*trivy*
+      - scripts/*gate*
+      - scripts/lint-waivers.sh
+      - .trivyignore.yaml
+      - test/fixtures/gate/**
+      - .github/workflows/**
+  push:
+    branches:
+      - main
+    paths:
+      - scripts/*trivy*
+      - scripts/*gate*
+      - scripts/lint-waivers.sh
+      - .trivyignore.yaml
+      - test/fixtures/gate/**
+      - .github/workflows/**
+
+permissions:
+  contents: read
+
+jobs:
+  gate-selftest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install Trivy
+        run: |
+          bash scripts/install-trivy.sh "$RUNNER_TEMP/trivy"
+          echo "$RUNNER_TEMP/trivy" >> "$GITHUB_PATH"
+      - name: Waiver lint
+        run: bash scripts/lint-waivers.sh
+      - name: Gate self-test
+        run: bash scripts/gate-selftest.sh
