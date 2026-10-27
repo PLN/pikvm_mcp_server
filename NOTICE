@@ -1302,5 +1302,7 @@ No code from another pikvm_mcp_server fork was added for these methods.
   .env.example notes the Docker defaults and no longer sets
   PIKVM_MCP_NO_DOTENV=0. package.json names PLN as author and this
   repository. This file gains a copyright line for the fork's changes.
-  The image smoke test also validates compose.tailscale.yaml.
+  The image smoke test also validates compose.tailscale.yaml. Two
+  docker/entrypoint.sh comments no longer imply that an exit code stops
+  a restart policy from retrying.
   No code from another pikvm_mcp_server fork was copied.

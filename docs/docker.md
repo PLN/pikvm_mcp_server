@@ -11,7 +11,7 @@
 >
 > Compose merges `compose.override.yaml` into `compose.yaml` automatically. Building needs BuildKit (`docker buildx build`, or `DOCKER_BUILDKIT=1 docker build`).
 
-The image runs the server as uid 10001 under `tini`, with a read-only root filesystem and every capability dropped. Everything it keeps lives in one `/data` volume. It includes `tesseract` with English data, so `pikvm_read_text` is available by default. `npm` is not in the image.
+The image runs the server as uid 10001 under `tini`. `compose.yaml` adds a read-only root filesystem, drops every capability and sets `no-new-privileges`; the `docker run` example below uses the first two as well. Everything the server keeps lives in one `/data` volume. It includes `tesseract` with English data, so `pikvm_read_text` is available by default. `npm` is not in the image.
 
 Use Docker Engine 28.3.3 or later. Before 28.0, a port published to `127.0.0.1` could be reached by other hosts on the same network segment, and 28.2.x to 28.3.2 have a firewalld-reload advisory. Do not set `DOCKER_INSECURE_NO_IPTABLES_RAW=1`. Docker Desktop is not affected.
 
@@ -29,7 +29,7 @@ docker compose run --rm pikvm-mcp pin default   # compare the fingerprint with t
 docker compose up -d
 ```
 
-`compose.yaml` sets `PIKVM_TLS_MODE: pin`, so a start without a pin file exits 78 with `run: pin default` instead of looping. The server listens on `http://127.0.0.1:8675/mcp`. Check it with `curl -s http://127.0.0.1:8675/healthz` (answers `ok`) and `docker compose ps` (healthy after up to 60 s).
+`compose.yaml` sets `PIKVM_TLS_MODE: pin`, so a start without a pin file exits 78 with `run: pin default` rather than a bare file error. `restart: unless-stopped` keeps retrying it until the pin exists or you stop the service. The server listens on `http://127.0.0.1:8675/mcp`. Check it with `curl -s http://127.0.0.1:8675/healthz` (answers `ok`) and `docker compose ps` (healthy after up to 60 s).
 
 Connect Claude Code:
 
@@ -44,10 +44,10 @@ HID and MSD tools stay disarmed in HTTP mode until you set `PIKVM_MCP_ARM_HID: "
 An MCP client can start the container itself:
 
 ```bash
-claude mcp add pikvm -- docker run -i --rm -v pikvm-data:/data -e PIKVM_HOST=https://pikvm.example.net ghcr.io/pln/pikvm_mcp_server:0.3.0
+claude mcp add pikvm -- docker run -i --rm --read-only --cap-drop ALL -v pikvm-data:/data -e PIKVM_HOST=https://pikvm.example.net ghcr.io/pln/pikvm_mcp_server:0.3.0
 ```
 
-Stdout carries only the protocol; logs go to stderr. The process exits when the client closes stdin. **stdio has no arm-gate: a stdio client can use every HID and MSD tool.** The password comes from `/data/secrets/pikvm-password` in that volume. Compose prefixes its volumes with the project name (for example `pikvm_mcp_server_pikvm-data`), so `pikvm-data` here is a separate volume unless you name the Compose one.
+Stdout carries only the protocol; logs go to stderr. The process exits when the client closes stdin. **stdio has no process-level arm gate: `PIKVM_MCP_ARM_HID` and `PIKVM_MCP_ARM_MSD` do not apply, and HID and MSD tools are armed** unless a registry device sets `armHid` or `armMsd` to `false`. The password comes from `/data/secrets/pikvm-password` in that volume. Compose prefixes its volumes with the project name (for example `pikvm_mcp_server_pikvm-data`), so `pikvm-data` here is a separate volume unless you name the Compose one.
 
 ## The `/data` volume
 
@@ -78,7 +78,7 @@ The entrypoint sets a variable only when it is unset or empty, and logs each def
 
 The image itself sets `PIKVM_MCP_HOST=0.0.0.0` (inside the container's own network namespace), `PIKVM_MCP_NO_DOTENV=1` and `PIKVM_OCR_TESSERACT_BIN=/usr/bin/tesseract`. Every other variable in [README.md](../README.md) passes through unchanged.
 
-The entrypoint exits with a message, rather than letting `restart:` loop on a bare error, when:
+The entrypoint exits with a message naming the cause, rather than a bare error, when the following holds. A restart policy still retries the container; fix the cause or stop the service.
 
 | Exit | Cause |
 | --- | --- |
@@ -161,7 +161,7 @@ cat > ts-config/serve.json <<'EOF'
 EOF
 ```
 
-Write the bearer, password and pin into the volume as in the quick start, using `docker compose -f compose.tailscale.yaml run ...`, then `docker compose -f compose.tailscale.yaml up -d`. The client URL is `https://pikvm-mcp.<tailnet>.ts.net/mcp`. See Tailscale's documentation for `serve` configuration.
+Write the bearer, password and pin into the volume as in the quick start, using `docker compose -f compose.tailscale.yaml run ...`, then `docker compose -f compose.tailscale.yaml up -d`. With `-f`, Compose does not read `compose.override.yaml` on its own: until the first release, use `-f compose.tailscale.yaml -f compose.override.yaml` so the local build is used. The client URL is `https://pikvm-mcp.<tailnet>.ts.net/mcp`. See Tailscale's documentation for `serve` configuration.
 
 Things to know:
 
