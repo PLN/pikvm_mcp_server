@@ -1,3 +1,5 @@
+// Modified 2026-10 by PLN: serverInfo.version follows package.json (GPL-3.0; see NOTICE).
+
 /**
  * stdio smoke test — spawns `node dist/index.js` exactly like PC-Control does
  * (probes/pikvm_acceptance.py: StdioServerParameters(command="node",
@@ -18,6 +20,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
+import { readFileSync } from 'node:fs';
 import { startKvmdMock } from './kvmd-mock.mjs';
 
 const REPO = join(fileURLToPath(import.meta.url), '..', '..');
@@ -88,6 +91,8 @@ test('stdio: initialize works and mouse click dispatches (no arm-gate in stdio)'
 
     const init = await waitForResponse(1);
     assert.equal(init.result.serverInfo.name, 'pikvm-mcp-server');
+    const pkg = JSON.parse(readFileSync(join(REPO, 'package.json'), 'utf8'));
+    assert.equal(init.result.serverInfo.version, pkg.version);
     assert.ok(init.result.protocolVersion, 'protocolVersion negotiated');
 
     child.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');

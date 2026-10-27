@@ -31,6 +31,7 @@
 // Modified 2026-10 by PLN: a catalog read is not started with under 1 ms left (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: a post-send job cap reports phase job_timeout (GPL-3.0; see NOTICE).
 // Modified 2026-10 by PLN: the upload response read is phase job_timeout (GPL-3.0; see NOTICE).
+// Modified 2026-10 by PLN: serverInfo.version follows package.json (GPL-3.0; see NOTICE).
 
 /**
  * MCP server factory for PiKVM tools
@@ -95,6 +96,10 @@ import {
   parseOcrEngineArg,
   type ResolvedOcr,
 } from './ocr.js';
+import { createRequire } from 'node:module';
+
+/** package.json sits one level above dist/ (and src/), including in the image. */
+const SERVER_VERSION = (createRequire(import.meta.url)('../package.json') as { version: string }).version;
 
 export interface McpServerDeps {
   pikvm: PiKVMClient;
@@ -973,7 +978,7 @@ export function createMcpServer(deps: McpServerDeps): Server {
   const server = new Server(
     {
       name: 'pikvm-mcp-server',
-      version: '0.2.0',
+      version: SERVER_VERSION,
     },
     {
       capabilities: {

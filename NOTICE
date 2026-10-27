@@ -75,6 +75,7 @@ Modified 2026-10 by PLN: Docker image, entrypoint, compose file, and image smoke
 Modified 2026-10 by PLN: a cut-short POST reply is state unknown; CI checkouts keep no credentials (GPL-3.0; see below).
 Modified 2026-10 by PLN: Docker and systemd guides, README and package metadata fixes (GPL-3.0; see below).
 Modified 2026-10 by PLN: manual image release workflow and image scan gate (GPL-3.0; see below).
+Modified 2026-10 by PLN: version 0.3.0, reported in serverInfo (GPL-3.0; see below).
 
 pikvm-mcp-server — copyright notices and GPLv3 §5 modification log
 
@@ -1337,4 +1338,10 @@ No code from another pikvm_mcp_server fork was added for these methods.
   requires purls and paths to be lists of non-blank strings, and the
   gate self-test checks it refuses a blank path. publish skips attesting
   only when the registry already holds a verifying attestation.
+  No code from another pikvm_mcp_server fork was copied.
+
+2026-10, by PLN:
+  The version is 0.3.0. serverInfo.version comes from package.json, one
+  level above dist/, instead of a hard-coded 0.2.0, and the stdio test
+  checks it.
   No code from another pikvm_mcp_server fork was copied.
